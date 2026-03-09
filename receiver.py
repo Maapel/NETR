@@ -60,27 +60,28 @@ class MJPEGHandler(BaseHTTPRequestHandler):
             self.send_error(404)
 
     def _set_cmd(self, query: str):
-        """Forward q:<val> or f:<val> command to ESP32 over UDP."""
+        """Forward q:<val> and/or f:<val> commands to ESP32 over UDP."""
         import urllib.parse
         params = dict(urllib.parse.parse_qsl(query))
-        cmd = None
+        cmds = []
         if "quality" in params:
             val = max(0, min(63, int(params["quality"])))
-            cmd = f"q:{val}".encode()
-        elif "fps" in params:
+            cmds.append(f"q:{val}".encode())
+        if "fps" in params:
             val = max(1, min(60, int(params["fps"])))
-            cmd = f"f:{val}".encode()
+            cmds.append(f"f:{val}".encode())
 
-        if cmd:
+        if cmds:
             ctrl = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            ctrl.sendto(cmd, (ESP32_IP, CMD_PORT))
+            for cmd in cmds:
+                ctrl.sendto(cmd, (ESP32_IP, CMD_PORT))
             ctrl.close()
-            stats["last_cmd"] = cmd.decode()
+            stats["last_cmd"] = " ".join(c.decode() for c in cmds)
 
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
-        self.wfile.write(json.dumps({"ok": bool(cmd)}).encode())
+        self.wfile.write(json.dumps({"ok": bool(cmds)}).encode())
 
     def _index(self):
         html = """<!DOCTYPE html>
@@ -92,10 +93,15 @@ class MJPEGHandler(BaseHTTPRequestHandler):
            display:flex; flex-direction:column; align-items:center; padding:20px; gap:10px; }
     img  { max-width:100%; border:2px solid #444; }
     #stats { font-size:14px; color:#8f8; }
-    .ctrl { display:flex; gap:12px; align-items:center; }
-    label { font-size:13px; }
+    .ctrl { display:flex; gap:20px; align-items:flex-end; flex-wrap:wrap; justify-content:center; }
+    .ctrl-group { display:flex; flex-direction:column; gap:4px; font-size:13px; }
     input[type=range] { width:160px; }
-    span.val { width:30px; display:inline-block; text-align:right; }
+    button {
+      padding:6px 20px; background:#2a2; color:#fff;
+      border:none; border-radius:4px; cursor:pointer; font-size:13px;
+    }
+    button:active { background:#1a1; }
+    #feedback { font-size:12px; color:#fa0; min-height:16px; }
   </style>
 </head>
 <body>
@@ -104,26 +110,37 @@ class MJPEGHandler(BaseHTTPRequestHandler):
   <div id="stats">connecting...</div>
 
   <div class="ctrl">
-    <label>Quality (lower = better)
-      <span class="val" id="qval">12</span>
+    <div class="ctrl-group">
+      <span>Quality (lower = better): <b id="qval">12</b></span>
       <input type="range" min="4" max="63" value="12" id="quality"
-             oninput="document.getElementById('qval').textContent=this.value"
-             onchange="send('quality',this.value)">
-    </label>
-    <label>FPS
-      <span class="val" id="fval">30</span>
+             oninput="document.getElementById('qval').textContent=this.value">
+    </div>
+    <div class="ctrl-group">
+      <span>FPS: <b id="fval">30</b></span>
       <input type="range" min="1" max="30" value="30" id="fps"
-             oninput="document.getElementById('fval').textContent=this.value"
-             onchange="send('fps',this.value)">
-    </label>
+             oninput="document.getElementById('fval').textContent=this.value">
+    </div>
+    <button onclick="applySettings()">Apply</button>
   </div>
+  <div id="feedback"></div>
 
   <script>
-    function send(key, val) {
-      fetch('/set?' + key + '=' + val)
-        .then(r=>r.json())
-        .then(d=> { if(!d.ok) console.warn('cmd failed'); });
+    function applySettings() {
+      const q = document.getElementById('quality').value;
+      const f = document.getElementById('fps').value;
+      const fb = document.getElementById('feedback');
+      fb.textContent = 'Sending...';
+
+      Promise.all([
+        fetch('/set?quality=' + q).then(r => r.json()),
+        fetch('/set?fps='     + f).then(r => r.json())
+      ]).then(([rq, rf]) => {
+        fb.textContent = (rq.ok && rf.ok)
+          ? `Applied — quality=${q}  fps=${f}`
+          : 'Send failed (check console)';
+      }).catch(e => { fb.textContent = 'Error: ' + e; });
     }
+
     setInterval(() => {
       fetch('/stats').then(r=>r.json()).then(d=>{
         document.getElementById('stats').textContent =
