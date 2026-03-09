@@ -17,7 +17,9 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from collections import defaultdict
 
 UDP_PORT  = 5000
+CMD_PORT  = 5001
 HTTP_PORT = 8080
+ESP32_IP  = "192.168.137.149"   # update if ESP32 gets a different DHCP lease
 HDR       = struct.Struct("<IHHq")   # frame_id, chunk_idx, total_chunks, ts_us
 HDR_SIZE  = HDR.size                 # 16 bytes
 
@@ -52,8 +54,33 @@ class MJPEGHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+        elif self.path.startswith("/set?"):
+            self._set_cmd(self.path[5:])
         else:
             self.send_error(404)
+
+    def _set_cmd(self, query: str):
+        """Forward q:<val> or f:<val> command to ESP32 over UDP."""
+        import urllib.parse
+        params = dict(urllib.parse.parse_qsl(query))
+        cmd = None
+        if "quality" in params:
+            val = max(0, min(63, int(params["quality"])))
+            cmd = f"q:{val}".encode()
+        elif "fps" in params:
+            val = max(1, min(60, int(params["fps"])))
+            cmd = f"f:{val}".encode()
+
+        if cmd:
+            ctrl = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            ctrl.sendto(cmd, (ESP32_IP, CMD_PORT))
+            ctrl.close()
+            stats["last_cmd"] = cmd.decode()
+
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps({"ok": bool(cmd)}).encode())
 
     def _index(self):
         html = """<!DOCTYPE html>
@@ -62,16 +89,41 @@ class MJPEGHandler(BaseHTTPRequestHandler):
   <title>ESP32-CAM UDP Stream</title>
   <style>
     body { background:#111; color:#eee; font-family:monospace;
-           display:flex; flex-direction:column; align-items:center; padding:20px; }
+           display:flex; flex-direction:column; align-items:center; padding:20px; gap:10px; }
     img  { max-width:100%; border:2px solid #444; }
-    #stats { margin-top:10px; font-size:14px; color:#8f8; }
+    #stats { font-size:14px; color:#8f8; }
+    .ctrl { display:flex; gap:12px; align-items:center; }
+    label { font-size:13px; }
+    input[type=range] { width:160px; }
+    span.val { width:30px; display:inline-block; text-align:right; }
   </style>
 </head>
 <body>
   <h2>ESP32-CAM Live (UDP)</h2>
   <img src="/stream" />
   <div id="stats">connecting...</div>
+
+  <div class="ctrl">
+    <label>Quality (lower = better)
+      <span class="val" id="qval">12</span>
+      <input type="range" min="4" max="63" value="12" id="quality"
+             oninput="document.getElementById('qval').textContent=this.value"
+             onchange="send('quality',this.value)">
+    </label>
+    <label>FPS
+      <span class="val" id="fval">30</span>
+      <input type="range" min="1" max="30" value="30" id="fps"
+             oninput="document.getElementById('fval').textContent=this.value"
+             onchange="send('fps',this.value)">
+    </label>
+  </div>
+
   <script>
+    function send(key, val) {
+      fetch('/set?' + key + '=' + val)
+        .then(r=>r.json())
+        .then(d=> { if(!d.ok) console.warn('cmd failed'); });
+    }
     setInterval(() => {
       fetch('/stats').then(r=>r.json()).then(d=>{
         document.getElementById('stats').textContent =

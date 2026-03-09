@@ -12,6 +12,7 @@
 #define WIFI_PASSWORD "1234567890"
 #define LAPTOP_IP     "192.168.137.239"
 #define LAPTOP_PORT   5000
+#define CMD_PORT      5001   // laptop → ESP32 control channel
 // ─────────────────────────────────────────────────────────────────────────────
 
 // AI-Thinker ESP32-CAM pin map
@@ -33,9 +34,8 @@
 #define PCLK_GPIO_NUM     22
 
 // UDP fragmentation
-// Each packet: [4B frame_id][2B chunk_idx][2B total_chunks][8B timestamp_us][payload]
-// Header is always 16 bytes. Payload up to CHUNK_SIZE bytes.
-#define CHUNK_SIZE  1400   // safe below 1500 MTU with IP+UDP headers
+// Packet layout: [4B frame_id][2B chunk_idx][2B total_chunks][8B timestamp_us][payload]
+#define CHUNK_SIZE  1400
 #define HDR_SIZE      16
 
 struct FrameEnvelope {
@@ -45,7 +45,12 @@ struct FrameEnvelope {
 
 static QueueHandle_t frameQueue;
 static WiFiUDP       udp;
+static WiFiUDP       cmdUdp;
 static uint32_t      frameId = 0;
+
+// Live-tunable settings (read by captureTask, written by cmdTask)
+static volatile int  g_jpeg_quality = 12;   // 0=best … 63=worst
+static volatile int  g_target_fps   = 30;
 
 // ── Camera init ───────────────────────────────────────────────────────────────
 static bool initCamera() {
@@ -73,11 +78,11 @@ static bool initCamera() {
 
     if (psramFound()) {
         config.frame_size   = FRAMESIZE_QVGA;
-        config.jpeg_quality = 12;
+        config.jpeg_quality = g_jpeg_quality;
         config.fb_count     = 2;
     } else {
         config.frame_size   = FRAMESIZE_QVGA;
-        config.jpeg_quality = 20;
+        config.jpeg_quality = g_jpeg_quality;
         config.fb_count     = 1;
         Serial.println("WARN: No PSRAM");
     }
@@ -116,11 +121,23 @@ static void syncTime() {
     }
 }
 
-// ── Task: capture frames ──────────────────────────────────────────────────────
+// ── Task: capture at target FPS ───────────────────────────────────────────────
 void captureTask(void *) {
+    TickType_t lastWake = xTaskGetTickCount();
+
     while (true) {
+        int fps = g_target_fps;
+        TickType_t period = pdMS_TO_TICKS(1000 / fps);
+
         camera_fb_t *fb = esp_camera_fb_get();
-        if (!fb) { delay(5); continue; }
+        if (!fb) {
+            vTaskDelayUntil(&lastWake, period);
+            continue;
+        }
+
+        // Apply any quality change requested via cmd channel
+        sensor_t *s = esp_camera_sensor_get();
+        s->set_quality(s, g_jpeg_quality);
 
         struct timeval tv;
         gettimeofday(&tv, NULL);
@@ -130,14 +147,15 @@ void captureTask(void *) {
         };
 
         if (xQueueSend(frameQueue, &env, 0) != pdTRUE) {
-            esp_camera_fb_return(fb);   // queue full — drop oldest implicitly
+            esp_camera_fb_return(fb);
         }
+
+        vTaskDelayUntil(&lastWake, period);
     }
 }
 
 // ── Task: fragment and send each frame over UDP ───────────────────────────────
 void sendTask(void *) {
-    // Static packet buffer: header + one chunk of data
     static uint8_t pkt[HDR_SIZE + CHUNK_SIZE];
 
     while (true) {
@@ -146,24 +164,21 @@ void sendTask(void *) {
             continue;
         }
 
-        const uint8_t *data   = env.fb->buf;
-        const size_t   total  = env.fb->len;
+        const uint8_t *data    = env.fb->buf;
+        const size_t   total   = env.fb->len;
         const uint16_t nchunks = (total + CHUNK_SIZE - 1) / CHUNK_SIZE;
-        const uint32_t fid    = frameId++;
+        const uint32_t fid     = frameId++;
 
         for (uint16_t i = 0; i < nchunks; i++) {
-            size_t  offset   = (size_t)i * CHUNK_SIZE;
+            size_t   offset  = (size_t)i * CHUNK_SIZE;
             uint16_t pld_len = (uint16_t)((offset + CHUNK_SIZE <= total)
                                            ? CHUNK_SIZE
                                            : total - offset);
 
-            // Build header (little-endian)
             memcpy(pkt,      &fid,       4);
             memcpy(pkt + 4,  &i,         2);
             memcpy(pkt + 6,  &nchunks,   2);
             memcpy(pkt + 8,  &env.ts_us, 8);
-
-            // Append payload
             memcpy(pkt + HDR_SIZE, data + offset, pld_len);
 
             udp.beginPacket(LAPTOP_IP, LAPTOP_PORT);
@@ -172,6 +187,42 @@ void sendTask(void *) {
         }
 
         esp_camera_fb_return(env.fb);
+    }
+}
+
+// ── Task: receive control commands from laptop ────────────────────────────────
+// Commands (plain text, UDP to port CMD_PORT):
+//   q:<0-63>   set JPEG quality   e.g. "q:20"
+//   f:<fps>    set target FPS     e.g. "f:15"
+void cmdTask(void *) {
+    cmdUdp.begin(CMD_PORT);
+    Serial.printf("CMD listener on UDP :%d\n", CMD_PORT);
+
+    while (true) {
+        int len = cmdUdp.parsePacket();
+        if (len <= 0) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+
+        char buf[32] = {};
+        cmdUdp.read(buf, sizeof(buf) - 1);
+
+        if (buf[0] == 'q' && buf[1] == ':') {
+            int val = atoi(buf + 2);
+            if (val >= 0 && val <= 63) {
+                g_jpeg_quality = val;
+                Serial.printf("Quality → %d\n", val);
+            }
+        } else if (buf[0] == 'f' && buf[1] == ':') {
+            int val = atoi(buf + 2);
+            if (val >= 1 && val <= 60) {
+                g_target_fps = val;
+                Serial.printf("FPS → %d\n", val);
+            }
+        } else {
+            Serial.printf("Unknown cmd: %s\n", buf);
+        }
     }
 }
 
@@ -196,11 +247,12 @@ void setup() {
 
     syncTime();
 
-    udp.begin(LAPTOP_PORT);  // bind local port (needed before sendPacket on some stacks)
+    udp.begin(LAPTOP_PORT);
 
     frameQueue = xQueueCreate(2, sizeof(FrameEnvelope));
     xTaskCreatePinnedToCore(captureTask, "capture", 4096, NULL, 1, NULL, 0);
     xTaskCreatePinnedToCore(sendTask,    "send",    8192, NULL, 1, NULL, 1);
+    xTaskCreatePinnedToCore(cmdTask,     "cmd",     4096, NULL, 1, NULL, 1);
 }
 
 void loop() {
