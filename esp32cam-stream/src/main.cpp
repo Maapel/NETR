@@ -125,31 +125,42 @@ static void syncTime() {
 
 // ── Task: capture at target FPS ───────────────────────────────────────────────
 void captureTask(void *) {
-    TickType_t lastWake = xTaskGetTickCount();
+    TickType_t lastWake   = xTaskGetTickCount();
+    int        last_q     = g_jpeg_quality;
+    int        last_fps   = g_target_fps;
+    sensor_t  *s          = esp_camera_sensor_get();
+
+    // Apply initial quality once
+    s->set_quality(s, last_q);
 
     while (true) {
+        // Apply quality only when it actually changes
+        int q = g_jpeg_quality;
+        if (q != last_q) {
+            s->set_quality(s, q);
+            last_q = q;
+            Serial.printf("Quality applied: %d\n", q);
+        }
+
+        // Reset pacing baseline when fps changes to avoid stale lastWake
         int fps = g_target_fps;
+        if (fps != last_fps) {
+            last_fps = fps;
+            lastWake = xTaskGetTickCount();
+        }
         TickType_t period = pdMS_TO_TICKS(1000 / fps);
 
         camera_fb_t *fb = esp_camera_fb_get();
-        if (!fb) {
-            vTaskDelayUntil(&lastWake, period);
-            continue;
-        }
-
-        // Apply any quality change requested via cmd channel
-        sensor_t *s = esp_camera_sensor_get();
-        s->set_quality(s, g_jpeg_quality);
-
-        struct timeval tv;
-        gettimeofday(&tv, NULL);
-        FrameEnvelope env = {
-            .fb    = fb,
-            .ts_us = (int64_t)tv.tv_sec * 1000000LL + tv.tv_usec
-        };
-
-        if (xQueueSend(frameQueue, &env, 0) != pdTRUE) {
-            esp_camera_fb_return(fb);
+        if (fb) {
+            struct timeval tv;
+            gettimeofday(&tv, NULL);
+            FrameEnvelope env = {
+                .fb    = fb,
+                .ts_us = (int64_t)tv.tv_sec * 1000000LL + tv.tv_usec
+            };
+            if (xQueueSend(frameQueue, &env, 0) != pdTRUE) {
+                esp_camera_fb_return(fb);
+            }
         }
 
         vTaskDelayUntil(&lastWake, period);
