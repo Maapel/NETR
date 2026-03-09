@@ -49,11 +49,14 @@ class MJPEGHandler(BaseHTTPRequestHandler):
             self._mjpeg()
         elif self.path == "/stats":
             body = json.dumps(stats).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            except BrokenPipeError:
+                pass
         elif self.path.startswith("/set?"):
             self._set_cmd(self.path[5:])
         else:
@@ -78,10 +81,13 @@ class MJPEGHandler(BaseHTTPRequestHandler):
             ctrl.close()
             stats["last_cmd"] = " ".join(c.decode() for c in cmds)
 
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.end_headers()
-        self.wfile.write(json.dumps({"ok": bool(cmds)}).encode())
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"ok": bool(cmds)}).encode())
+        except BrokenPipeError:
+            pass
 
     def _index(self):
         html = """<!DOCTYPE html>
