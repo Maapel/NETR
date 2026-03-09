@@ -12,9 +12,21 @@
 #define WIFI_SSID     "215"
 #define WIFI_PASSWORD "1234567890"
 #define LAPTOP_IP     "192.168.137.239"
-#define LAPTOP_PORT   5000
-#define CMD_PORT      5001   // laptop → ESP32 control channel
 #define OTA_PASSWORD  "esp32ota"
+
+// CAM_ID is injected by the build environment (-DCAM_ID=1 or -DCAM_ID=2).
+// Each camera gets its own stream port, cmd port, and OTA hostname so both
+// can be targeted independently over WiFi.
+#ifndef CAM_ID
+  #define CAM_ID 1   // fallback — should always be set by platformio.ini
+#endif
+
+#define _STR(x) #x
+#define STR(x) _STR(x)
+
+#define LAPTOP_PORT  (5000 + (CAM_ID - 1) * 2)   // cam1=5000  cam2=5002
+#define CMD_PORT     (5001 + (CAM_ID - 1) * 2)   // cam1=5001  cam2=5003
+#define OTA_HOSTNAME "esp32cam-" STR(CAM_ID)      // cam1="esp32cam-1" etc.
 // ─────────────────────────────────────────────────────────────────────────────
 
 // AI-Thinker ESP32-CAM pin map
@@ -241,6 +253,7 @@ void cmdTask(void *) {
 
 // ── Task: handle OTA updates ──────────────────────────────────────────────────
 void otaTask(void *) {
+    ArduinoOTA.setHostname(OTA_HOSTNAME);
     ArduinoOTA.setPassword(OTA_PASSWORD);
 
     ArduinoOTA.onStart([]() {
