@@ -1,6 +1,7 @@
 #include "esp_camera.h"
 #include <WiFi.h>
 #include <WiFiUdp.h>
+#include <ArduinoOTA.h>
 #include <time.h>
 #include <sys/time.h>
 #include "freertos/FreeRTOS.h"
@@ -13,6 +14,7 @@
 #define LAPTOP_IP     "192.168.137.239"
 #define LAPTOP_PORT   5000
 #define CMD_PORT      5001   // laptop → ESP32 control channel
+#define OTA_PASSWORD  "esp32ota"
 // ─────────────────────────────────────────────────────────────────────────────
 
 // AI-Thinker ESP32-CAM pin map
@@ -226,6 +228,29 @@ void cmdTask(void *) {
     }
 }
 
+// ── Task: handle OTA updates ──────────────────────────────────────────────────
+void otaTask(void *) {
+    ArduinoOTA.setPassword(OTA_PASSWORD);
+
+    ArduinoOTA.onStart([]() {
+        Serial.println("OTA start — suspending stream");
+    });
+    ArduinoOTA.onEnd([]() {
+        Serial.println("OTA done — rebooting");
+    });
+    ArduinoOTA.onError([](ota_error_t e) {
+        Serial.printf("OTA error [%u]\n", e);
+    });
+
+    ArduinoOTA.begin();
+    Serial.println("OTA ready on port 3232");
+
+    while (true) {
+        ArduinoOTA.handle();
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
 // ── Arduino entry points ──────────────────────────────────────────────────────
 void setup() {
     Serial.begin(115200);
@@ -253,6 +278,7 @@ void setup() {
     xTaskCreatePinnedToCore(captureTask, "capture", 4096, NULL, 1, NULL, 0);
     xTaskCreatePinnedToCore(sendTask,    "send",    8192, NULL, 1, NULL, 1);
     xTaskCreatePinnedToCore(cmdTask,     "cmd",     4096, NULL, 1, NULL, 1);
+    xTaskCreatePinnedToCore(otaTask,     "ota",     8192, NULL, 1, NULL, 1);
 }
 
 void loop() {
