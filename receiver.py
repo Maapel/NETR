@@ -14,6 +14,7 @@ import time
 import threading
 import json
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
 from collections import defaultdict
 
 UDP_PORT  = 5000
@@ -186,8 +187,10 @@ class MJPEGHandler(BaseHTTPRequestHandler):
             pass
 
 
-class QuietHTTPServer(HTTPServer):
-    """Suppress BrokenPipeError — happens when browser closes connection early."""
+class QuietHTTPServer(ThreadingMixIn, HTTPServer):
+    """One thread per request + suppress BrokenPipeError."""
+    daemon_threads = True
+
     def handle_error(self, request, client_address):
         import sys
         if issubclass(sys.exc_info()[0], BrokenPipeError):
