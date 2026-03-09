@@ -60,7 +60,10 @@ class MJPEGHandler(BaseHTTPRequestHandler):
         elif self.path.startswith("/set?"):
             self._set_cmd(self.path[5:])
         else:
-            self.send_error(404)
+            try:
+                self.send_error(404)
+            except BrokenPipeError:
+                pass
 
     def _set_cmd(self, query: str):
         """Forward q:<val> and/or f:<val> commands to ESP32 over UDP."""
@@ -183,8 +186,17 @@ class MJPEGHandler(BaseHTTPRequestHandler):
             pass
 
 
+class QuietHTTPServer(HTTPServer):
+    """Suppress BrokenPipeError — happens when browser closes connection early."""
+    def handle_error(self, request, client_address):
+        import sys
+        if issubclass(sys.exc_info()[0], BrokenPipeError):
+            return
+        super().handle_error(request, client_address)
+
+
 def http_thread():
-    HTTPServer(("0.0.0.0", HTTP_PORT), MJPEGHandler).serve_forever()
+    QuietHTTPServer(("0.0.0.0", HTTP_PORT), MJPEGHandler).serve_forever()
 
 
 # ── UDP receiver ──────────────────────────────────────────────────────────────
