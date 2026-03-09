@@ -1,6 +1,6 @@
 #include "esp_camera.h"
 #include <WiFi.h>
-#include <WiFiClient.h>
+#include <WiFiUdp.h>
 #include <time.h>
 #include <sys/time.h>
 #include "freertos/FreeRTOS.h"
@@ -32,16 +32,20 @@
 #define HREF_GPIO_NUM     23
 #define PCLK_GPIO_NUM     22
 
-// Frame envelope: frame buffer pointer + timestamp captured at acquire time
+// UDP fragmentation
+// Each packet: [4B frame_id][2B chunk_idx][2B total_chunks][8B timestamp_us][payload]
+// Header is always 16 bytes. Payload up to CHUNK_SIZE bytes.
+#define CHUNK_SIZE  1400   // safe below 1500 MTU with IP+UDP headers
+#define HDR_SIZE      16
+
 struct FrameEnvelope {
     camera_fb_t *fb;
     int64_t      ts_us;
 };
 
-// Queue holds at most 2 envelopes — if sender is slow we drop, not stall
 static QueueHandle_t frameQueue;
-
-WiFiClient client;
+static WiFiUDP       udp;
+static uint32_t      frameId = 0;
 
 // ── Camera init ───────────────────────────────────────────────────────────────
 static bool initCamera() {
@@ -68,7 +72,7 @@ static bool initCamera() {
     config.pixel_format = PIXFORMAT_JPEG;
 
     if (psramFound()) {
-        config.frame_size   = FRAMESIZE_QVGA;  // 320x240
+        config.frame_size   = FRAMESIZE_QVGA;
         config.jpeg_quality = 12;
         config.fb_count     = 2;
     } else {
@@ -112,25 +116,11 @@ static void syncTime() {
     }
 }
 
-// ── TCP helpers ───────────────────────────────────────────────────────────────
-static bool writeAll(WiFiClient &c, const uint8_t *buf, size_t len) {
-    size_t sent = 0;
-    while (sent < len) {
-        int n = c.write(buf + sent, len - sent);
-        if (n <= 0) return false;
-        sent += n;
-    }
-    return true;
-}
-
-// ── Task: capture frames and push to queue ────────────────────────────────────
+// ── Task: capture frames ──────────────────────────────────────────────────────
 void captureTask(void *) {
     while (true) {
         camera_fb_t *fb = esp_camera_fb_get();
-        if (!fb) {
-            delay(10);
-            continue;
-        }
+        if (!fb) { delay(5); continue; }
 
         struct timeval tv;
         gettimeofday(&tv, NULL);
@@ -139,50 +129,56 @@ void captureTask(void *) {
             .ts_us = (int64_t)tv.tv_sec * 1000000LL + tv.tv_usec
         };
 
-        // Non-blocking send to queue; if full, drop this frame and return buffer
         if (xQueueSend(frameQueue, &env, 0) != pdTRUE) {
-            esp_camera_fb_return(fb);
+            esp_camera_fb_return(fb);   // queue full — drop oldest implicitly
         }
     }
 }
 
-// ── Task: pop from queue and send over TCP ─────────────────────────────────────
+// ── Task: fragment and send each frame over UDP ───────────────────────────────
 void sendTask(void *) {
-    while (true) {
-        // Reconnect loop
-        if (!client.connected()) {
-            Serial.printf("Connecting to %s:%d...\n", LAPTOP_IP, LAPTOP_PORT);
-            if (!client.connect(LAPTOP_IP, LAPTOP_PORT)) {
-                delay(1000);
-                continue;
-            }
-            client.setNoDelay(true);
-            Serial.println("Server connected");
-        }
+    // Static packet buffer: header + one chunk of data
+    static uint8_t pkt[HDR_SIZE + CHUNK_SIZE];
 
+    while (true) {
         FrameEnvelope env;
         if (xQueueReceive(frameQueue, &env, pdMS_TO_TICKS(500)) != pdTRUE) {
             continue;
         }
 
-        uint32_t img_len = env.fb->len;
-        bool ok = writeAll(client, (const uint8_t *)&env.ts_us, sizeof(env.ts_us))
-               && writeAll(client, (const uint8_t *)&img_len,   sizeof(img_len))
-               && writeAll(client, env.fb->buf, img_len);
+        const uint8_t *data   = env.fb->buf;
+        const size_t   total  = env.fb->len;
+        const uint16_t nchunks = (total + CHUNK_SIZE - 1) / CHUNK_SIZE;
+        const uint32_t fid    = frameId++;
+
+        for (uint16_t i = 0; i < nchunks; i++) {
+            size_t  offset   = (size_t)i * CHUNK_SIZE;
+            uint16_t pld_len = (uint16_t)((offset + CHUNK_SIZE <= total)
+                                           ? CHUNK_SIZE
+                                           : total - offset);
+
+            // Build header (little-endian)
+            memcpy(pkt,      &fid,       4);
+            memcpy(pkt + 4,  &i,         2);
+            memcpy(pkt + 6,  &nchunks,   2);
+            memcpy(pkt + 8,  &env.ts_us, 8);
+
+            // Append payload
+            memcpy(pkt + HDR_SIZE, data + offset, pld_len);
+
+            udp.beginPacket(LAPTOP_IP, LAPTOP_PORT);
+            udp.write(pkt, HDR_SIZE + pld_len);
+            udp.endPacket();
+        }
 
         esp_camera_fb_return(env.fb);
-
-        if (!ok) {
-            Serial.println("Send failed — reconnecting");
-            client.stop();
-        }
     }
 }
 
 // ── Arduino entry points ──────────────────────────────────────────────────────
 void setup() {
     Serial.begin(115200);
-    Serial.println("\n== ESP32-CAM stream test ==");
+    Serial.println("\n== ESP32-CAM UDP stream ==");
 
     if (!initCamera()) {
         Serial.println("FATAL: halting");
@@ -200,13 +196,13 @@ void setup() {
 
     syncTime();
 
-    frameQueue = xQueueCreate(2, sizeof(FrameEnvelope));
+    udp.begin(LAPTOP_PORT);  // bind local port (needed before sendPacket on some stacks)
 
-    // Capture on core 0, send on core 1 — keeps WiFi stack and camera isolated
+    frameQueue = xQueueCreate(2, sizeof(FrameEnvelope));
     xTaskCreatePinnedToCore(captureTask, "capture", 4096, NULL, 1, NULL, 0);
     xTaskCreatePinnedToCore(sendTask,    "send",    8192, NULL, 1, NULL, 1);
 }
 
 void loop() {
-    vTaskDelay(portMAX_DELAY);  // tasks do all the work
+    vTaskDelay(portMAX_DELAY);
 }
