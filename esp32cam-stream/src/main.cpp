@@ -11,22 +11,19 @@
 // ── User config ──────────────────────────────────────────────────────────────
 #define WIFI_SSID     "215"
 #define WIFI_PASSWORD "1234567890"
-#define LAPTOP_IP     "10.248.87.222"
 #define OTA_PASSWORD  "esp32ota"
 
-// CAM_ID is injected by the build environment (-DCAM_ID=1 or -DCAM_ID=2).
-// Each camera gets its own stream port, cmd port, and OTA hostname so both
-// can be targeted independently over WiFi.
 #ifndef CAM_ID
-  #define CAM_ID 1   // fallback — should always be set by platformio.ini
+  #define CAM_ID 1
 #endif
 
 #define _STR(x) #x
 #define STR(x) _STR(x)
 
-#define LAPTOP_PORT  (5000 + (CAM_ID - 1) * 2)   // cam1=5000  cam2=5002
-#define CMD_PORT     (5001 + (CAM_ID - 1) * 2)   // cam1=5001  cam2=5003
-#define OTA_HOSTNAME "esp32cam-" STR(CAM_ID)      // cam1="esp32cam-1" etc.
+#define LAPTOP_PORT      (5000 + (CAM_ID - 1) * 2)  // cam1=5000  cam2=5002
+#define CMD_PORT         (5001 + (CAM_ID - 1) * 2)  // cam1=5001  cam2=5003
+#define DISCOVERY_PORT   5004                        // shared beacon channel
+#define OTA_HOSTNAME     "esp32cam-" STR(CAM_ID)
 // ─────────────────────────────────────────────────────────────────────────────
 
 // AI-Thinker ESP32-CAM pin map
@@ -60,10 +57,14 @@ struct FrameEnvelope {
 static QueueHandle_t frameQueue;
 static WiFiUDP       udp;
 static WiFiUDP       cmdUdp;
+static WiFiUDP       discUdp;
 static uint32_t      frameId = 0;
 
+// Laptop IP discovered at runtime via beacon — no hardcoded IP needed
+static char          g_laptop_ip[24] = "";   // empty until beacon received
+
 // Live-tunable settings (read by captureTask, written by cmdTask)
-static volatile int  g_jpeg_quality = 12;   // 0=best … 63=worst
+static volatile int  g_jpeg_quality = 12;
 static volatile int  g_target_fps   = 30;
 
 // ── Camera init ───────────────────────────────────────────────────────────────
@@ -118,7 +119,7 @@ static bool initCamera() {
 
 // ── NTP sync ──────────────────────────────────────────────────────────────────
 static void syncTime() {
-    configTime(0, 0, LAPTOP_IP);
+    configTime(0, 0, g_laptop_ip[0] ? g_laptop_ip : "pool.ntp.org");
     Serial.print("NTP sync");
     struct tm ti;
     int retries = 0;
@@ -206,7 +207,8 @@ void sendTask(void *) {
             memcpy(pkt + 8,  &env.ts_us, 8);
             memcpy(pkt + HDR_SIZE, data + offset, pld_len);
 
-            udp.beginPacket(LAPTOP_IP, LAPTOP_PORT);
+            if (g_laptop_ip[0] == '\0') continue;  // not yet discovered
+            udp.beginPacket(g_laptop_ip, LAPTOP_PORT);
             udp.write(pkt, HDR_SIZE + pld_len);
             udp.endPacket();
         }
@@ -248,6 +250,44 @@ void cmdTask(void *) {
         } else {
             Serial.printf("Unknown cmd: %s\n", buf);
         }
+    }
+}
+
+// ── Task: beacon-based laptop discovery ───────────────────────────────────────
+// Broadcasts "CAM:<id>" every 10s so discover.py can find our IP.
+// Listens for "LAPTOP:<ip>" from the receiver so we know where to stream.
+void discoveryTask(void *) {
+    discUdp.begin(DISCOVERY_PORT);
+
+    char announce[16];
+    snprintf(announce, sizeof(announce), "CAM:%d", CAM_ID);
+
+    TickType_t lastAnnounce = xTaskGetTickCount() - pdMS_TO_TICKS(10000); // fire immediately
+
+    while (true) {
+        // Re-announce every 10s
+        if (xTaskGetTickCount() - lastAnnounce >= pdMS_TO_TICKS(10000)) {
+            IPAddress bcast = WiFi.broadcastIP();
+            discUdp.beginPacket(bcast, DISCOVERY_PORT);
+            discUdp.write((const uint8_t *)announce, strlen(announce));
+            discUdp.endPacket();
+            Serial.printf("Announced: %s  (broadcast %s)\n",
+                          announce, bcast.toString().c_str());
+            lastAnnounce = xTaskGetTickCount();
+        }
+
+        // Listen for laptop beacon
+        int len = discUdp.parsePacket();
+        if (len > 0) {
+            char buf[64] = {};
+            discUdp.read(buf, sizeof(buf) - 1);
+            if (strncmp(buf, "LAPTOP:", 7) == 0) {
+                strncpy(g_laptop_ip, buf + 7, sizeof(g_laptop_ip) - 1);
+                Serial.printf("Laptop discovered: %s\n", g_laptop_ip);
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
 
@@ -299,10 +339,11 @@ void setup() {
     udp.begin(LAPTOP_PORT);
 
     frameQueue = xQueueCreate(2, sizeof(FrameEnvelope));
-    xTaskCreatePinnedToCore(captureTask, "capture", 4096, NULL, 1, NULL, 0);
-    xTaskCreatePinnedToCore(sendTask,    "send",    8192, NULL, 1, NULL, 1);
-    xTaskCreatePinnedToCore(cmdTask,     "cmd",     4096, NULL, 1, NULL, 1);
-    xTaskCreatePinnedToCore(otaTask,     "ota",     8192, NULL, 1, NULL, 1);
+    xTaskCreatePinnedToCore(captureTask,   "capture",   4096, NULL, 1, NULL, 0);
+    xTaskCreatePinnedToCore(sendTask,      "send",      8192, NULL, 1, NULL, 1);
+    xTaskCreatePinnedToCore(cmdTask,       "cmd",       4096, NULL, 1, NULL, 1);
+    xTaskCreatePinnedToCore(otaTask,       "ota",       8192, NULL, 1, NULL, 1);
+    xTaskCreatePinnedToCore(discoveryTask, "discovery", 4096, NULL, 1, NULL, 1);
 }
 
 void loop() {

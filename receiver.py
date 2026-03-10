@@ -17,10 +17,13 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 from collections import defaultdict
 
-UDP_PORT  = 5000
-CMD_PORT  = 5001
-HTTP_PORT = 8080
-ESP32_IP  = "192.168.137.149"   # update if ESP32 gets a different DHCP lease
+UDP_PORT       = 5000
+CMD_PORT       = 5001
+HTTP_PORT      = 8080
+DISCOVERY_PORT = 5004
+
+# ESP32_IP is discovered at runtime via beacon — no hardcoding needed
+ESP32_IP  = ""   # updated when cam1 announces itself
 HDR       = struct.Struct("<IHHq")   # frame_id, chunk_idx, total_chunks, ts_us
 HDR_SIZE  = HDR.size                 # 16 bytes
 
@@ -273,6 +276,46 @@ def udp_serve():
                     fps_ts = time.monotonic()
 
 
+def _get_own_ip() -> str:
+    """Get the laptop's IP on the current network."""
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+
+
+def beacon_thread():
+    """Broadcast LAPTOP:<ip> every 5s so ESP32s know where to stream."""
+    global ESP32_IP
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("0.0.0.0", DISCOVERY_PORT))
+    sock.settimeout(1.0)
+
+    own_ip = _get_own_ip()
+    msg = f"LAPTOP:{own_ip}".encode()
+    print(f"Beacon: broadcasting {msg.decode()} on UDP :{DISCOVERY_PORT}")
+
+    while True:
+        # Send beacon
+        sock.sendto(msg, ("255.255.255.255", DISCOVERY_PORT))
+
+        # Listen for camera announcements (CAM:<id>)
+        try:
+            data, addr = sock.recvfrom(64)
+            txt = data.decode(errors="ignore").strip()
+            if txt.startswith("CAM:"):
+                cam_id = txt[4:]
+                if cam_id == "1" and ESP32_IP != addr[0]:
+                    ESP32_IP = addr[0]
+                    print(f"Cam1 discovered: {ESP32_IP}")
+        except socket.timeout:
+            pass
+
+        time.sleep(4)
+
+
 if __name__ == "__main__":
-    threading.Thread(target=http_thread, daemon=True).start()
+    threading.Thread(target=http_thread,  daemon=True).start()
+    threading.Thread(target=beacon_thread, daemon=True).start()
     udp_serve()
