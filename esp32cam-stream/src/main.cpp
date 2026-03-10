@@ -11,7 +11,7 @@
 // ── User config ──────────────────────────────────────────────────────────────
 #define WIFI_SSID     "215"
 #define WIFI_PASSWORD "1234567890"
-#define LAPTOP_IP     "192.168.137.239"
+#define LAPTOP_IP     "10.248.87.222"
 #define OTA_PASSWORD  "esp32ota"
 
 // CAM_ID is injected by the build environment (-DCAM_ID=1 or -DCAM_ID=2).
