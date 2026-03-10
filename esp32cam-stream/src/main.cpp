@@ -9,8 +9,8 @@
 #include "freertos/queue.h"
 
 // ── User config ──────────────────────────────────────────────────────────────
-#define WIFI_SSID     "215"
-#define WIFI_PASSWORD "1234567890"
+#define WIFI_SSID     "iitm_wifi_"
+#define WIFI_PASSWORD "12345678"
 #define OTA_PASSWORD  "esp32ota"
 
 #ifndef CAM_ID
