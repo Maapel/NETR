@@ -5,6 +5,7 @@
 #include <time.h>
 #include <sys/time.h>
 #include <stdarg.h>
+#include "esp_sntp.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -64,7 +65,8 @@ static WiFiUDP       logUdp;
 static uint32_t      frameId = 0;
 
 // Laptop IP discovered at runtime via beacon — no hardcoded IP needed
-static char          g_laptop_ip[24] = "";   // empty until beacon received
+static char          g_laptop_ip[24]      = "";  // empty until beacon received
+static char          g_last_laptop_ip[24] = "";  // last known — kept for logging after drop
 
 // Live-tunable settings (read by captureTask, written by cmdTask)
 static volatile int  g_jpeg_quality = 12;
@@ -81,10 +83,12 @@ static void udp_log(const char *fmt, ...) {
 
     Serial.println(buf);
 
-    if (g_laptop_ip[0]) {
-        logUdp.beginPacket(g_laptop_ip, LOG_PORT);
+    // Use current IP if known, otherwise fall back to last known IP
+    const char *log_ip = g_laptop_ip[0] ? g_laptop_ip : g_last_laptop_ip;
+    if (log_ip[0]) {
         char tagged[280];
         snprintf(tagged, sizeof(tagged), "CAM%d|%s", CAM_ID, buf);
+        logUdp.beginPacket(log_ip, LOG_PORT);
         logUdp.write((const uint8_t *)tagged, strlen(tagged));
         logUdp.endPacket();
     }
@@ -307,7 +311,8 @@ void discoveryTask(void *) {
             discUdp.read(buf, sizeof(buf) - 1);
             if (strncmp(buf, "LAPTOP:", 7) == 0) {
                 bool changed = strncmp(g_laptop_ip, buf + 7, sizeof(g_laptop_ip)) != 0;
-                strncpy(g_laptop_ip, buf + 7, sizeof(g_laptop_ip) - 1);
+                strncpy(g_laptop_ip,      buf + 7, sizeof(g_laptop_ip) - 1);
+                strncpy(g_last_laptop_ip, buf + 7, sizeof(g_last_laptop_ip) - 1);
                 if (changed) {
                     udp_log("Laptop discovered: %s", g_laptop_ip);
                 }
@@ -395,10 +400,24 @@ void wifiTask(void *) {
             if (WiFi.status() == WL_CONNECTED) {
                 udp_log("WiFi reconnected — IP: %s",
                         WiFi.localIP().toString().c_str());
-                // Re-sync NTP so clock stays accurate after reconnect
-                configTime(0, 0, g_laptop_ip[0] ? g_laptop_ip : "pool.ntp.org");
-                udp_log("NTP re-sync → %s",
-                        g_laptop_ip[0] ? g_laptop_ip : "pool.ntp.org");
+
+                // Re-sync NTP; prefer laptop server, fall back to pool
+                const char *ntp_server = g_last_laptop_ip[0] ? g_last_laptop_ip : "pool.ntp.org";
+                configTime(0, 0, ntp_server);
+                udp_log("NTP sync started → %s", ntp_server);
+
+                // Wait up to 10 s for SNTP to confirm sync
+                int ntp_tries = 0;
+                while (sntp_get_sync_status() == SNTP_SYNC_STATUS_RESET && ntp_tries++ < 20) {
+                    vTaskDelay(pdMS_TO_TICKS(500));
+                }
+                if (sntp_get_sync_status() != SNTP_SYNC_STATUS_RESET) {
+                    struct timeval tv;
+                    gettimeofday(&tv, NULL);
+                    udp_log("NTP sync OK — Unix time %ld", (long)tv.tv_sec);
+                } else {
+                    udp_log("NTP sync timeout — clock may be stale");
+                }
             } else {
                 udp_log("WiFi reconnect failed — will retry");
             }
