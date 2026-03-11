@@ -350,6 +350,31 @@ void ledTask(void *) {
     }
 }
 
+// ── Task: WiFi watchdog — reconnects if connection drops ──────────────────────
+void wifiTask(void *) {
+    while (true) {
+        if (WiFi.status() != WL_CONNECTED) {
+            Serial.println("WiFi lost — reconnecting...");
+            g_laptop_ip[0] = '\0';   // clear so stream pauses until rediscovered
+            WiFi.disconnect();
+            WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+            int retries = 0;
+            while (WiFi.status() != WL_CONNECTED && retries++ < 20) {
+                vTaskDelay(pdMS_TO_TICKS(500));
+            }
+
+            if (WiFi.status() == WL_CONNECTED) {
+                Serial.printf("WiFi reconnected — IP: %s\n",
+                              WiFi.localIP().toString().c_str());
+            } else {
+                Serial.println("Reconnect failed — will retry");
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(5000));  // check every 5s
+    }
+}
+
 // ── Arduino entry points ──────────────────────────────────────────────────────
 void setup() {
     Serial.begin(115200);
@@ -385,6 +410,7 @@ void setup() {
     xTaskCreatePinnedToCore(otaTask,       "ota",       8192, NULL, 1, NULL, 1);
     xTaskCreatePinnedToCore(discoveryTask, "discovery", 4096, NULL, 1, NULL, 1);
     xTaskCreatePinnedToCore(ledTask,       "led",       2048, NULL, 1, NULL, 1);
+    xTaskCreatePinnedToCore(wifiTask,      "wifi_wd",   4096, NULL, 1, NULL, 1);
 }
 
 void loop() {
