@@ -395,6 +395,10 @@ void wifiTask(void *) {
             if (WiFi.status() == WL_CONNECTED) {
                 udp_log("WiFi reconnected — IP: %s",
                         WiFi.localIP().toString().c_str());
+                // Re-sync NTP so clock stays accurate after reconnect
+                configTime(0, 0, g_laptop_ip[0] ? g_laptop_ip : "pool.ntp.org");
+                udp_log("NTP re-sync → %s",
+                        g_laptop_ip[0] ? g_laptop_ip : "pool.ntp.org");
             } else {
                 udp_log("WiFi reconnect failed — will retry");
             }
