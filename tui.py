@@ -357,15 +357,7 @@ class RigManager(App):
             self.log_msg("[yellow]NTP server stopped[/]")
 
         if self._upload_proc and self._upload_proc.poll() is not None:
-            code = self._upload_proc.returncode
-            out  = self._upload_proc.stdout.read() if self._upload_proc.stdout else b""
-            if code == 0:
-                self.log_msg("[green]✓ OTA upload SUCCESS[/]")
-            else:
-                self.log_msg(f"[red]✗ OTA upload FAILED (exit {code})[/]")
-                for line in out.decode(errors="ignore").splitlines()[-5:]:
-                    self.log_msg(f"  [dim]{line}[/]")
-            self._upload_proc = None
+            self._upload_proc = None   # result already logged by _stream_upload thread
 
     # ── Actions ───────────────────────────────────────────────────────────────
     def action_toggle_receiver(self):
@@ -462,6 +454,61 @@ class RigManager(App):
             cwd=ROOT / "esp32cam-stream",
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT
         )
+        threading.Thread(
+            target=self._stream_upload,
+            args=(self._upload_proc, cam),
+            daemon=True
+        ).start()
+
+    def _stream_upload(self, proc: subprocess.Popen, cam: str):
+        """Read espota output byte-by-byte, show progress bar every 10%."""
+        last_pct = -1
+        buf = ""
+
+        while True:
+            ch = proc.stdout.read(1)
+            if not ch:
+                break
+            c = ch.decode(errors="ignore")
+            if c in ("\n", "\r"):
+                line = buf.strip()
+                buf = ""
+                if not line:
+                    continue
+
+                # Progress bar: "Uploading: [====   ] 45%"
+                if "%" in line:
+                    m = re.search(r"(\d+)%", line)
+                    if m:
+                        pct = int(m.group(1))
+                        # Report every 10% step (and 100%)
+                        if pct >= last_pct + 10 or pct == 100:
+                            last_pct = pct
+                            filled = int(20 * pct / 100)
+                            bar = "█" * filled + "░" * (20 - filled)
+                            self.call_from_thread(
+                                self.log_msg,
+                                f"[cyan]  [{bar}] {pct}%[/]"
+                            )
+                elif "Sending invitation" in line:
+                    self.call_from_thread(
+                        self.log_msg, f"[dim]  Connecting to {cam}...[/]"
+                    )
+                elif "Upload size:" in line:
+                    self.call_from_thread(self.log_msg, f"[dim]  {line}[/]")
+                elif "[ERROR]" in line or "Error" in line:
+                    self.call_from_thread(self.log_msg, f"[red]  {line}[/]")
+                # Skip verbose DEBUG/INFO lines from espota
+            else:
+                buf += c
+
+        code = proc.wait()
+        if code == 0:
+            self.call_from_thread(self.log_msg, f"[green]✓ OTA {cam} upload SUCCESS[/]")
+        else:
+            self.call_from_thread(
+                self.log_msg, f"[red]✗ OTA {cam} upload FAILED (exit {code})[/]"
+            )
 
     # ── Discover ──────────────────────────────────────────────────────────────
     async def _discover(self):
