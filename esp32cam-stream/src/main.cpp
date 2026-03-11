@@ -315,14 +315,53 @@ void otaTask(void *) {
     }
 }
 
+// ── LED helpers (GPIO 33, active LOW) ────────────────────────────────────────
+// Blink pattern meanings:
+//   fast blink (100ms) : connecting to WiFi
+//   slow blink (500ms) : WiFi OK, waiting for laptop beacon
+//   solid ON           : streaming (laptop discovered)
+//   3 rapid flashes    : camera init failed
+#define LED_PIN 33
+
+static void ledOn()  { digitalWrite(LED_PIN, LOW);  }
+static void ledOff() { digitalWrite(LED_PIN, HIGH); }
+static void ledBlink(int times, int ms) {
+    for (int i = 0; i < times; i++) {
+        ledOn();  delay(ms);
+        ledOff(); delay(ms);
+    }
+}
+
+void ledTask(void *) {
+    while (true) {
+        if (g_laptop_ip[0] != '\0') {
+            // Laptop discovered — solid on
+            ledOn();
+            vTaskDelay(pdMS_TO_TICKS(500));
+        } else if (WiFi.status() == WL_CONNECTED) {
+            // WiFi OK, no laptop yet — slow blink
+            ledOn();  vTaskDelay(pdMS_TO_TICKS(500));
+            ledOff(); vTaskDelay(pdMS_TO_TICKS(500));
+        } else {
+            // No WiFi — fast blink
+            ledOn();  vTaskDelay(pdMS_TO_TICKS(100));
+            ledOff(); vTaskDelay(pdMS_TO_TICKS(100));
+        }
+    }
+}
+
 // ── Arduino entry points ──────────────────────────────────────────────────────
 void setup() {
     Serial.begin(115200);
     Serial.println("\n== ESP32-CAM UDP stream ==");
 
+    pinMode(LED_PIN, OUTPUT);
+    ledOff();
+
     if (!initCamera()) {
         Serial.println("FATAL: halting");
-        while (true) delay(1000);
+        // 3 rapid flashes = camera init failed
+        while (true) { ledBlink(3, 100); delay(500); }
     }
 
     WiFi.mode(WIFI_STA);
@@ -330,7 +369,8 @@ void setup() {
     Serial.printf("Connecting to %s", WIFI_SSID);
     while (WiFi.status() != WL_CONNECTED) {
         Serial.print('.');
-        delay(500);
+        ledOn();  delay(100);
+        ledOff(); delay(400);
     }
     Serial.printf("\nWi-Fi OK — IP: %s\n", WiFi.localIP().toString().c_str());
 
@@ -344,6 +384,7 @@ void setup() {
     xTaskCreatePinnedToCore(cmdTask,       "cmd",       4096, NULL, 1, NULL, 1);
     xTaskCreatePinnedToCore(otaTask,       "ota",       8192, NULL, 1, NULL, 1);
     xTaskCreatePinnedToCore(discoveryTask, "discovery", 4096, NULL, 1, NULL, 1);
+    xTaskCreatePinnedToCore(ledTask,       "led",       2048, NULL, 1, NULL, 1);
 }
 
 void loop() {
