@@ -4,6 +4,7 @@
 #include <ArduinoOTA.h>
 #include <time.h>
 #include <sys/time.h>
+#include <stdarg.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -23,6 +24,7 @@
 #define LAPTOP_PORT      (5000 + (CAM_ID - 1) * 2)  // cam1=5000  cam2=5002
 #define CMD_PORT         (5001 + (CAM_ID - 1) * 2)  // cam1=5001  cam2=5003
 #define DISCOVERY_PORT   5004                        // shared beacon channel
+#define LOG_PORT         5010                        // UDP debug log to laptop
 #define OTA_HOSTNAME     "esp32cam-" STR(CAM_ID)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -58,6 +60,7 @@ static QueueHandle_t frameQueue;
 static WiFiUDP       udp;
 static WiFiUDP       cmdUdp;
 static WiFiUDP       discUdp;
+static WiFiUDP       logUdp;
 static uint32_t      frameId = 0;
 
 // Laptop IP discovered at runtime via beacon — no hardcoded IP needed
@@ -66,6 +69,26 @@ static char          g_laptop_ip[24] = "";   // empty until beacon received
 // Live-tunable settings (read by captureTask, written by cmdTask)
 static volatile int  g_jpeg_quality = 12;
 static volatile int  g_target_fps   = 30;
+
+// ── UDP log helper ────────────────────────────────────────────────────────────
+// Prints to Serial AND sends a UDP packet to the laptop log listener (port 5010)
+static void udp_log(const char *fmt, ...) {
+    char buf[256];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+
+    Serial.println(buf);
+
+    if (g_laptop_ip[0]) {
+        logUdp.beginPacket(g_laptop_ip, LOG_PORT);
+        char tagged[280];
+        snprintf(tagged, sizeof(tagged), "CAM%d|%s", CAM_ID, buf);
+        logUdp.write((const uint8_t *)tagged, strlen(tagged));
+        logUdp.endPacket();
+    }
+}
 
 // ── Camera init ───────────────────────────────────────────────────────────────
 static bool initCamera() {
@@ -173,6 +196,7 @@ void captureTask(void *) {
             };
             if (xQueueSend(frameQueue, &env, 0) != pdTRUE) {
                 esp_camera_fb_return(fb);
+                udp_log("WARN: frame queue full — dropped frame");
             }
         }
 
@@ -282,8 +306,11 @@ void discoveryTask(void *) {
             char buf[64] = {};
             discUdp.read(buf, sizeof(buf) - 1);
             if (strncmp(buf, "LAPTOP:", 7) == 0) {
+                bool changed = strncmp(g_laptop_ip, buf + 7, sizeof(g_laptop_ip)) != 0;
                 strncpy(g_laptop_ip, buf + 7, sizeof(g_laptop_ip) - 1);
-                Serial.printf("Laptop discovered: %s\n", g_laptop_ip);
+                if (changed) {
+                    udp_log("Laptop discovered: %s", g_laptop_ip);
+                }
             }
         }
 
@@ -354,7 +381,8 @@ void ledTask(void *) {
 void wifiTask(void *) {
     while (true) {
         if (WiFi.status() != WL_CONNECTED) {
-            Serial.println("WiFi lost — reconnecting...");
+            udp_log("WiFi lost — reconnecting (IP was: %s)",
+                    g_laptop_ip[0] ? g_laptop_ip : "none");
             g_laptop_ip[0] = '\0';   // clear so stream pauses until rediscovered
             WiFi.disconnect();
             WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
@@ -365,10 +393,10 @@ void wifiTask(void *) {
             }
 
             if (WiFi.status() == WL_CONNECTED) {
-                Serial.printf("WiFi reconnected — IP: %s\n",
-                              WiFi.localIP().toString().c_str());
+                udp_log("WiFi reconnected — IP: %s",
+                        WiFi.localIP().toString().c_str());
             } else {
-                Serial.println("Reconnect failed — will retry");
+                udp_log("WiFi reconnect failed — will retry");
             }
         }
         vTaskDelay(pdMS_TO_TICKS(5000));  // check every 5s

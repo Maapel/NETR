@@ -34,6 +34,7 @@ NTP_SRV    = ROOT / "ntp_server.py"
 SERIAL_DEV = "/dev/ttyUSB0"
 
 DISCOVERY_PORT = 5004
+LOG_PORT       = 5010   # UDP debug log from ESP32s
 ESP32_MACS = {
     "c4:dd:57:ea:28:5c": "cam1",
     "c4:dd:57:ea:3d:84": "cam2",
@@ -268,6 +269,39 @@ class RigManager(App):
         self._update_cam_cards()
         self.set_interval(30, self._auto_ping)
         self.set_interval(2,  self._poll_procs)
+        threading.Thread(target=self._udp_log_listener, daemon=True).start()
+
+    # ── UDP log listener ───────────────────────────────────────────────────────
+    def _udp_log_listener(self):
+        """Receive CAMx|<message> packets from ESP32s on LOG_PORT and show in log."""
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(("0.0.0.0", LOG_PORT))
+            sock.settimeout(1.0)
+        except Exception as e:
+            self.call_from_thread(self.log_msg, f"[red]UDP log listener failed: {e}[/]")
+            return
+
+        cam_colors = {"1": "cyan", "2": "magenta"}
+        while True:
+            try:
+                data, addr = sock.recvfrom(512)
+                msg = data.decode(errors="ignore").strip()
+                # Expected format: CAM1|<text>  or  CAM2|<text>
+                if msg.startswith("CAM") and "|" in msg:
+                    cam_id, text = msg[3:].split("|", 1)
+                    color = cam_colors.get(cam_id, "white")
+                    self.call_from_thread(
+                        self.log_msg,
+                        f"[[bold {color}]CAM{cam_id}[/]] {text}"
+                    )
+                else:
+                    self.call_from_thread(self.log_msg, f"[dim]{addr[0]}[/] {msg}")
+            except socket.timeout:
+                continue
+            except Exception:
+                continue
 
     # ── Logging ───────────────────────────────────────────────────────────────
     def log_msg(self, msg: str):
