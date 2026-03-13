@@ -22,6 +22,7 @@ from socketserver import ThreadingMixIn
 
 HTTP_PORT      = 8080
 DISCOVERY_PORT = 5004
+TIMESYNC_PORT  = 5005
 FRAME_TIMEOUT  = 0.25    # discard incomplete frames older than this (s)
 SYNC_WINDOW_US = 200_000 # max |ts1-ts2| to call frames "paired" (200 ms)
 RECENT_BUF_US  = 500_000 # how long to keep frames for pairing (500 ms)
@@ -487,6 +488,33 @@ def _own_ip() -> str:
         return s.getsockname()[0]
 
 
+def timesync_server():
+    """
+    NTP-style round-trip responder on UDP 5005.
+    Receives: SYNC_REQ:<cam_id>:<T1_mono_us>
+    Sends:    SYNC_RESP:<T1_mono_us>:<T2_us>:<T3_us>
+    T2 = receive wall time, T3 = send wall time (both in Unix µs).
+    ESP32 computes: corrected_time = T3 + (T4_mono - T1_mono) / 2
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("0.0.0.0", TIMESYNC_PORT))
+    while True:
+        try:
+            data, addr = sock.recvfrom(128)
+            t2 = int(time.time() * 1e6)          # record receive time immediately
+            msg = data.decode(errors="ignore").strip()
+            if msg.startswith("SYNC_REQ:"):
+                # "SYNC_REQ:<cam_id>:<T1_mono>"
+                parts = msg[9:].split(":", 1)
+                if len(parts) == 2:
+                    t1_mono = parts[1]
+                    t3 = int(time.time() * 1e6)  # record send time just before sending
+                    sock.sendto(f"SYNC_RESP:{t1_mono}:{t2}:{t3}".encode(), addr)
+        except Exception:
+            continue
+
+
 def beacon_thread():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
@@ -521,8 +549,9 @@ if __name__ == "__main__":
     print(f"Browser → http://localhost:{HTTP_PORT}")
     threading.Thread(target=QuietHTTPServer(("0.0.0.0", HTTP_PORT), MJPEGHandler).serve_forever,
                      daemon=True).start()
-    threading.Thread(target=beacon_thread, daemon=True).start()
-    threading.Thread(target=sync_tracker, daemon=True).start()
+    threading.Thread(target=beacon_thread,   daemon=True).start()
+    threading.Thread(target=timesync_server, daemon=True).start()
+    threading.Thread(target=sync_tracker,    daemon=True).start()
     threading.Thread(target=watchdog,     daemon=True).start()
     threading.Thread(target=udp_serve, args=(CAMS[1],), daemon=True).start()
     udp_serve(CAMS[2])

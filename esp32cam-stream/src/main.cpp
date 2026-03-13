@@ -24,6 +24,7 @@
 #define LAPTOP_PORT      (5000 + (CAM_ID - 1) * 2)  // cam1=5000  cam2=5002
 #define CMD_PORT         (5001 + (CAM_ID - 1) * 2)  // cam1=5001  cam2=5003
 #define DISCOVERY_PORT   5004                        // shared beacon channel
+#define TIMESYNC_PORT    5005                        // NTP-style round-trip time sync
 #define LOG_PORT         5010                        // UDP debug log to laptop
 #define OTA_HOSTNAME     "esp32cam-" STR(CAM_ID)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -61,6 +62,7 @@ static WiFiUDP       udp;
 static WiFiUDP       cmdUdp;
 static WiFiUDP       discUdp;
 static WiFiUDP       logUdp;
+static WiFiUDP       tsUdp;
 static uint32_t      frameId = 0;
 
 // Laptop IP discovered at runtime via beacon — no hardcoded IP needed
@@ -406,6 +408,67 @@ void ledTask(void *) {
     }
 }
 
+// ── Task: NTP-style round-trip time sync ──────────────────────────────────────
+// Protocol (Cristian's algorithm):
+//   ESP32 → laptop:  "SYNC_REQ:<cam_id>:<T1_mono_us>"
+//   laptop → ESP32:  "SYNC_RESP:<T1_mono_us>:<T2_laptop_us>:<T3_laptop_us>"
+//   ESP32 computes:  RTT = T4_mono - T1_mono
+//                    corrected_time = T3_laptop + RTT/2
+// Both cameras sync to the same laptop clock → inter-cam error ≈ |RTT1-RTT2|/2
+void timeSyncTask(void *) {
+    tsUdp.begin(TIMESYNC_PORT);
+
+    while (true) {
+        if (!g_laptop_ip[0]) {
+            vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
+        }
+
+        // T1: monotonic timestamp (µs since boot) — unaffected by settimeofday
+        int64_t t1 = (int64_t)esp_timer_get_time();
+
+        char req[64];
+        snprintf(req, sizeof(req), "SYNC_REQ:%d:%lld", CAM_ID, (long long)t1);
+        tsUdp.beginPacket(g_laptop_ip, TIMESYNC_PORT);
+        tsUdp.write((const uint8_t *)req, strlen(req));
+        tsUdp.endPacket();
+
+        // Wait up to 300 ms for response
+        uint32_t deadline_ms = millis() + 300;
+        bool synced = false;
+        while (millis() < deadline_ms && !synced) {
+            int len = tsUdp.parsePacket();
+            if (len > 0) {
+                char buf[128] = {};
+                tsUdp.read(buf, sizeof(buf) - 1);
+                if (strncmp(buf, "SYNC_RESP:", 10) == 0) {
+                    char *p = buf + 10;
+                    int64_t t1_echo   = strtoll(p, &p, 10); p++;
+                    int64_t t2_laptop = strtoll(p, &p, 10); p++;
+                    int64_t t3_laptop = strtoll(p, &p, 10);
+
+                    int64_t t4  = (int64_t)esp_timer_get_time();
+                    int64_t rtt = t4 - t1_echo;          // round-trip in µs
+                    int64_t corrected_us = t3_laptop + rtt / 2;
+
+                    struct timeval tv;
+                    tv.tv_sec  = (time_t)(corrected_us / 1000000LL);
+                    tv.tv_usec = (suseconds_t)(corrected_us % 1000000LL);
+                    settimeofday(&tv, NULL);
+
+                    udp_log("TimeSync: RTT=%lldus one-way~%lldus", (long long)rtt, (long long)(rtt / 2));
+                    synced = true;
+                }
+            }
+            vTaskDelay(pdMS_TO_TICKS(5));
+        }
+        if (!synced)
+            udp_log("TimeSync: no response from laptop");
+
+        vTaskDelay(pdMS_TO_TICKS(10000));   // re-sync every 10 s
+    }
+}
+
 // ── Task: WiFi watchdog — reconnects if connection drops ──────────────────────
 void wifiTask(void *) {
     while (true) {
@@ -467,6 +530,7 @@ void setup() {
     xTaskCreatePinnedToCore(cmdTask,       "cmd",       4096, NULL, 1, NULL, 1);
     xTaskCreatePinnedToCore(otaTask,       "ota",       8192, NULL, 1, NULL, 1);
     xTaskCreatePinnedToCore(discoveryTask, "discovery", 4096, NULL, 1, NULL, 1);
+    xTaskCreatePinnedToCore(timeSyncTask,  "timesync",  4096, NULL, 1, NULL, 1);
     xTaskCreatePinnedToCore(ledTask,       "led",       2048, NULL, 1, NULL, 1);
     xTaskCreatePinnedToCore(wifiTask,      "wifi_wd",   4096, NULL, 1, NULL, 1);
 }
