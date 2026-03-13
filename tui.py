@@ -231,6 +231,31 @@ class RigManager(App):
         self.set_interval(30, self._auto_ping)
         self.set_interval(2,  self._poll_procs)
         threading.Thread(target=self._udp_log_listener, daemon=True).start()
+        threading.Thread(target=self._timesync_server,  daemon=True).start()
+
+    # ── Timesync responder ────────────────────────────────────────────────────
+    def _timesync_server(self):
+        """Respond to SYNC_REQ from ESP32s so round-trip time sync works
+        even when receiver.py is not running."""
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(("0.0.0.0", 5005))
+        except Exception as e:
+            self.call_from_thread(self.log_msg, f"[red]Timesync server failed: {e}[/]")
+            return
+        while True:
+            try:
+                data, addr = sock.recvfrom(128)
+                t2 = int(time.time() * 1e6)
+                msg = data.decode(errors="ignore").strip()
+                if msg.startswith("SYNC_REQ:"):
+                    parts = msg[9:].split(":", 1)
+                    if len(parts) == 2:
+                        t3 = int(time.time() * 1e6)
+                        sock.sendto(f"SYNC_RESP:{parts[1]}:{t2}:{t3}".encode(), addr)
+            except Exception:
+                continue
 
     # ── UDP log listener ──────────────────────────────────────────────────────
     def _udp_log_listener(self):
