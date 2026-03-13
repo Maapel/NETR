@@ -495,10 +495,11 @@ def beacon_thread():
     sock.settimeout(1.0)
 
     own_ip = _own_ip()
-    msg = f"LAPTOP:{own_ip}".encode()
-    print(f"Beacon: {msg.decode()}  UDP:{DISCOVERY_PORT}")
+    print(f"Beacon: LAPTOP:{own_ip}  UDP:{DISCOVERY_PORT}")
 
     while True:
+        # Include current timestamp so ESP32s sync their clock from the beacon
+        msg = f"LAPTOP:{own_ip}:{int(time.time() * 1e6):.0f}".encode()
         sock.sendto(msg, ("255.255.255.255", DISCOVERY_PORT))
         try:
             data, addr = sock.recvfrom(64)

@@ -169,7 +169,6 @@ class RigManager(App):
     TITLE = "NETR"
     BINDINGS = [
         Binding("r",     "toggle_receiver", "Receiver"),
-        Binding("n",     "toggle_ntp",      "NTP"),
         Binding("d",     "discover",        "Discover"),
         Binding("s",     "scan",            "Scan"),
         Binding("m",     "monitor",         "Monitor"),
@@ -177,7 +176,6 @@ class RigManager(App):
     ]
 
     receiver_running = reactive(False)
-    ntp_running      = reactive(False)
 
     def __init__(self):
         super().__init__()
@@ -186,7 +184,6 @@ class RigManager(App):
             "cam2": CamState("cam2"),
         }
         self._receiver_proc: subprocess.Popen | None = None
-        self._ntp_proc:      subprocess.Popen | None = None
         self._upload_proc:   subprocess.Popen | None = None
 
     # ── Layout ────────────────────────────────────────────────────────────────
@@ -203,7 +200,6 @@ class RigManager(App):
                 yield Static("── SERVICES ──", classes="panel-title")
                 with Horizontal(classes="service-row"):
                     yield Button("▶ Receiver", id="btn-receiver")
-                    yield Button("▶ NTP",      id="btn-ntp")
 
                 yield Static("── OTA UPLOAD ──", classes="panel-title")
                 with Horizontal(classes="service-row"):
@@ -308,22 +304,12 @@ class RigManager(App):
             self.query_one("#btn-receiver", Button).remove_class("running")
             self.log_msg("[yellow]Receiver stopped[/]")
 
-        if self._ntp_proc and self._ntp_proc.poll() is not None:
-            self._ntp_proc = None
-            self.ntp_running = False
-            self.query_one("#btn-ntp", Button).label = "▶ NTP"
-            self.query_one("#btn-ntp", Button).remove_class("running")
-            self.log_msg("[yellow]NTP stopped[/]")
-
         if self._upload_proc and self._upload_proc.poll() is not None:
             self._upload_proc = None
 
     # ── Actions ───────────────────────────────────────────────────────────────
     def action_toggle_receiver(self):
         self.on_button_pressed(Button.Pressed(self.query_one("#btn-receiver")))
-
-    def action_toggle_ntp(self):
-        self.on_button_pressed(Button.Pressed(self.query_one("#btn-ntp")))
 
     def action_discover(self):
         self.on_button_pressed(Button.Pressed(self.query_one("#btn-discover")))
@@ -338,7 +324,6 @@ class RigManager(App):
     def on_button_pressed(self, event: Button.Pressed) -> None:
         bid = event.button.id
         if   bid == "btn-receiver":  self._toggle_receiver()
-        elif bid == "btn-ntp":       self._toggle_ntp()
         elif bid == "btn-cam1-ota":  self._ota_upload("cam1")
         elif bid == "btn-cam2-ota":  self._ota_upload("cam2")
         elif bid == "btn-cam1-usb":  self._usb_flash("cam1")
@@ -362,22 +347,6 @@ class RigManager(App):
             )
             btn.label = "■ Receiver"; btn.add_class("running")
             self.log_msg("[green]Receiver started[/] → http://localhost:8080")
-
-    # ── NTP ───────────────────────────────────────────────────────────────────
-    def _toggle_ntp(self):
-        btn = self.query_one("#btn-ntp", Button)
-        if self._ntp_proc and self._ntp_proc.poll() is None:
-            self._ntp_proc.terminate()
-            self._ntp_proc = None
-            btn.label = "▶ NTP"; btn.remove_class("running")
-            self.log_msg("[yellow]NTP stopped[/]")
-        else:
-            self._ntp_proc = subprocess.Popen(
-                ["sudo", str(PYTHON), str(NTP_SRV)],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
-            btn.label = "■ NTP"; btn.add_class("running")
-            self.log_msg("[green]NTP started[/] on UDP:123")
 
     # ── OTA upload ────────────────────────────────────────────────────────────
     def _ota_upload(self, cam: str):
@@ -477,9 +446,9 @@ class RigManager(App):
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock.bind(("0.0.0.0", DISCOVERY_PORT))
             sock.settimeout(1.0)
-            beacon   = f"LAPTOP:{own_ip()}".encode()
             deadline = time.monotonic() + 12
             while time.monotonic() < deadline:
+                beacon = f"LAPTOP:{own_ip()}:{int(time.time()*1e6):.0f}".encode()
                 sock.sendto(beacon, ("255.255.255.255", DISCOVERY_PORT))
                 try:
                     data, addr = sock.recvfrom(64)

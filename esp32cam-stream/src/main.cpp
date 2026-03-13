@@ -5,7 +5,6 @@
 #include <time.h>
 #include <sys/time.h>
 #include <stdarg.h>
-#include "esp_sntp.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -144,23 +143,15 @@ static bool initCamera() {
     return true;
 }
 
-// ── NTP sync ──────────────────────────────────────────────────────────────────
-static void syncTime() {
-    configTime(0, 0, g_laptop_ip[0] ? g_laptop_ip : "pool.ntp.org");
-    Serial.print("NTP sync");
-    struct tm ti;
-    int retries = 0;
-    while (!getLocalTime(&ti) && retries++ < 20) {
-        Serial.print('.');
-        delay(500);
-    }
-    if (retries >= 20) {
-        Serial.println("\nWARN: NTP timed out");
-    } else {
-        char buf[32];
-        strftime(buf, sizeof(buf), "%H:%M:%S", &ti);
-        Serial.printf(" OK: %s UTC\n", buf);
-    }
+// ── Beacon-based clock sync ────────────────────────────────────────────────────
+// Laptop embeds its Unix timestamp (µs) in the beacon: "LAPTOP:<ip>:<unix_us>"
+// We call settimeofday() directly — no SNTP, no port 123, no sudo needed.
+static void syncTimeFromBeacon(int64_t laptop_us) {
+    struct timeval tv;
+    tv.tv_sec  = (time_t)(laptop_us / 1000000LL);
+    tv.tv_usec = (suseconds_t)(laptop_us % 1000000LL);
+    settimeofday(&tv, NULL);
+    udp_log("Clock synced from beacon — %ld.%06ld", (long)tv.tv_sec, (long)tv.tv_usec);
 }
 
 // ── Task: capture at target FPS ───────────────────────────────────────────────
@@ -304,18 +295,36 @@ void discoveryTask(void *) {
             lastAnnounce = xTaskGetTickCount();
         }
 
-        // Listen for laptop beacon
+        // Listen for laptop beacon: "LAPTOP:<ip>:<unix_us>"
         int len = discUdp.parsePacket();
         if (len > 0) {
-            char buf[64] = {};
+            char buf[80] = {};
             discUdp.read(buf, sizeof(buf) - 1);
             if (strncmp(buf, "LAPTOP:", 7) == 0) {
-                bool changed = strncmp(g_laptop_ip, buf + 7, sizeof(g_laptop_ip)) != 0;
-                strncpy(g_laptop_ip,      buf + 7, sizeof(g_laptop_ip) - 1);
-                strncpy(g_last_laptop_ip, buf + 7, sizeof(g_last_laptop_ip) - 1);
-                if (changed) {
-                    udp_log("Laptop discovered: %s", g_laptop_ip);
+                char *rest   = buf + 7;
+                char *colon2 = strchr(rest, ':');
+
+                char new_ip[24] = {};
+                int64_t beacon_us = 0;
+
+                if (colon2) {
+                    size_t ip_len = colon2 - rest;
+                    if (ip_len < sizeof(new_ip))
+                        memcpy(new_ip, rest, ip_len);
+                    beacon_us = atoll(colon2 + 1);
+                } else {
+                    strncpy(new_ip, rest, sizeof(new_ip) - 1);
                 }
+
+                bool changed = strncmp(g_laptop_ip, new_ip, sizeof(g_laptop_ip)) != 0;
+                strncpy(g_laptop_ip,      new_ip, sizeof(g_laptop_ip) - 1);
+                strncpy(g_last_laptop_ip, new_ip, sizeof(g_last_laptop_ip) - 1);
+                if (changed)
+                    udp_log("Laptop discovered: %s", g_laptop_ip);
+
+                // Sync clock from beacon timestamp (no NTP/port-123 needed)
+                if (beacon_us > 1000000000000000LL)   // sanity: > year 2001 in µs
+                    syncTimeFromBeacon(beacon_us);
             }
         }
 
@@ -401,23 +410,7 @@ void wifiTask(void *) {
                 udp_log("WiFi reconnected — IP: %s",
                         WiFi.localIP().toString().c_str());
 
-                // Re-sync NTP; prefer laptop server, fall back to pool
-                const char *ntp_server = g_last_laptop_ip[0] ? g_last_laptop_ip : "pool.ntp.org";
-                configTime(0, 0, ntp_server);
-                udp_log("NTP sync started → %s", ntp_server);
-
-                // Wait up to 10 s for SNTP to confirm sync
-                int ntp_tries = 0;
-                while (sntp_get_sync_status() == SNTP_SYNC_STATUS_RESET && ntp_tries++ < 20) {
-                    vTaskDelay(pdMS_TO_TICKS(500));
-                }
-                if (sntp_get_sync_status() != SNTP_SYNC_STATUS_RESET) {
-                    struct timeval tv;
-                    gettimeofday(&tv, NULL);
-                    udp_log("NTP sync OK — Unix time %ld", (long)tv.tv_sec);
-                } else {
-                    udp_log("NTP sync timeout — clock may be stale");
-                }
+                // Clock will re-sync automatically once beacon resumes
             } else {
                 udp_log("WiFi reconnect failed — will retry");
             }
@@ -449,8 +442,7 @@ void setup() {
         ledOff(); delay(400);
     }
     Serial.printf("\nWi-Fi OK — IP: %s\n", WiFi.localIP().toString().c_str());
-
-    syncTime();
+    // Clock syncs from laptop beacon — no NTP server needed
 
     udp.begin(LAPTOP_PORT);
 
