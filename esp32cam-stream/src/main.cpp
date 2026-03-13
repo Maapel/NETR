@@ -70,6 +70,8 @@ static char          g_last_laptop_ip[24] = "";  // last known — kept for logg
 // Live-tunable settings (read by captureTask, written by cmdTask)
 static volatile int  g_jpeg_quality = 12;
 static volatile int  g_target_fps   = 30;
+// Set during OTA — pauses capture+send so WiFi bandwidth goes to the upload
+static volatile bool g_ota_active   = false;
 
 // ── UDP log helper ────────────────────────────────────────────────────────────
 // Prints to Serial AND sends a UDP packet to the laptop log listener (port 5010)
@@ -165,6 +167,11 @@ void captureTask(void *) {
     s->set_quality(s, last_q);
 
     while (true) {
+        if (g_ota_active) {
+            vTaskDelay(pdMS_TO_TICKS(200));
+            continue;
+        }
+
         // Apply quality only when it actually changes
         int q = g_jpeg_quality;
         if (q != last_q) {
@@ -206,6 +213,11 @@ void sendTask(void *) {
     while (true) {
         FrameEnvelope env;
         if (xQueueReceive(frameQueue, &env, pdMS_TO_TICKS(500)) != pdTRUE) {
+            continue;
+        }
+
+        if (g_ota_active) {
+            esp_camera_fb_return(env.fb);   // free buffer, don't transmit
             continue;
         }
 
@@ -338,13 +350,16 @@ void otaTask(void *) {
     ArduinoOTA.setPassword(OTA_PASSWORD);
 
     ArduinoOTA.onStart([]() {
-        Serial.println("OTA start — suspending stream");
+        g_ota_active = true;
+        udp_log("OTA started — stream paused for full bandwidth");
     });
     ArduinoOTA.onEnd([]() {
-        Serial.println("OTA done — rebooting");
+        udp_log("OTA done — rebooting");
+        g_ota_active = false;
     });
     ArduinoOTA.onError([](ota_error_t e) {
-        Serial.printf("OTA error [%u]\n", e);
+        g_ota_active = false;
+        udp_log("OTA error [%u] — stream resumed", e);
     });
 
     ArduinoOTA.begin();
