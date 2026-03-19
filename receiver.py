@@ -36,6 +36,7 @@ except ImportError:
     _PUPIL_OK = False
 
 g_analysis_enabled = False   # toggled via /set?analysis=1|0
+g_debug_view = "original"    # "original", "p_suppressed", "p_blurred", "p_thresh", "p_morph", "g_thresh", "g_morph"
 
 # ── Eye pipeline settings (persistent) ────────────────────────────────────────
 import pathlib as _pathlib_eye
@@ -89,25 +90,43 @@ def _apply_pupil_overlay(data: bytes, roi: list[float] = None) -> bytes:
         return data
 
     h, w = bgr.shape[:2]
+    result = None
+    
     if roi and roi != [0.0, 0.0, 1.0, 1.0]:
         x1, y1, x2, y2 = int(roi[0]*w), int(roi[1]*h), int(roi[2]*w), int(roi[3]*h)
-        # Ensure valid crop
         x1, y1 = max(0, x1), max(0, y1)
         x2, y2 = min(w, x2), min(h, y2)
         if x2 > x1 and y2 > y1:
             crop = bgr[y1:y2, x1:x2]
             gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
             result = _eye_pipe.process(gray)
-            # Draw result on crop, but we need to pass the full image or adjust coordinates
-            # EyePipeline.draw expects the same image that was processed
-            crop = EyePipeline.draw(crop, result)
-            bgr[y1:y2, x1:x2] = crop
+            
+            # If a specific debug view is requested, replace the crop with that view
+            if g_debug_view in result.intermediate_frames:
+                dbg = result.intermediate_frames[g_debug_view]
+                if len(dbg.shape) == 2: # grayscale
+                    dbg = cv2.cvtColor(dbg, cv2.COLOR_GRAY2BGR)
+                # Resize if necessary (though it should match the crop)
+                if dbg.shape[:2] != (y2-y1, x2-x1):
+                    dbg = cv2.resize(dbg, (x2-x1, y2-y1))
+                bgr[y1:y2, x1:x2] = dbg
+            else:
+                crop = EyePipeline.draw(crop, result)
+                bgr[y1:y2, x1:x2] = crop
+            
             # Draw ROI box
             cv2.rectangle(bgr, (x1, y1), (x2, y2), (0, 0, 255), 1)
     else:
         gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
         result = _eye_pipe.process(gray)
-        bgr = EyePipeline.draw(bgr, result)
+        
+        if g_debug_view in result.intermediate_frames:
+            dbg = result.intermediate_frames[g_debug_view]
+            if len(dbg.shape) == 2:
+                dbg = cv2.cvtColor(dbg, cv2.COLOR_GRAY2BGR)
+            bgr = dbg
+        else:
+            bgr = EyePipeline.draw(bgr, result)
 
     _, enc = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
     return enc.tobytes()
@@ -555,12 +574,15 @@ class MJPEGHandler(BaseHTTPRequestHandler):
     }
 
     def _set_cmd(self, query: str):
-        global g_analysis_enabled, g_settings
+        global g_analysis_enabled, g_settings, g_debug_view
         import urllib.parse
         params = dict(urllib.parse.parse_qsl(query))
         cmds = []
         if "analysis" in params:
             g_analysis_enabled = params["analysis"] != "0"
+        
+        if "debug_view" in params:
+            g_debug_view = params["debug_view"]
 
         # ROI settings (x1,y1,x2,y2 normalized)
         new_roi = None
@@ -748,7 +770,8 @@ class MJPEGHandler(BaseHTTPRequestHandler):
   </div>
   <div id="feedback"></div>
 
-  <details style="margin:8px 0; border:1px solid #444; border-radius:4px; padding:4px 8px; background:#1a2a1a">
+  <div style="display:flex; gap:12px; width:100%; flex-wrap:wrap; align-items:flex-start">
+    <details style="flex:1; min-width:350px; border:1px solid #444; border-radius:4px; padding:4px 8px; background:#1a2a1a">
     <summary style="cursor:pointer; color:#8f8; font-weight:bold; padding:4px 0">
       Camera Hardware Settings
     </summary>
@@ -852,13 +875,25 @@ class MJPEGHandler(BaseHTTPRequestHandler):
       </div>
     </div>
     <button onclick="applySettings()">Apply</button>
-  </details>
+    </details>
 
-  <details style="margin:8px 0; border:1px solid #444; border-radius:4px; padding:4px 8px; background:#1a1a2e">
+    <details style="flex:1; min-width:350px; border:1px solid #444; border-radius:4px; padding:4px 8px; background:#1a1a2e">
     <summary style="cursor:pointer; color:#8df; font-weight:bold; padding:4px 0">
       Eye Pipeline Settings
     </summary>
     <div style="display:grid; grid-template-columns:1fr 1fr; gap:4px 16px; padding:8px 0; font-size:12px">
+      <div class="ctrl-group">
+        <span style="color:#adf">Debug View</span>
+        <select id="debug_view" onchange="applyDebugView(this.value)">
+          <option value="original">Final Result (Overlay)</option>
+          <option value="p_suppressed">Pupil: Glint Suppressed</option>
+          <option value="p_blurred">Pupil: Blurred</option>
+          <option value="p_thresh">Pupil: Threshold</option>
+          <option value="p_morph">Pupil: Morphological</option>
+          <option value="g_thresh">Glint: Threshold</option>
+          <option value="g_morph">Glint: Morphological</option>
+        </select>
+      </div>
       <div class="ctrl-group">
         <span style="color:#8f8">Pupil -Glint suppress thresh: <b id="p_glint_thresh_val">200</b></span>
         <input type="range" min="10" max="255" value="200" id="p_glint_thresh"
@@ -925,7 +960,8 @@ class MJPEGHandler(BaseHTTPRequestHandler):
       <button onclick="saveEyeSettings()" style="background:#862">Save Eye</button>
     </div>
     <div id="eye-feedback" style="font-size:11px; color:#8df; min-height:14px"></div>
-  </details>
+    </details>
+  </div>
 
 <script>
 // ── Synchronized canvas display ───────────────────────────────────────────────
@@ -1124,6 +1160,10 @@ const EYE_FLOAT_SCALE = {
 function eyeSliderVal(key) {
   const raw = +document.getElementById(key).value;
   return (key in EYE_FLOAT_SCALE) ? raw / EYE_FLOAT_SCALE[key] : raw;
+}
+
+function applyDebugView(val) {
+  fetch('/set?debug_view=' + val).then(r => r.json());
 }
 
 function applyEyeSettings() {
