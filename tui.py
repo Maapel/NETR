@@ -171,6 +171,22 @@ Button.usb     { background: $warning-darken-2; }
     border: solid $accent;
 }
 
+.log-filters {
+    height: 1;
+    align: left middle;
+}
+.log-filters Button {
+    min-width: 6;
+    height: 1;
+    margin: 0;
+    padding: 0 1;
+}
+.log-filters Button.filter-active {
+    background: $accent;
+    color: $text;
+    text-style: bold;
+}
+
 .pupil-row {
     height: 1;
     padding: 0 1;
@@ -200,6 +216,8 @@ class RigManager(App):
     receiver_running  = reactive(False)
     analysis_enabled  = reactive(False)
 
+    LOG_GROUPS = ("all", "cam1", "cam2", "ota", "sys")
+
     def __init__(self):
         super().__init__()
         self.cams: dict[str, CamState] = {
@@ -208,6 +226,8 @@ class RigManager(App):
         }
         self._receiver_proc: subprocess.Popen | None = None
         self._upload_procs:  dict[str, subprocess.Popen] = {}  # keyed by cam id
+        self._log_entries: list[tuple[str, str]] = []  # (group, rendered_msg)
+        self._log_filter: str = "all"
 
     # ── Layout ────────────────────────────────────────────────────────────────
     def compose(self) -> ComposeResult:
@@ -243,6 +263,12 @@ class RigManager(App):
 
             with Vertical(id="right-panel"):
                 yield Static("── LOG ──", classes="panel-title")
+                with Horizontal(classes="log-filters"):
+                    yield Button("All", id="flt-all", classes="filter-active")
+                    yield Button("CAM1", id="flt-cam1")
+                    yield Button("CAM2", id="flt-cam2")
+                    yield Button("OTA", id="flt-ota")
+                    yield Button("Sys", id="flt-sys")
                 yield RichLog(id="log", highlight=True, markup=True)
                 yield Static("── PUPIL ANALYSIS ──", classes="panel-title")
                 with Vertical(id="analysis-section"):
@@ -257,8 +283,8 @@ class RigManager(App):
 
     def on_mount(self) -> None:
         self._update_cam_cards()
-        self.log_msg("[bold cyan]NETR[/] started")
-        self.log_msg(f"Laptop IP: [bold]{own_ip()}[/]")
+        self.log_msg("[bold cyan]NETR[/] started", "sys")
+        self.log_msg(f"Laptop IP: [bold]{own_ip()}[/]", "sys")
         self.set_interval(30, self._auto_ping)
         self.set_interval(2,  self._poll_procs)
         threading.Thread(target=self._udp_log_listener, daemon=True).start()
@@ -330,27 +356,37 @@ class RigManager(App):
             self.call_from_thread(self.log_msg, f"[red]UDP log listener failed: {e}[/]")
             return
 
-        cam_colors = {"1": "cyan", "2": "magenta"}
         while True:
             try:
                 data, addr = sock.recvfrom(512)
                 msg = data.decode(errors="ignore").strip()
                 if msg.startswith("CAM") and "|" in msg:
                     cam_id, text = msg[3:].split("|", 1)
-                    color = cam_colors.get(cam_id, "white")
-                    self.call_from_thread(
-                        self.log_msg, f"[[bold {color}]CAM{cam_id}[/]] {text}"
-                    )
+                    group = f"cam{cam_id}"
+                    self.call_from_thread(self.log_msg, text, group)
                 else:
-                    self.call_from_thread(self.log_msg, f"[dim]{addr[0]}[/] {msg}")
+                    self.call_from_thread(self.log_msg, f"[dim]{addr[0]}[/] {msg}", "sys")
             except socket.timeout:
                 continue
             except Exception:
                 continue
 
     # ── Logging ───────────────────────────────────────────────────────────────
-    def log_msg(self, msg: str):
-        self.query_one("#log", RichLog).write(f"[dim]{now()}[/]  {msg}")
+    def log_msg(self, msg: str, group: str = "sys"):
+        tag_colors = {"cam1": "cyan", "cam2": "magenta", "ota": "yellow", "sys": "dim white"}
+        color = tag_colors.get(group, "white")
+        tag = f"[{color}]{group.upper():>4}[/]"
+        rendered = f"[dim]{now()}[/] {tag}  {msg}"
+        self._log_entries.append((group, rendered))
+        if self._log_filter == "all" or self._log_filter == group:
+            self.query_one("#log", RichLog).write(rendered)
+
+    def _refilter_log(self):
+        log = self.query_one("#log", RichLog)
+        log.clear()
+        for group, rendered in self._log_entries:
+            if self._log_filter == "all" or self._log_filter == group:
+                log.write(rendered)
 
     # ── Camera cards ──────────────────────────────────────────────────────────
     def _update_cam_cards(self):
@@ -389,7 +425,7 @@ class RigManager(App):
             self.receiver_running = False
             self.query_one("#btn-receiver", Button).label = "▶ Receiver"
             self.query_one("#btn-receiver", Button).remove_class("running")
-            self.log_msg("[yellow]Receiver stopped[/]")
+            self.log_msg("[yellow]Receiver stopped[/]", "sys")
 
         done = [cam for cam, p in self._upload_procs.items() if p.poll() is not None]
         for cam in done:
@@ -420,6 +456,16 @@ class RigManager(App):
         elif bid == "btn-discover":  self.run_worker(self._discover(), exclusive=True)
         elif bid == "btn-scan":      self.run_worker(self._scan(),    exclusive=True)
         elif bid == "btn-monitor":   self._open_monitor()
+        elif bid and bid.startswith("flt-"):
+            group = bid[4:]  # "all", "cam1", "cam2", "ota", "sys"
+            self._log_filter = group
+            for g in self.LOG_GROUPS:
+                btn = self.query_one(f"#flt-{g}", Button)
+                if g == group:
+                    btn.add_class("filter-active")
+                else:
+                    btn.remove_class("filter-active")
+            self._refilter_log()
 
     # ── Receiver ──────────────────────────────────────────────────────────────
     def _toggle_receiver(self):
@@ -429,7 +475,7 @@ class RigManager(App):
             self._receiver_proc = None
             self.receiver_running = False
             btn.label = "▶ Receiver"; btn.remove_class("running")
-            self.log_msg("[yellow]Receiver stopped[/]")
+            self.log_msg("[yellow]Receiver stopped[/]", "sys")
         else:
             self._receiver_proc = subprocess.Popen(
                 [str(PYTHON), str(RECEIVER)],
@@ -437,18 +483,18 @@ class RigManager(App):
             )
             self.receiver_running = True
             btn.label = "■ Receiver"; btn.add_class("running")
-            self.log_msg("[green]Receiver started[/] → http://localhost:8080")
+            self.log_msg("[green]Receiver started[/] → http://localhost:8080", "sys")
 
     # ── OTA upload ────────────────────────────────────────────────────────────
     def _ota_upload(self, cam: str):
         if cam in self._upload_procs and self._upload_procs[cam].poll() is None:
-            self.log_msg(f"[yellow]{cam} OTA already in progress[/]"); return
+            self.log_msg(f"[yellow]{cam} OTA already in progress[/]", "ota"); return
 
         cam_state = self.cams[cam]
         if not cam_state.ip:
-            self.log_msg(f"[red]{cam} IP unknown — run Discover first[/]"); return
+            self.log_msg(f"[red]{cam} IP unknown — run Discover first[/]", "ota"); return
 
-        self.log_msg(f"[cyan]OTA → {cam} ({cam_state.ip})[/]")
+        self.log_msg(f"[cyan]OTA → {cam} ({cam_state.ip})[/]", "ota")
         proc = subprocess.Popen(
             [str(PIO), "run", "-e", f"{cam}_ota", "--target", "upload"],
             cwd=ROOT / "esp32cam-stream",
@@ -463,7 +509,7 @@ class RigManager(App):
     # ── USB flash ─────────────────────────────────────────────────────────────
     def _usb_flash(self, cam: str):
         if cam in self._upload_procs and self._upload_procs[cam].poll() is None:
-            self.log_msg(f"[yellow]{cam} upload already in progress[/]"); return
+            self.log_msg(f"[yellow]{cam} upload already in progress[/]", "ota"); return
 
         if not Path(SERIAL_DEV).exists():
             self.log_msg(
@@ -509,28 +555,28 @@ class RigManager(App):
                             filled = int(20 * pct / 100)
                             bar = "█" * filled + "░" * (20 - filled)
                             self.call_from_thread(
-                                self.log_msg, f"[cyan]  [{bar}] {pct}%[/]"
+                                self.log_msg, f"[cyan]  [{bar}] {pct}%[/]", "ota"
                             )
                 elif "Sending invitation" in line:
-                    self.call_from_thread(self.log_msg, f"[dim]  Connecting to {cam}...[/]")
+                    self.call_from_thread(self.log_msg, f"[dim]  Connecting to {cam}...[/]", "ota")
                 elif "Upload size:" in line or "Writing at" in line[:20]:
-                    self.call_from_thread(self.log_msg, f"[dim]  {line}[/]")
+                    self.call_from_thread(self.log_msg, f"[dim]  {line}[/]", "ota")
                 elif "[ERROR]" in line or "Error" in line or "Failed" in line:
-                    self.call_from_thread(self.log_msg, f"[red]  {line}[/]")
+                    self.call_from_thread(self.log_msg, f"[red]  {line}[/]", "ota")
                 elif "Chip is" in line or "Flash params" in line:
-                    self.call_from_thread(self.log_msg, f"[dim]  {line}[/]")
+                    self.call_from_thread(self.log_msg, f"[dim]  {line}[/]", "ota")
             else:
                 buf += c
 
         code = proc.wait()
         if code == 0:
-            self.call_from_thread(self.log_msg, f"[green]✓ {method} {cam} SUCCESS[/]")
+            self.call_from_thread(self.log_msg, f"[green]✓ {method} {cam} SUCCESS[/]", "ota")
         else:
-            self.call_from_thread(self.log_msg, f"[red]✗ {method} {cam} FAILED (exit {code})[/]")
+            self.call_from_thread(self.log_msg, f"[red]✗ {method} {cam} FAILED (exit {code})[/]", "ota")
 
     # ── Discover ──────────────────────────────────────────────────────────────
     async def _discover(self):
-        self.log_msg("[cyan]Discovering cameras...[/]")
+        self.log_msg("[cyan]Discovering cameras...[/]", "sys")
         found: dict[str, str] = {}
 
         try:
@@ -550,49 +596,49 @@ class RigManager(App):
                         cam_id = "cam" + txt[4:]
                         if cam_id in self.cams and cam_id not in found:
                             found[cam_id] = addr[0]
-                            self.log_msg(f"[green]Beacon: {cam_id} → {addr[0]}[/]")
+                            self.log_msg(f"[green]Beacon: {cam_id} → {addr[0]}[/]", "sys")
                 except socket.timeout:
                     pass
                 await asyncio.sleep(0.1)
             sock.close()
         except Exception as e:
-            self.log_msg(f"[yellow]Beacon error: {e}[/]")
+            self.log_msg(f"[yellow]Beacon error: {e}[/]", "sys")
 
         if len(found) < 2:
-            self.log_msg("[cyan]Subnet scan for remaining cameras...[/]")
+            self.log_msg("[cyan]Subnet scan for remaining cameras...[/]", "sys")
             loop    = asyncio.get_event_loop()
             scanned = await loop.run_in_executor(None, scan_for_esps)
             for cam, ip in scanned.items():
                 if cam not in found:
                     found[cam] = ip
-                    self.log_msg(f"[green]Scan: {cam} → {ip}[/]")
+                    self.log_msg(f"[green]Scan: {cam} → {ip}[/]", "sys")
 
         if not found:
-            self.log_msg("[red]No cameras found[/]"); return
+            self.log_msg("[red]No cameras found[/]", "sys"); return
 
         for cam, ip in found.items():
             self.cams[cam].ip     = ip
             self.cams[cam].online = True
             self.cams[cam].note   = "discovered"
             if update_pio_ini(cam, ip):
-                self.log_msg(f"[dim]platformio.ini: {cam}_ota → {ip}[/]")
+                self.log_msg(f"[dim]platformio.ini: {cam}_ota → {ip}[/]", "sys")
 
         self._update_cam_cards()
 
     # ── Scan ──────────────────────────────────────────────────────────────────
     async def _scan(self):
-        self.log_msg("[cyan]Scanning subnet...[/]")
+        self.log_msg("[cyan]Scanning subnet...[/]", "sys")
         loop  = asyncio.get_event_loop()
         found = await loop.run_in_executor(None, scan_for_esps)
         if not found:
-            self.log_msg("[red]No ESP32-CAMs found[/]"); return
+            self.log_msg("[red]No ESP32-CAMs found[/]", "sys"); return
         for cam, ip in found.items():
             rtt = ping_host(ip)
             self.cams[cam].ip     = ip
             self.cams[cam].online = rtt is not None
             self.cams[cam].ping   = rtt
             self.cams[cam].note   = "found via scan"
-            self.log_msg(f"[green]{cam}[/] → {ip}  {rtt:.0f}ms")
+            self.log_msg(f"[green]{cam}[/] → {ip}  {rtt:.0f}ms", "sys")
         self._update_cam_cards()
 
     # ── Serial monitor ────────────────────────────────────────────────────────
