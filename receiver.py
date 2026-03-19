@@ -14,11 +14,112 @@ Open http://localhost:8080 in your browser.
 
 import socket
 import struct
+import sys
 import time
 import threading
 import json
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
+
+# ── Pupil detection (optional — requires cv2/numpy) ───────────────────────────
+# Inlined from /home/maadhav/iot-software/pupil_detection.py — cv2/numpy only,
+# no pygame dependency.
+try:
+    import cv2
+    import numpy as np
+
+    _clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    _GLINT_THRESH = 190
+    _HOUGH_P1, _HOUGH_P2 = 50, 20
+    _R_MIN, _R_MAX = 30, 160
+    _SX, _SY = (0.25, 0.75), (0.10, 0.75)
+
+    def _detect_pupil(gray, _unused):
+        h, w = gray.shape
+        _, glint = cv2.threshold(gray, _GLINT_THRESH, 255, cv2.THRESH_BINARY)
+        glint = cv2.dilate(glint,
+                           cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)),
+                           iterations=2)
+        clean    = cv2.inpaint(gray, glint, inpaintRadius=9, flags=cv2.INPAINT_TELEA)
+        enhanced = _clahe.apply(clean)
+        blurred  = cv2.GaussianBlur(enhanced, (5, 5), 0)
+        x0, x1 = int(w * _SX[0]), int(w * _SX[1])
+        y0, y1 = int(h * _SY[0]), int(h * _SY[1])
+        crop = blurred[y0:y1, x0:x1]
+        circles = cv2.HoughCircles(crop, cv2.HOUGH_GRADIENT,
+                                   dp=1.2, minDist=50,
+                                   param1=_HOUGH_P1, param2=_HOUGH_P2,
+                                   minRadius=_R_MIN, maxRadius=_R_MAX)
+        debug = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
+        if circles is None:
+            return None, None, debug
+        circles = np.round(circles[0]).astype(int)
+        circles[:, 0] += x0
+        circles[:, 1] += y0
+        cx, cy, r = circles[0]
+        return (int(cx), int(cy)), int(r), debug
+
+    def _draw_overlay(frame, center, radius):
+        if center is None:
+            return frame
+        cx, cy = center
+        r = radius if radius else 20
+        cv2.circle(frame, (cx, cy), r, (0, 200, 255), 2)
+        cv2.circle(frame, (cx, cy), 4, (0, 255,   0), -1)
+        cv2.line(frame, (cx - r, cy), (cx + r, cy), (0, 255, 0), 1)
+        cv2.line(frame, (cx, cy - r), (cx, cy + r), (0, 255, 0), 1)
+        cv2.putText(frame, f"({cx},{cy})", (cx + r + 4, cy - 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
+        return frame
+
+    _PUPIL_OK = True
+except ImportError:
+    _PUPIL_OK = False
+
+g_analysis_enabled = False   # toggled via /set?analysis=1|0
+
+# ── Persistent settings ───────────────────────────────────────────────────────
+import pathlib as _pathlib
+_SETTINGS_FILE = _pathlib.Path(__file__).parent / "cam_settings.json"
+_DEFAULT_SETTINGS = {
+    "quality": 12, "fps": 30, "res": 5,
+    "brightness": 0, "contrast": 0, "saturation": 0,
+    "auto_exposure": 1, "exposure": 300, "auto_gain": 1,
+    "gain": 0, "ae_level": 0, "hmirror": 0, "vflip": 0, "wb_mode": 0,
+}
+def _load_settings():
+    try:
+        with open(_SETTINGS_FILE) as f:
+            saved = json.load(f)
+        return {**_DEFAULT_SETTINGS, **saved}
+    except (FileNotFoundError, json.JSONDecodeError):
+        return dict(_DEFAULT_SETTINGS)
+def _save_settings(s):
+    with open(_SETTINGS_FILE, "w") as f:
+        json.dump(s, f, indent=2)
+g_settings = _load_settings()
+
+def _apply_pupil_overlay(data: bytes) -> bytes:
+    """Decode JPEG, run pupil detection, draw overlay, re-encode. Returns JPEG bytes."""
+    if not _PUPIL_OK or not data:
+        return data
+    arr = np.frombuffer(data, np.uint8)
+    bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if bgr is None:
+        return data
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    gray = cv2.equalizeHist(gray)
+    center, radius, _ = _detect_pupil(gray, 0)
+    _draw_overlay(bgr, center, radius)
+    _, enc = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    return enc.tobytes()
+
+import collections
+import os
+from datetime import datetime
+
+RECORD_BUF_SECS = 120  # 2-minute rolling buffer
+RECORD_MAX_FRAMES = 30 * RECORD_BUF_SECS  # ~3600 frames at 30fps
 
 HTTP_PORT      = 8080
 DISCOVERY_PORT = 5004
@@ -51,6 +152,9 @@ class CamState:
         # Recent frames kept for timestamp-based pairing: [(ts_us, jpeg), ...]
         self._recent: list[tuple[int, bytes]] = []
         self._recent_lock = threading.Lock()
+
+        # Rolling 2-minute recording buffer: deque of (ts_us, jpeg_bytes)
+        self.rec_buf: collections.deque = collections.deque(maxlen=RECORD_MAX_FRAMES)
 
         self.stats = {
             "fps": 0.0, "latency_ms": 0.0,
@@ -100,6 +204,9 @@ class CamState:
         with self.frame_lock:
             self.latest_frame = jpeg
         self.frame_event.set()
+
+        # Rolling 2-min recording buffer (always recording)
+        self.rec_buf.append((ts_us, jpeg))
 
         # Store in recent buffer for pairing
         now_us = int(time.time() * 1e6)
@@ -157,6 +264,8 @@ class MJPEGHandler(BaseHTTPRequestHandler):
         elif path == "/jpeg/1":    self._jpeg(CAMS[1])
         elif path == "/jpeg/2":    self._jpeg(CAMS[2])
         elif path == "/stats":     self._stats()
+        elif path == "/settings":  self._get_settings()
+        elif path == "/record/save": self._record_save()
         elif self.path.startswith("/set?"): self._set_cmd(self.path[5:])
         else:
             try: self.send_error(404)
@@ -178,15 +287,99 @@ class MJPEGHandler(BaseHTTPRequestHandler):
         except BrokenPipeError:
             pass
 
-    # ── /set?quality=X&fps=Y&cam=1 ───────────────────────────────────────────
+    # ── /settings (return saved settings as JSON) ──────────────────────────
+    def _get_settings(self):
+        try:
+            body = json.dumps(g_settings).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except BrokenPipeError:
+            pass
+
+    # ── /record/save — dump rolling 2-min buffer to disk ────────────────────
+    def _record_save(self):
+        threading.Thread(target=self._do_save, daemon=True).start()
+        body = json.dumps({"ok": True, "msg": "Saving..."}).encode()
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except BrokenPipeError:
+            pass
+
+    @staticmethod
+    def _do_save():
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_dir = _pathlib.Path(__file__).parent / "recordings" / ts
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for cid, cam in CAMS.items():
+            frames = list(cam.rec_buf)
+            if not frames:
+                print(f"cam{cid}: no frames to save")
+                continue
+            cam_dir = out_dir / f"cam{cid}"
+            if _PUPIL_OK:
+                # Save as MJPEG AVI
+                first_jpg = frames[0][1]
+                arr = np.frombuffer(first_jpg, np.uint8)
+                img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                h, w = img.shape[:2]
+                # Estimate FPS from timestamps
+                dt = (frames[-1][0] - frames[0][0]) / 1e6
+                fps = len(frames) / dt if dt > 0 else 30.0
+                path = str(out_dir / f"cam{cid}.avi")
+                writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"MJPG"),
+                                         fps, (w, h))
+                for _, jpeg in frames:
+                    a = np.frombuffer(jpeg, np.uint8)
+                    f = cv2.imdecode(a, cv2.IMREAD_COLOR)
+                    if f is not None:
+                        writer.write(f)
+                writer.release()
+                print(f"cam{cid}: saved {len(frames)} frames → {path}  ({fps:.1f} fps)")
+            else:
+                # Fallback: save individual JPEGs
+                cam_dir.mkdir(parents=True, exist_ok=True)
+                for i, (ts_us, jpeg) in enumerate(frames):
+                    (cam_dir / f"{i:05d}_{ts_us}.jpg").write_bytes(jpeg)
+                print(f"cam{cid}: saved {len(frames)} frames → {cam_dir}/")
+
+    # ── /set?quality=X&fps=Y&cam=1&analysis=0|1&brightness=0&... ────────────
+    # All sensor params mapped to firmware command prefixes
+    _PARAM_MAP = {
+        "quality":       ("q:",  0,  63),
+        "fps":           ("f:",  1,  60),
+        "res":           ("r:",  0,  13),
+        "brightness":    ("br:", -2,  2),
+        "contrast":      ("ct:", -2,  2),
+        "saturation":    ("sa:", -2,  2),
+        "auto_exposure": ("ae:",  0,  1),
+        "exposure":      ("ev:",  0, 1200),
+        "auto_gain":     ("ag:",  0,  1),
+        "gain":          ("gv:",  0, 30),
+        "ae_level":      ("al:", -2,  2),
+        "hmirror":       ("hm:",  0,  1),
+        "vflip":         ("vf:",  0,  1),
+        "wb_mode":       ("wm:",  0,  4),
+    }
+
     def _set_cmd(self, query: str):
+        global g_analysis_enabled, g_settings
         import urllib.parse
         params = dict(urllib.parse.parse_qsl(query))
         cmds = []
-        if "quality" in params:
-            cmds.append(f"q:{max(0, min(63, int(params['quality'])))}" .encode())
-        if "fps" in params:
-            cmds.append(f"f:{max(1, min(60, int(params['fps'])))}" .encode())
+        if "analysis" in params:
+            g_analysis_enabled = params["analysis"] != "0"
+        for key, (prefix, lo, hi) in self._PARAM_MAP.items():
+            if key in params:
+                val = max(lo, min(hi, int(params[key])))
+                cmds.append(f"{prefix}{val}".encode())
+                g_settings[key] = val
 
         target_ids = []
         if "cam" in params:
@@ -199,9 +392,10 @@ class MJPEGHandler(BaseHTTPRequestHandler):
             for cid in target_ids:
                 for cmd in cmds:
                     CAMS[cid].send_cmd(cmd)
+            _save_settings(g_settings)
 
         try:
-            body = json.dumps({"ok": bool(cmds)}).encode()
+            body = json.dumps({"ok": bool(cmds or "analysis" in params)}).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -219,6 +413,8 @@ class MJPEGHandler(BaseHTTPRequestHandler):
             try: self.send_error(503)
             except BrokenPipeError: pass
             return
+        if g_analysis_enabled:
+            data = _apply_pupil_overlay(data)
         try:
             self.send_response(200)
             self.send_header("Content-Type", "image/jpeg")
@@ -242,6 +438,8 @@ class MJPEGHandler(BaseHTTPRequestHandler):
                     data = cam.latest_frame
                 if not data:
                     continue
+                if g_analysis_enabled:
+                    data = _apply_pupil_overlay(data)
                 hdr = (b"--frame\r\nContent-Type: image/jpeg\r\n"
                        b"Content-Length: " + str(len(data)).encode() + b"\r\n\r\n")
                 self.wfile.write(hdr + data + b"\r\n")
@@ -324,7 +522,95 @@ class MJPEGHandler(BaseHTTPRequestHandler):
       <input type="range" min="1" max="30" value="30" id="fps"
              oninput="document.getElementById('fval').textContent=this.value">
     </div>
+    <div class="ctrl-group">
+      <span>Resolution</span>
+      <select id="res">
+        <option value="0">96x96</option>
+        <option value="1">QQVGA 160x120</option>
+        <option value="2">QCIF 176x144</option>
+        <option value="3">HQVGA 240x176</option>
+        <option value="4">240x240</option>
+        <option value="5" selected>QVGA 320x240</option>
+        <option value="6">CIF 400x296</option>
+        <option value="7">HVGA 480x320</option>
+        <option value="8">VGA 640x480</option>
+        <option value="9">SVGA 800x600</option>
+        <option value="10">XGA 1024x768</option>
+        <option value="11">HD 1280x720</option>
+        <option value="12">SXGA 1280x1024</option>
+        <option value="13">UXGA 1600x1200</option>
+      </select>
+    </div>
+    <div class="ctrl-group">
+      <span>Brightness: <b id="brval">0</b></span>
+      <input type="range" min="-2" max="2" value="0" id="brightness"
+             oninput="document.getElementById('brval').textContent=this.value">
+    </div>
+    <div class="ctrl-group">
+      <span>Contrast: <b id="ctval">0</b></span>
+      <input type="range" min="-2" max="2" value="0" id="contrast"
+             oninput="document.getElementById('ctval').textContent=this.value">
+    </div>
+    <div class="ctrl-group">
+      <span>Saturation: <b id="saval">0</b></span>
+      <input type="range" min="-2" max="2" value="0" id="saturation"
+             oninput="document.getElementById('saval').textContent=this.value">
+    </div>
+    <div class="ctrl-group">
+      <span>AE Level: <b id="alval">0</b></span>
+      <input type="range" min="-2" max="2" value="0" id="ae_level"
+             oninput="document.getElementById('alval').textContent=this.value">
+    </div>
+    <div class="ctrl-group">
+      <span>Auto Exposure</span>
+      <select id="auto_exposure">
+        <option value="1" selected>On</option>
+        <option value="0">Off</option>
+      </select>
+    </div>
+    <div class="ctrl-group">
+      <span>Exposure: <b id="evval">300</b></span>
+      <input type="range" min="0" max="1200" value="300" id="exposure"
+             oninput="document.getElementById('evval').textContent=this.value">
+    </div>
+    <div class="ctrl-group">
+      <span>Auto Gain</span>
+      <select id="auto_gain">
+        <option value="1" selected>On</option>
+        <option value="0">Off</option>
+      </select>
+    </div>
+    <div class="ctrl-group">
+      <span>Gain: <b id="gvval">0</b></span>
+      <input type="range" min="0" max="30" value="0" id="gain"
+             oninput="document.getElementById('gvval').textContent=this.value">
+    </div>
+    <div class="ctrl-group">
+      <span>WB Mode</span>
+      <select id="wb_mode">
+        <option value="0" selected>Auto</option>
+        <option value="1">Sunny</option>
+        <option value="2">Cloudy</option>
+        <option value="3">Office</option>
+        <option value="4">Home</option>
+      </select>
+    </div>
+    <div class="ctrl-group">
+      <span>H-Mirror</span>
+      <select id="hmirror">
+        <option value="0" selected>Off</option>
+        <option value="1">On</option>
+      </select>
+    </div>
+    <div class="ctrl-group">
+      <span>V-Flip</span>
+      <select id="vflip">
+        <option value="0" selected>Off</option>
+        <option value="1">On</option>
+      </select>
+    </div>
     <button onclick="applySettings()">Apply</button>
+    <button onclick="saveRecording()" style="background:#c33">Save 2min Buffer</button>
   </div>
   <div id="feedback"></div>
 
@@ -403,21 +689,38 @@ setInterval(() => {
 }, 1000);
 
 // ── Controls ──────────────────────────────────────────────────────────────────
+const ALL_KEYS = ['quality','fps','res','brightness','contrast','saturation',
+  'ae_level','auto_exposure','exposure','auto_gain','gain','wb_mode','hmirror','vflip'];
+const LABEL_MAP = {quality:'qval',fps:'fval',brightness:'brval',contrast:'ctval',
+  saturation:'saval',ae_level:'alval',exposure:'evval',gain:'gvval'};
+
 function applySettings() {
-  const q   = document.getElementById('quality').value;
-  const f   = document.getElementById('fps').value;
   const cam = document.getElementById('target').value;
   const fb  = document.getElementById('feedback');
   fb.textContent = 'Sending...';
-  const camParam = cam ? '&cam=' + cam : '';
-  Promise.all([
-    fetch('/set?quality=' + q + camParam).then(r => r.json()),
-    fetch('/set?fps='     + f + camParam).then(r => r.json()),
-  ]).then(([rq, rf]) => {
-    const who = cam ? 'cam' + cam : 'both';
-    fb.textContent = (rq.ok && rf.ok)
-      ? `Applied to ${who} — quality=${q}  fps=${f}`
-      : 'Send failed';
+  let qs = ALL_KEYS.map(k => k + '=' + document.getElementById(k).value).join('&');
+  if (cam) qs += '&cam=' + cam;
+  fetch('/set?' + qs).then(r => r.json()).then(d => {
+    fb.textContent = d.ok ? 'Applied to ' + (cam ? 'cam'+cam : 'both') : 'Send failed';
+  }).catch(e => { fb.textContent = 'Error: ' + e; });
+}
+
+// Load saved settings on page load
+fetch('/settings').then(r => r.json()).then(s => {
+  for (const k of ALL_KEYS) {
+    const el = document.getElementById(k);
+    if (el && s[k] !== undefined) {
+      el.value = s[k];
+      if (LABEL_MAP[k]) document.getElementById(LABEL_MAP[k]).textContent = s[k];
+    }
+  }
+}).catch(() => {});
+
+function saveRecording() {
+  const fb = document.getElementById('feedback');
+  fb.textContent = 'Saving 2-min buffer...';
+  fetch('/record/save').then(r => r.json()).then(d => {
+    fb.textContent = d.ok ? 'Saved to recordings/' : 'Save failed';
   }).catch(e => { fb.textContent = 'Error: ' + e; });
 }
 </script>
@@ -515,6 +818,16 @@ def timesync_server():
             continue
 
 
+def _push_settings(cid: int):
+    """Send all saved settings to a camera on discovery."""
+    param_map = MJPEGHandler._PARAM_MAP
+    for key, (prefix, lo, hi) in param_map.items():
+        if key in g_settings:
+            val = max(lo, min(hi, int(g_settings[key])))
+            CAMS[cid].send_cmd(f"{prefix}{val}".encode())
+            time.sleep(0.02)  # small gap so ESP32 processes each command
+
+
 def beacon_thread():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
@@ -538,6 +851,7 @@ def beacon_thread():
                     if cid in CAMS and CAMS[cid].ip != addr[0]:
                         CAMS[cid].ip = addr[0]
                         print(f"cam{cid} discovered: {addr[0]}")
+                        _push_settings(cid)
                 except ValueError:
                     pass
         except socket.timeout:

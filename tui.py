@@ -7,8 +7,10 @@ import asyncio
 import re
 import socket
 import subprocess
+import sys
 import threading
 import time
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 
@@ -17,6 +19,14 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.reactive import reactive
 from textual.widgets import Button, Footer, RichLog, Static
+
+# ── Pupil detection availability check ────────────────────────────────────────
+# Actual detection runs in receiver.py; we just check cv2 is importable here.
+try:
+    import cv2 as _cv2_check  # noqa: F401
+    _PUPIL_OK = True
+except Exception:
+    _PUPIL_OK = False
 
 # ── Project paths ──────────────────────────────────────────────────────────────
 ROOT       = Path(__file__).parent
@@ -160,6 +170,18 @@ Button.usb     { background: $warning-darken-2; }
     height: 1fr;
     border: solid $accent;
 }
+
+.pupil-row {
+    height: 1;
+    padding: 0 1;
+    color: $text-muted;
+}
+
+#analysis-section {
+    height: 5;
+    border: solid $accent;
+    padding: 0 1;
+}
 """
 
 
@@ -175,7 +197,8 @@ class RigManager(App):
         Binding("q",     "quit",            "Quit"),
     ]
 
-    receiver_running = reactive(False)
+    receiver_running  = reactive(False)
+    analysis_enabled  = reactive(False)
 
     def __init__(self):
         super().__init__()
@@ -184,7 +207,7 @@ class RigManager(App):
             "cam2": CamState("cam2"),
         }
         self._receiver_proc: subprocess.Popen | None = None
-        self._upload_proc:   subprocess.Popen | None = None
+        self._upload_procs:  dict[str, subprocess.Popen] = {}  # keyed by cam id
 
     # ── Layout ────────────────────────────────────────────────────────────────
     def compose(self) -> ComposeResult:
@@ -221,6 +244,14 @@ class RigManager(App):
             with Vertical(id="right-panel"):
                 yield Static("── LOG ──", classes="panel-title")
                 yield RichLog(id="log", highlight=True, markup=True)
+                yield Static("── PUPIL ANALYSIS ──", classes="panel-title")
+                with Vertical(id="analysis-section"):
+                    with Horizontal(classes="service-row"):
+                        yield Button("⊙ Overlay OFF", id="btn-analysis", variant="default")
+                    yield Static(
+                        "[dim]cv2/numpy missing[/]" if not _PUPIL_OK else "[dim]press to enable pupil overlay in browser[/]",
+                        id="analysis-status", classes="pupil-row", markup=True
+                    )
 
         yield Footer()
 
@@ -232,6 +263,13 @@ class RigManager(App):
         self.set_interval(2,  self._poll_procs)
         threading.Thread(target=self._udp_log_listener, daemon=True).start()
         threading.Thread(target=self._timesync_server,  daemon=True).start()
+
+    def on_unmount(self) -> None:
+        if self._receiver_proc and self._receiver_proc.poll() is None:
+            self._receiver_proc.terminate()
+        for p in self._upload_procs.values():
+            if p.poll() is None:
+                p.terminate()
 
     # ── Timesync responder ────────────────────────────────────────────────────
     def _timesync_server(self):
@@ -256,6 +294,30 @@ class RigManager(App):
                         sock.sendto(f"SYNC_RESP:{parts[1]}:{t2}:{t3}".encode(), addr)
             except Exception:
                 continue
+
+    # ── Pupil overlay toggle ──────────────────────────────────────────────────
+    def _toggle_analysis(self):
+        if not _PUPIL_OK:
+            self.log_msg("[red]Pupil analysis unavailable — cv2/numpy missing[/]"); return
+        if not self.receiver_running:
+            self.log_msg("[yellow]Start receiver first[/]"); return
+        self.analysis_enabled = not self.analysis_enabled
+        val = "1" if self.analysis_enabled else "0"
+        try:
+            urllib.request.urlopen(
+                f"http://localhost:8080/set?analysis={val}", timeout=1
+            ).close()
+        except Exception:
+            pass
+        btn = self.query_one("#btn-analysis", Button)
+        if self.analysis_enabled:
+            btn.label = "⊙ Overlay ON"
+            btn.variant = "success"
+            self.log_msg("[green]Pupil overlay enabled[/]")
+        else:
+            btn.label = "⊙ Overlay OFF"
+            btn.variant = "default"
+            self.log_msg("[dim]Pupil overlay disabled[/]")
 
     # ── UDP log listener ──────────────────────────────────────────────────────
     def _udp_log_listener(self):
@@ -329,8 +391,9 @@ class RigManager(App):
             self.query_one("#btn-receiver", Button).remove_class("running")
             self.log_msg("[yellow]Receiver stopped[/]")
 
-        if self._upload_proc and self._upload_proc.poll() is not None:
-            self._upload_proc = None
+        done = [cam for cam, p in self._upload_procs.items() if p.poll() is not None]
+        for cam in done:
+            del self._upload_procs[cam]
 
     # ── Actions ───────────────────────────────────────────────────────────────
     def action_toggle_receiver(self):
@@ -353,6 +416,7 @@ class RigManager(App):
         elif bid == "btn-cam2-ota":  self._ota_upload("cam2")
         elif bid == "btn-cam1-usb":  self._usb_flash("cam1")
         elif bid == "btn-cam2-usb":  self._usb_flash("cam2")
+        elif bid == "btn-analysis":  self._toggle_analysis()
         elif bid == "btn-discover":  self.run_worker(self._discover(), exclusive=True)
         elif bid == "btn-scan":      self.run_worker(self._scan(),    exclusive=True)
         elif bid == "btn-monitor":   self._open_monitor()
@@ -363,6 +427,7 @@ class RigManager(App):
         if self._receiver_proc and self._receiver_proc.poll() is None:
             self._receiver_proc.terminate()
             self._receiver_proc = None
+            self.receiver_running = False
             btn.label = "▶ Receiver"; btn.remove_class("running")
             self.log_msg("[yellow]Receiver stopped[/]")
         else:
@@ -370,33 +435,35 @@ class RigManager(App):
                 [str(PYTHON), str(RECEIVER)],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             )
+            self.receiver_running = True
             btn.label = "■ Receiver"; btn.add_class("running")
             self.log_msg("[green]Receiver started[/] → http://localhost:8080")
 
     # ── OTA upload ────────────────────────────────────────────────────────────
     def _ota_upload(self, cam: str):
-        if self._upload_proc and self._upload_proc.poll() is None:
-            self.log_msg("[yellow]Upload in progress — please wait[/]"); return
+        if cam in self._upload_procs and self._upload_procs[cam].poll() is None:
+            self.log_msg(f"[yellow]{cam} OTA already in progress[/]"); return
 
         cam_state = self.cams[cam]
         if not cam_state.ip:
             self.log_msg(f"[red]{cam} IP unknown — run Discover first[/]"); return
 
         self.log_msg(f"[cyan]OTA → {cam} ({cam_state.ip})[/]")
-        self._upload_proc = subprocess.Popen(
+        proc = subprocess.Popen(
             [str(PIO), "run", "-e", f"{cam}_ota", "--target", "upload"],
             cwd=ROOT / "esp32cam-stream",
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT
         )
+        self._upload_procs[cam] = proc
         threading.Thread(
-            target=self._stream_upload, args=(self._upload_proc, cam, "OTA"),
+            target=self._stream_upload, args=(proc, cam, "OTA"),
             daemon=True
         ).start()
 
     # ── USB flash ─────────────────────────────────────────────────────────────
     def _usb_flash(self, cam: str):
-        if self._upload_proc and self._upload_proc.poll() is None:
-            self.log_msg("[yellow]Upload in progress — please wait[/]"); return
+        if cam in self._upload_procs and self._upload_procs[cam].poll() is None:
+            self.log_msg(f"[yellow]{cam} upload already in progress[/]"); return
 
         if not Path(SERIAL_DEV).exists():
             self.log_msg(
@@ -409,14 +476,15 @@ class RigManager(App):
             f"[yellow]USB flash → {cam} on {SERIAL_DEV}[/]  "
             f"[dim](IO0→GND + RST to enter flash mode)[/]"
         )
-        self._upload_proc = subprocess.Popen(
+        proc = subprocess.Popen(
             [str(PIO), "run", "-e", cam, "--target", "upload",
              "--upload-port", SERIAL_DEV],
             cwd=ROOT / "esp32cam-stream",
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT
         )
+        self._upload_procs[cam] = proc
         threading.Thread(
-            target=self._stream_upload, args=(self._upload_proc, cam, "USB"),
+            target=self._stream_upload, args=(proc, cam, "USB"),
             daemon=True
         ).start()
 

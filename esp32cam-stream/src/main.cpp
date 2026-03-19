@@ -72,6 +72,7 @@ static char          g_last_laptop_ip[24] = "";  // last known — kept for logg
 // Live-tunable settings (read by captureTask, written by cmdTask)
 static volatile int  g_jpeg_quality = 12;
 static volatile int  g_target_fps   = 30;
+static volatile int  g_framesize    = FRAMESIZE_QVGA;  // 320×240 default
 // Set during OTA — pauses capture+send so WiFi bandwidth goes to the upload
 static volatile bool g_ota_active   = false;
 
@@ -122,14 +123,17 @@ static bool initCamera() {
     config.pixel_format = PIXFORMAT_JPEG;
 
     if (psramFound()) {
-        config.frame_size   = FRAMESIZE_QVGA;
+        // Allocate buffer for the largest possible frame so set_framesize()
+        // can switch to any resolution at runtime without buffer overflow.
+        config.frame_size   = FRAMESIZE_UXGA;
         config.jpeg_quality = g_jpeg_quality;
         config.fb_count     = 2;
     } else {
-        config.frame_size   = FRAMESIZE_QVGA;
+        // No PSRAM — cap at SVGA to fit in internal RAM
+        config.frame_size   = FRAMESIZE_SVGA;
         config.jpeg_quality = g_jpeg_quality;
         config.fb_count     = 1;
-        Serial.println("WARN: No PSRAM");
+        Serial.println("WARN: No PSRAM — max res SVGA");
     }
 
     if (esp_camera_init(&config) != ESP_OK) {
@@ -142,6 +146,8 @@ static bool initCamera() {
     s->set_awb_gain(s, 1);
     s->set_exposure_ctrl(s, 1);
     s->set_gain_ctrl(s, 1);
+    // Start at default working resolution (g_framesize = QVGA)
+    s->set_framesize(s, (framesize_t)g_framesize);
 
     Serial.println("Camera OK");
     return true;
@@ -163,9 +169,10 @@ void captureTask(void *) {
     TickType_t lastWake   = xTaskGetTickCount();
     int        last_q     = g_jpeg_quality;
     int        last_fps   = g_target_fps;
+    int        last_fs    = g_framesize;
     sensor_t  *s          = esp_camera_sensor_get();
 
-    // Apply initial quality once
+    // Apply initial quality (framesize already set in initCamera)
     s->set_quality(s, last_q);
 
     while (true) {
@@ -174,12 +181,25 @@ void captureTask(void *) {
             continue;
         }
 
-        // Apply quality only when it actually changes
+        // Apply settings only when they change
         int q = g_jpeg_quality;
         if (q != last_q) {
             s->set_quality(s, q);
             last_q = q;
-            Serial.printf("Quality applied: %d\n", q);
+            udp_log("Quality → %d", q);
+        }
+
+        int fs = g_framesize;
+        if (fs != last_fs) {
+            s->set_framesize(s, (framesize_t)fs);
+            last_fs = fs;
+            lastWake = xTaskGetTickCount();   // reset pacing — frame size affects timing
+            // Flush stale frames still in the sensor FIFO from the old resolution
+            for (int i = 0; i < 3; i++) {
+                camera_fb_t *flush = esp_camera_fb_get();
+                if (flush) esp_camera_fb_return(flush);
+            }
+            udp_log("Resolution → framesize %d", fs);
         }
 
         // Reset pacing baseline when fps changes to avoid stale lastWake
@@ -278,10 +298,30 @@ void cmdTask(void *) {
             int val = atoi(buf + 2);
             if (val >= 1 && val <= 60) {
                 g_target_fps = val;
-                Serial.printf("FPS → %d\n", val);
+                udp_log("FPS → %d", val);
+            }
+        } else if (buf[0] == 'r' && buf[1] == ':') {
+            int val = atoi(buf + 2);
+            if (val >= 0 && val <= 13) {
+                g_framesize = val;
             }
         } else {
-            Serial.printf("Unknown cmd: %s\n", buf);
+            // Sensor settings — applied directly via sensor API
+            sensor_t *s = esp_camera_sensor_get();
+            if (!s) { udp_log("Sensor unavailable"); continue; }
+
+            if      (strncmp(buf, "br:", 3) == 0) { s->set_brightness(s, atoi(buf+3));      udp_log("Brightness → %d", atoi(buf+3)); }
+            else if (strncmp(buf, "ct:", 3) == 0) { s->set_contrast(s, atoi(buf+3));        udp_log("Contrast → %d", atoi(buf+3)); }
+            else if (strncmp(buf, "sa:", 3) == 0) { s->set_saturation(s, atoi(buf+3));      udp_log("Saturation → %d", atoi(buf+3)); }
+            else if (strncmp(buf, "ae:", 3) == 0) { s->set_exposure_ctrl(s, atoi(buf+3));   udp_log("Auto-exposure → %d", atoi(buf+3)); }
+            else if (strncmp(buf, "ev:", 3) == 0) { s->set_aec_value(s, atoi(buf+3));       udp_log("Exposure → %d", atoi(buf+3)); }
+            else if (strncmp(buf, "ag:", 3) == 0) { s->set_gain_ctrl(s, atoi(buf+3));       udp_log("Auto-gain → %d", atoi(buf+3)); }
+            else if (strncmp(buf, "gv:", 3) == 0) { s->set_agc_gain(s, atoi(buf+3));        udp_log("Gain → %d", atoi(buf+3)); }
+            else if (strncmp(buf, "al:", 3) == 0) { s->set_ae_level(s, atoi(buf+3));        udp_log("AE level → %d", atoi(buf+3)); }
+            else if (strncmp(buf, "hm:", 3) == 0) { s->set_hmirror(s, atoi(buf+3));         udp_log("H-mirror → %d", atoi(buf+3)); }
+            else if (strncmp(buf, "vf:", 3) == 0) { s->set_vflip(s, atoi(buf+3));           udp_log("V-flip → %d", atoi(buf+3)); }
+            else if (strncmp(buf, "wm:", 3) == 0) { s->set_wb_mode(s, atoi(buf+3));         udp_log("WB mode → %d", atoi(buf+3)); }
+            else { Serial.printf("Unknown cmd: %s\n", buf); }
         }
     }
 }
@@ -419,6 +459,10 @@ void timeSyncTask(void *) {
     tsUdp.begin(TIMESYNC_PORT);
 
     while (true) {
+        if (g_ota_active) {
+            vTaskDelay(pdMS_TO_TICKS(200));
+            continue;
+        }
         if (!g_laptop_ip[0]) {
             vTaskDelay(pdMS_TO_TICKS(500));
             continue;

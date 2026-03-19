@@ -17,6 +17,8 @@ Cameras stream JPEG frames over UDP to a Python receiver on the laptop.
 - `receiver.py` — laptop-side UDP receiver + MJPEG HTTP server (port 8080)
 - `ntp_server.py` — local NTP server (needs sudo, port 123)
 - `discover.py` — finds camera IPs on network, patches platformio.ini
+- `cam_settings.json` — persisted camera settings (auto-saved on Apply, auto-loaded on start)
+- `tui.py` — Textual TUI (NETR) for managing cameras, OTA, discovery
 
 ## Rules — always follow these
 
@@ -57,14 +59,40 @@ Cameras stream JPEG frames over UDP to a Python receiver on the laptop.
 | cmdTask | 1 | Receive quality/fps commands |
 | otaTask | 1 | ArduinoOTA handler |
 | discoveryTask | 1 | Beacon broadcast + laptop IP discovery |
+| timeSyncTask | 1 | Cristian's algorithm clock sync every 10s |
 | ledTask | 1 | LED state machine |
 | wifiTask | 1 | WiFi watchdog + auto-reconnect |
+
+### OTA bandwidth rule
+**Every task except `otaTask` must pause while OTA is active.**
+Check `g_ota_active` at the top of each task's loop:
+```cpp
+if (g_ota_active) { vTaskDelay(pdMS_TO_TICKS(200)); continue; }
+```
+This applies to: `captureTask`, `sendTask`, `timeSyncTask`, and any new task added in future.
+`discoveryTask`, `ledTask`, and `wifiTask` are exempt (they don't use WiFi bandwidth).
+
+### Camera resolution rule
+**Always init with `FRAMESIZE_UXGA`** (or `FRAMESIZE_SVGA` without PSRAM) so the DMA buffer
+can hold any resolution. Then call `s->set_framesize(s, (framesize_t)g_framesize)` immediately
+after init to start at the working resolution. Never init at a small framesize and expect
+`set_framesize` to grow it later — that causes buffer overflow and reboot.
+After any runtime `set_framesize` call, flush 3 frames to drain stale sensor FIFO data.
+
+### Settings persistence
+- All camera sensor settings (brightness, contrast, exposure, gain, etc.) are saved to `cam_settings.json`
+- Settings auto-load on receiver startup and are pushed to cameras on discovery
+- Browser UI loads saved settings on page load via `/settings` endpoint
+- Command protocol: `q:` quality, `f:` fps, `r:` resolution, `br:` brightness, `ct:` contrast,
+  `sa:` saturation, `ae:` auto-exposure, `ev:` exposure value, `ag:` auto-gain, `gv:` gain,
+  `al:` AE level, `hm:` h-mirror, `vf:` v-flip, `wm:` WB mode
 
 ### Code conventions
 - Use `volatile` for globals shared between tasks
 - Only call sensor functions (e.g. `set_quality`) when value actually changes
-- Use `vTaskDelayUntil` for precise FPS pacing; reset `lastWake` when FPS changes
+- Use `vTaskDelayUntil` for precise FPS pacing; reset `lastWake` when FPS/framesize changes
 - Always reset `g_laptop_ip` to `""` when WiFi drops
+- `g_last_laptop_ip` persists across WiFi drops so `udp_log()` keeps working
 
 ### Running the receiver
 ```bash
