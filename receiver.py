@@ -1110,7 +1110,10 @@ def udp_serve(cam: CamState):
     print(f"cam{cam.cam_id}: UDP :{cam.udp_port}")
 
     while True:
-        pkt, _ = sock.recvfrom(65535)
+        pkt, addr = sock.recvfrom(65535)
+        if not cam.ip:
+            cam.ip = addr[0]
+            print(f"cam{cam.cam_id}: IP from stream → {addr[0]}")
         cam.ingest(pkt)
 
 
