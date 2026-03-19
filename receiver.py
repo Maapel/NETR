@@ -1277,7 +1277,7 @@ fetch('/eye_settings').then(r => r.json()).then(s => {
     <button class="btn-speed" data-speed="0.5">0.5x</button>
     <button class="btn-speed active" data-speed="1">1x</button>
     <button class="btn-speed" data-speed="2">2x</button>
-    <label><input type="checkbox" id="analysis" checked> Analysis</label>
+    <label><input type="checkbox" id="analysis" checked onchange="render()"> Analysis</label>
     <span class="info" id="info">No recording loaded</span>
   </div>
 
@@ -1364,7 +1364,7 @@ fetch('/eye_settings').then(r => r.json()).then(s => {
       </div>
     </div>
     <div style="display:flex; gap:8px; padding-top:6px">
-      <button class="eye-btn" onclick="applyEyeSettings()">Apply to Pipeline</button>
+      <button class="eye-btn" style="background:#862" onclick="saveEyeSettings()">Save Eye Settings</button>
       <span id="eye-feedback" style="font-size:10px; color:#8df; align-self:center"></span>
     </div>
   </details>
@@ -1386,24 +1386,36 @@ const EYE_FLOAT_SCALE = {'p_circularity_min': 100, 'g_circularity_min': 100, 'g_
 function upd(el, scale=1) {
   const val = scale > 1 ? (el.value/scale).toFixed(scale>10?2:1) : el.value;
   document.getElementById(el.id + '_val').textContent = val;
+  applyEyeSettings(true); // Auto-apply
 }
 
 function applyDebugView(val) {
   fetch('/set?debug_view=' + val + '&analysis=1').then(r => r.json()).then(() => render());
 }
 
-function applyEyeSettings() {
+function applyEyeSettings(quiet=false) {
   const fb = document.getElementById('eye-feedback');
-  fb.textContent = 'Applying...';
+  if (!quiet) fb.textContent = 'Applying...';
   const qs = EYE_KEYS.map(k => {
     const el = document.getElementById(k);
     const scale = EYE_FLOAT_SCALE[k] || 1;
     return k + '=' + (el.value / scale);
   }).join('&');
   fetch('/set?' + qs + '&analysis=1').then(r => r.json()).then(d => {
-    fb.textContent = d.ok ? 'Applied' : 'Failed';
-    setTimeout(() => fb.textContent = '', 2000);
+    if (!quiet) {
+      fb.textContent = d.ok ? 'Applied' : 'Failed';
+      setTimeout(() => fb.textContent = '', 2000);
+    }
     render();
+  });
+}
+
+function saveEyeSettings() {
+  const fb = document.getElementById('eye-feedback');
+  fb.textContent = 'Saving...';
+  fetch('/set?save_eye=1').then(r => r.json()).then(d => {
+    fb.textContent = d.ok ? 'Saved' : 'Save failed';
+    setTimeout(() => fb.textContent = '', 2000);
   });
 }
 
