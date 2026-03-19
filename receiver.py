@@ -247,6 +247,29 @@ class CamState:
 
 CAMS = {1: CamState(1), 2: CamState(2)}
 
+# ── AVI reader cache (avoid reopening per frame) ─────────────────────────────
+_avi_cache = {}      # key: (rec_name, cid) → {"cap": VideoCapture, "total": int}
+_avi_cache_lock = threading.Lock()
+
+def _get_avi(rec_name: str, cid: int):
+    """Return (VideoCapture, total_frames) from cache, opening if needed."""
+    key = (rec_name, cid)
+    with _avi_cache_lock:
+        if key in _avi_cache:
+            entry = _avi_cache[key]
+            return entry["cap"], entry["total"], entry["lock"]
+    # Open outside global lock
+    avi_path = _pathlib.Path(__file__).parent / "recordings" / rec_name / f"cam{cid}.avi"
+    if not avi_path.exists():
+        return None, 0, None
+    cap = cv2.VideoCapture(str(avi_path))
+    # Count frames reliably by seeking to end
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    lock = threading.Lock()
+    with _avi_cache_lock:
+        _avi_cache[key] = {"cap": cap, "total": total, "lock": lock}
+    return cap, total, lock
+
 # Global sync offset reported to browser
 sync_offset_ms = 0.0
 
@@ -268,6 +291,7 @@ class MJPEGHandler(BaseHTTPRequestHandler):
         elif path == "/record/save": self._record_save()
         elif path == "/player":      self._player()
         elif path == "/recordings":  self._list_recordings()
+        elif path.startswith("/recordings/info/"): self._recording_info(path)
         elif path.startswith("/playback/"): self._playback_frame(path)
         elif self.path.startswith("/set?"): self._set_cmd(self.path[5:])
         else:
@@ -381,6 +405,31 @@ class MJPEGHandler(BaseHTTPRequestHandler):
         except BrokenPipeError:
             pass
 
+    # ── /recordings/info/<rec_name> — get frame counts without loading ────
+    def _recording_info(self, path: str):
+        rec_name = path.split("/")[-1]
+        rec_dir = _pathlib.Path(__file__).parent / "recordings" / rec_name
+        info = {}
+        for cid in [1, 2]:
+            avi = rec_dir / f"cam{cid}.avi"
+            jpgdir = rec_dir / f"cam{cid}"
+            if avi.exists() and _PUPIL_OK:
+                cap, total, _ = _get_avi(rec_name, cid)
+                info[str(cid)] = total if cap else 0
+            elif jpgdir.is_dir():
+                info[str(cid)] = len(list(jpgdir.glob("*.jpg")))
+            else:
+                info[str(cid)] = 0
+        body = json.dumps(info).encode()
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except BrokenPipeError:
+            pass
+
     # ── /playback/<rec_name>/cam<n>/<frame_idx>?analysis=0|1 ─────────────
     def _playback_frame(self, path: str):
         import urllib.parse
@@ -408,23 +457,23 @@ class MJPEGHandler(BaseHTTPRequestHandler):
         jpeg = None
         total = 0
 
-        # Try AVI first
+        # Try AVI first (cached reader)
         avi = rec_dir / f"cam{cid}.avi"
         if avi.exists() and _PUPIL_OK:
-            cap = cv2.VideoCapture(str(avi))
-            total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            idx = max(0, min(idx, total - 1))
-            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-            ret, frame = cap.read()
-            cap.release()
-            if ret:
-                if do_analysis:
-                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                    gray = cv2.equalizeHist(gray)
-                    center, radius, _ = _detect_pupil(gray, 0)
-                    _draw_overlay(frame, center, radius)
-                _, enc = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
-                jpeg = enc.tobytes()
+            cap, total, lock = _get_avi(rec_name, cid)
+            if cap and lock:
+                idx = max(0, min(idx, total - 1))
+                with lock:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+                    ret, frame = cap.read()
+                if ret:
+                    if do_analysis:
+                        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                        gray = cv2.equalizeHist(gray)
+                        center, radius, _ = _detect_pupil(gray, 0)
+                        _draw_overlay(frame, center, radius)
+                    _, enc = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+                    jpeg = enc.tobytes()
         else:
             # Fallback: JPEG directory
             jpgdir = rec_dir / f"cam{cid}"
@@ -940,7 +989,6 @@ let idx = 0;
 let playing = false;
 let speed = 1;
 let rendering = false;
-let rafId = null;
 
 // Refresh recordings list
 fetch('/recordings').then(r => r.json()).then(recs => {
@@ -967,12 +1015,11 @@ async function loadRec() {
   idx = 0;
   stop();
   document.getElementById('status').textContent = 'Loading...';
-  for (const cid of [1, 2]) {
-    try {
-      const r = await fetch(`/playback/${rec}/cam${cid}/0`);
-      total[cid] = parseInt(r.headers.get('X-Total-Frames') || '0');
-    } catch(_) { total[cid] = 0; }
-  }
+  try {
+    const info = await fetch(`/recordings/info/${rec}`).then(r => r.json());
+    total[1] = info['1'] || 0;
+    total[2] = info['2'] || 0;
+  } catch(_) { total[1] = 0; total[2] = 0; }
   const slider = document.getElementById('slider');
   const maxF = Math.max(total[1], total[2]);
   slider.max = Math.max(0, maxF - 1);
@@ -1024,30 +1071,29 @@ function seek(val) {
 
 function stop() {
   playing = false;
-  if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
   document.getElementById('btn-play').textContent = 'Play';
 }
 
 function togglePlay() {
   if (!rec) return;
-  playing = !playing;
-  document.getElementById('btn-play').textContent = playing ? 'Pause' : 'Play';
-  if (playing) playLoop();
+  if (playing) { stop(); return; }
+  playing = true;
+  document.getElementById('btn-play').textContent = 'Pause';
+  playLoop();
 }
 
-let lastFrame = 0;
 async function playLoop() {
-  if (!playing) return;
-  const now = performance.now();
-  const interval = (1000 / 30) / speed;  // base 30fps adjusted by speed
-  if (now - lastFrame >= interval) {
+  while (playing) {
     const maxF = Math.max(total[1], total[2]);
     if (idx >= maxF - 1) { stop(); return; }
     idx++;
+    const t0 = performance.now();
     await render();
-    lastFrame = performance.now();
+    const elapsed = performance.now() - t0;
+    const target = (1000 / 30) / speed;
+    const wait = Math.max(0, target - elapsed);
+    if (wait > 0) await new Promise(r => setTimeout(r, wait));
   }
-  rafId = requestAnimationFrame(playLoop);
 }
 
 // Keyboard shortcuts
