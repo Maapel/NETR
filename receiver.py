@@ -427,9 +427,8 @@ class MJPEGHandler(BaseHTTPRequestHandler):
                 if ret:
                     if do_analysis:
                         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                        gray = cv2.equalizeHist(gray)
-                        center, radius, _ = _detect_pupil(gray, 0)
-                        _draw_overlay(frame, center, radius)
+                        result = _eye_pipe.process(gray)
+                        frame = EyePipeline.draw(frame, result)
                     _, enc = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
                     jpeg = enc.tobytes()
         else:
@@ -445,9 +444,8 @@ class MJPEGHandler(BaseHTTPRequestHandler):
                         bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
                         if bgr is not None:
                             gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-                            gray = cv2.equalizeHist(gray)
-                            center, radius, _ = _detect_pupil(gray, 0)
-                            _draw_overlay(bgr, center, radius)
+                            result = _eye_pipe.process(gray)
+                            bgr = EyePipeline.draw(bgr, result)
                             _, enc = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 90])
                             jpeg = enc.tobytes()
 
