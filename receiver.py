@@ -79,17 +79,36 @@ def _save_settings(s):
         json.dump(s, f, indent=2)
 g_settings = _load_settings()
 
-def _apply_pupil_overlay(data: bytes) -> bytes:
-    """Decode JPEG, run eye pipeline (pupil + glint + PCCR), draw overlay, re-encode."""
+def _apply_pupil_overlay(data: bytes, roi: list[float] = None) -> bytes:
+    """Decode JPEG, run eye pipeline (pupil + glint + PCCR) on ROI, draw overlay, re-encode."""
     if not _PUPIL_OK or not data:
         return data
     arr = np.frombuffer(data, np.uint8)
     bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if bgr is None:
         return data
-    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    result = _eye_pipe.process(gray)
-    bgr = EyePipeline.draw(bgr, result)
+
+    h, w = bgr.shape[:2]
+    if roi and roi != [0.0, 0.0, 1.0, 1.0]:
+        x1, y1, x2, y2 = int(roi[0]*w), int(roi[1]*h), int(roi[2]*w), int(roi[3]*h)
+        # Ensure valid crop
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w, x2), min(h, y2)
+        if x2 > x1 and y2 > y1:
+            crop = bgr[y1:y2, x1:x2]
+            gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+            result = _eye_pipe.process(gray)
+            # Draw result on crop, but we need to pass the full image or adjust coordinates
+            # EyePipeline.draw expects the same image that was processed
+            crop = EyePipeline.draw(crop, result)
+            bgr[y1:y2, x1:x2] = crop
+            # Draw ROI box
+            cv2.rectangle(bgr, (x1, y1), (x2, y2), (0, 0, 255), 1)
+    else:
+        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        result = _eye_pipe.process(gray)
+        bgr = EyePipeline.draw(bgr, result)
+
     _, enc = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
     return enc.tobytes()
 
@@ -118,6 +137,7 @@ class CamState:
         self.udp_port = 5000 + (cam_id - 1) * 2
         self.cmd_port = 5001 + (cam_id - 1) * 2
         self.ip       = ""
+        self.roi      = [0.0, 0.0, 1.0, 1.0] # [x1, y1, x2, y2] normalized
 
         # UDP reassembly buffer
         self._frames: dict = {}
@@ -542,6 +562,16 @@ class MJPEGHandler(BaseHTTPRequestHandler):
         if "analysis" in params:
             g_analysis_enabled = params["analysis"] != "0"
 
+        # ROI settings (x1,y1,x2,y2 normalized)
+        new_roi = None
+        if "roi" in params:
+            try:
+                new_roi = [float(x) for x in params["roi"].split(",")]
+                if len(new_roi) != 4:
+                    new_roi = None
+            except ValueError:
+                new_roi = None
+
         # Eye pipeline parameters
         eye_updates = {}
         for key, (lo, hi) in self._EYE_PARAM_MAP.items():
@@ -573,21 +603,24 @@ class MJPEGHandler(BaseHTTPRequestHandler):
             target_ids = [1, 2]
 
         sent_to = []
-        if cmds:
+        if cmds or new_roi:
             for cid in target_ids:
+                if new_roi:
+                    CAMS[cid].roi = new_roi
                 if not CAMS[cid].ip:
+                    if new_roi: sent_to.append(cid) # Still count if we set ROI
                     continue
                 for cmd in cmds:
                     CAMS[cid].send_cmd(cmd)
                     time.sleep(0.06)  # ESP32 cmdTask polls every 50ms
-                sent_to.append(cid)
+                if cid not in sent_to: sent_to.append(cid)
             _save_settings(g_settings)
 
         try:
             msg = ""
             if sent_to:
                 msg = "cam" + "+cam".join(str(c) for c in sent_to)
-            elif cmds:
+            elif cmds or new_roi:
                 msg = "no cams online"
             body = json.dumps({"ok": bool(sent_to or "analysis" in params or eye_updates or "save_eye" in params), "to": msg}).encode()
             self.send_response(200)
@@ -608,7 +641,7 @@ class MJPEGHandler(BaseHTTPRequestHandler):
             except BrokenPipeError: pass
             return
         if g_analysis_enabled:
-            data = _apply_pupil_overlay(data)
+            data = _apply_pupil_overlay(data, cam.roi)
         try:
             self.send_response(200)
             self.send_header("Content-Type", "image/jpeg")
@@ -633,7 +666,7 @@ class MJPEGHandler(BaseHTTPRequestHandler):
                 if not data:
                     continue
                 if g_analysis_enabled:
-                    data = _apply_pupil_overlay(data)
+                    data = _apply_pupil_overlay(data, cam.roi)
                 hdr = (b"--frame\r\nContent-Type: image/jpeg\r\n"
                        b"Content-Length: " + str(len(data)).encode() + b"\r\n\r\n")
                 self.wfile.write(hdr + data + b"\r\n")
@@ -663,6 +696,7 @@ class MJPEGHandler(BaseHTTPRequestHandler):
     canvas.online  { border-color: #3a3; }
     canvas.offline { border-color: #622; }
     .feed-stats { font-size: 11px; color: #8d8; }
+    .feed-roi-hint { font-size: 10px; color: #555; }
 
     .sync-bar { font-size: 12px; color: #adf;
                 background: #1a1a2e; padding: 4px 14px; border-radius: 3px; }
@@ -688,11 +722,13 @@ class MJPEGHandler(BaseHTTPRequestHandler):
       <div class="feed-label">CAM 1</div>
       <canvas id="c1" width="320" height="240"></canvas>
       <div class="feed-stats" id="s1">—</div>
+      <div class="feed-roi-hint">Drag to set ROI · Dbl-click to reset</div>
     </div>
     <div class="feed">
       <div class="feed-label">CAM 2</div>
       <canvas id="c2" width="320" height="240"></canvas>
       <div class="feed-stats" id="s2">—</div>
+      <div class="feed-roi-hint">Drag to set ROI · Dbl-click to reset</div>
     </div>
   </div>
 
@@ -901,6 +937,67 @@ const c2  = document.getElementById('c2');
 const ctx1 = c1.getContext('2d');
 const ctx2 = c2.getContext('2d');
 
+// ROI State
+let roi = {
+  1: { x1: 0, y1: 0, x2: 1, y2: 1, active: false, start: null, current: null },
+  2: { x1: 0, y1: 0, x2: 1, y2: 1, active: false, start: null, current: null }
+};
+
+function setupROI(cid, canvas) {
+  canvas.onmousedown = (e) => {
+    const rect = canvas.getBoundingClientRect();
+    roi[cid].start = {
+      x: (e.clientX - rect.left) / rect.width,
+      y: (e.clientY - rect.top) / rect.height
+    };
+    roi[cid].current = { ...roi[cid].start };
+    roi[cid].active = true;
+  };
+
+  window.addEventListener('mousemove', (e) => {
+    if (!roi[cid].active) return;
+    const rect = canvas.getBoundingClientRect();
+    roi[cid].current = {
+      x: (e.clientX - rect.left) / rect.width,
+      y: (e.clientY - rect.top) / rect.height
+    };
+  });
+
+  window.addEventListener('mouseup', (e) => {
+    if (!roi[cid].active) return;
+    roi[cid].active = false;
+    
+    const x1 = Math.min(roi[cid].start.x, roi[cid].current.x);
+    const y1 = Math.min(roi[cid].start.y, roi[cid].current.y);
+    const x2 = Math.max(roi[cid].start.x, roi[cid].current.x);
+    const y2 = Math.max(roi[cid].start.y, roi[cid].current.y);
+
+    if (Math.abs(x2 - x1) > 0.01 && Math.abs(y2 - y1) > 0.01) {
+      applyROI(cid, x1, y1, x2, y2);
+    }
+    roi[cid].current = null;
+  });
+
+  canvas.ondblclick = () => {
+    applyROI(cid, 0, 0, 1, 1);
+  };
+}
+
+function applyROI(cid, x1, y1, x2, y2) {
+  x1 = Math.max(0, Math.min(1, x1));
+  y1 = Math.max(0, Math.min(1, y1));
+  x2 = Math.max(0, Math.min(1, x2));
+  y2 = Math.max(0, Math.min(1, y2));
+  const qs = `cam=${cid}&roi=${x1.toFixed(3)},${y1.toFixed(3)},${x2.toFixed(3)},${y2.toFixed(3)}&analysis=1`;
+  fetch('/set?' + qs).then(r => r.json()).then(d => {
+    document.getElementById('feedback').textContent = `Cam ${cid} ROI set`;
+    setTimeout(() => { document.getElementById('feedback').textContent = ''; }, 2000);
+  });
+}
+
+setupROI(1, c1);
+setupROI(2, c2);
+
 let displayFps = 20;   // how often we poll for new frames (Hz)
 let running    = true;
 let camOnline  = {1: false, 2: false};
@@ -912,12 +1009,23 @@ async function fetchBitmap(url) {
   return createImageBitmap(blob);
 }
 
-function drawBitmap(canvas, ctx, bmp) {
+function drawBitmap(canvas, ctx, bmp, cid) {
   if (!bmp) return;
   canvas.width  = bmp.width;
   canvas.height = bmp.height;
   ctx.drawImage(bmp, 0, 0);
   bmp.close();
+
+  // Draw local ROI selection box while dragging
+  if (roi[cid].active && roi[cid].current) {
+    const x1 = roi[cid].start.x * canvas.width;
+    const y1 = roi[cid].start.y * canvas.height;
+    const x2 = roi[cid].current.x * canvas.width;
+    const y2 = roi[cid].current.y * canvas.height;
+    ctx.strokeStyle = '#f00';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+  }
 }
 
 async function loop() {
@@ -931,8 +1039,8 @@ async function loop() {
     const [bmp1, bmp2] = await Promise.all(fetches);
 
     requestAnimationFrame(() => {
-      drawBitmap(c1, ctx1, bmp1);
-      drawBitmap(c2, ctx2, bmp2);
+      drawBitmap(c1, ctx1, bmp1, 1);
+      drawBitmap(c2, ctx2, bmp2, 2);
     });
   } catch (_) {}
 
