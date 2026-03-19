@@ -556,10 +556,11 @@ class MJPEGHandler(BaseHTTPRequestHandler):
 
     # Eye pipeline parameter ranges for validation
     _EYE_PARAM_MAP = {
-        "p_glint_thresh":    (10, 255),
-        "p_blur_ksize":      (3, 21),
-        "p_thresh_offset":   (5, 100),
-        "p_morph_ksize":     (3, 15),
+        "p_glint_thresh":   (10, 255),
+        "p_blur_ksize":     (3, 21),
+        "p_thresh_offset":  (0, 100),
+        "p_morph_ksize":    (3, 15),
+
         "p_min_radius":      (5, 200),
         "p_max_radius":      (20, 400),
         "p_circularity_min": (0.1, 1.0),
@@ -905,7 +906,7 @@ class MJPEGHandler(BaseHTTPRequestHandler):
       </div>
       <div class="ctrl-group">
         <span style="color:#8f8">Pupil -Threshold offset: <b id="p_thresh_offset_val">30</b></span>
-        <input type="range" min="5" max="100" value="30" id="p_thresh_offset"
+        <input type="range" min="0" max="100" value="30" id="p_thresh_offset"
                oninput="document.getElementById('p_thresh_offset_val').textContent=this.value">
       </div>
       <div class="ctrl-group">
@@ -1249,7 +1250,7 @@ fetch('/eye_settings').then(r => r.json()).then(s => {
     .cam-panel { flex: 1; display: flex; flex-direction: column; align-items: center;
                  min-width: 0; }
     .cam-label { font-size: 11px; color: #fa0; margin-bottom: 4px; font-weight: bold; }
-    .cam-panel canvas { width: 100%; flex: 1; object-fit: contain;
+    .cam-panel canvas { width: 100%; height: auto;
                         background: #111; border: 1px solid #333; border-radius: 3px;
                         cursor: crosshair; }
 
@@ -1320,7 +1321,7 @@ fetch('/eye_settings').then(r => r.json()).then(s => {
       </div>
       <div class="ctrl-group">
         <span style="color:#8f8">Pupil -Thresh offset: <b id="p_thresh_offset_val">30</b></span>
-        <input type="range" min="5" max="100" value="30" id="p_thresh_offset" oninput="upd(this)">
+        <input type="range" min="0" max="100" value="30" id="p_thresh_offset" oninput="upd(this)">
       </div>
       <div class="ctrl-group">
         <span style="color:#8f8">Pupil -Morph ksize: <b id="p_morph_ksize_val">5</b></span>

@@ -75,7 +75,7 @@ class PupilDetector:
         #    The pupil is the darkest region — use a threshold relative to its own intensity.
         dark_val = int(np.percentile(blurred, 10))
         tval = dark_val + self.thresh_offset
-        tval = max(tval, 30)
+        tval = max(tval, 5)
         _, mask = cv2.threshold(blurred, tval, 255, cv2.THRESH_BINARY_INV)
         intermediate["p_thresh"] = mask.copy()
 
