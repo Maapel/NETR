@@ -551,6 +551,7 @@ class MJPEGHandler(BaseHTTPRequestHandler):
             for cid in target_ids:
                 for cmd in cmds:
                     CAMS[cid].send_cmd(cmd)
+                    time.sleep(0.06)  # ESP32 cmdTask polls every 50ms
             _save_settings(g_settings)
 
         try:
@@ -1038,9 +1039,12 @@ async function render() {
     `Frame ${idx} / ${maxF - 1}`;
   document.getElementById('slider').value = idx;
 
-  const fetches = [1, 2].filter(cid => idx < total[cid]).map(cid =>
-    fetch(`/playback/${rec}/cam${cid}/${idx}?analysis=${ana}`)
-      .then(r => r.blob())
+  const fetches = [1, 2].map(cid => {
+    if (idx >= total[cid] || total[cid] === 0) return Promise.resolve();
+    // Clamp to last frame for shorter cam
+    const fi = Math.min(idx, total[cid] - 1);
+    return fetch(`/playback/${rec}/cam${cid}/${fi}?analysis=${ana}`)
+      .then(r => { if (!r.ok) throw new Error(r.status); return r.blob(); })
       .then(b => createImageBitmap(b))
       .then(bmp => {
         const canvas = cid === 1 ? c1 : c2;
@@ -1050,8 +1054,10 @@ async function render() {
         ctx.drawImage(bmp, 0, 0);
         bmp.close();
       })
-      .catch(() => {})
-  );
+      .catch(e => {
+        document.getElementById('status').textContent = `cam${cid} frame ${fi}: ${e}`;
+      });
+  });
   await Promise.all(fetches);
   rendering = false;
 }
