@@ -558,6 +558,7 @@ class MJPEGHandler(BaseHTTPRequestHandler):
     _EYE_PARAM_MAP = {
         "p_glint_thresh":   (10, 255),
         "p_blur_ksize":     (3, 21),
+        "p_dark_percentile":(0.0, 100.0),
         "p_thresh_offset":  (0, 100),
         "p_morph_ksize":    (3, 15),
 
@@ -905,6 +906,11 @@ class MJPEGHandler(BaseHTTPRequestHandler):
                oninput="document.getElementById('p_blur_ksize_val').textContent=this.value">
       </div>
       <div class="ctrl-group">
+        <span style="color:#8f8">Pupil -Dark percentile: <b id="p_dark_percentile_val">10.0</b></span>
+        <input type="range" min="0" max="1000" value="100" id="p_dark_percentile"
+               oninput="document.getElementById('p_dark_percentile_val').textContent=(this.value/10).toFixed(1)">
+      </div>
+      <div class="ctrl-group">
         <span style="color:#8f8">Pupil -Threshold offset: <b id="p_thresh_offset_val">30</b></span>
         <input type="range" min="0" max="100" value="30" id="p_thresh_offset"
                oninput="document.getElementById('p_thresh_offset_val').textContent=this.value">
@@ -1148,13 +1154,13 @@ function saveRecording() {
 }
 
 // ── Eye pipeline controls ─────────────────────────────────────────────────────
-const EYE_KEYS = ['p_glint_thresh','p_blur_ksize','p_thresh_offset','p_morph_ksize',
+const EYE_KEYS = ['p_glint_thresh','p_blur_ksize','p_dark_percentile','p_thresh_offset','p_morph_ksize',
   'p_min_radius','p_max_radius','p_circularity_min',
   'g_brightness_thresh','g_min_area','g_max_area','g_search_radius_factor','g_circularity_min'];
 
 // Float params use scaled integer sliders
 const EYE_FLOAT_SCALE = {
-  'p_circularity_min': 100, 'g_circularity_min': 100, 'g_search_radius_factor': 10
+  'p_dark_percentile': 10, 'p_circularity_min': 100, 'g_circularity_min': 100, 'g_search_radius_factor': 10
 };
 
 function eyeSliderVal(key) {
@@ -1320,6 +1326,10 @@ fetch('/eye_settings').then(r => r.json()).then(s => {
         <input type="range" min="3" max="21" step="2" value="7" id="p_blur_ksize" oninput="upd(this)">
       </div>
       <div class="ctrl-group">
+        <span style="color:#8f8">Pupil -Dark %: <b id="p_dark_percentile_val">10.0</b></span>
+        <input type="range" min="0" max="1000" value="100" id="p_dark_percentile" oninput="upd(this,10)">
+      </div>
+      <div class="ctrl-group">
         <span style="color:#8f8">Pupil -Thresh offset: <b id="p_thresh_offset_val">30</b></span>
         <input type="range" min="0" max="100" value="30" id="p_thresh_offset" oninput="upd(this)">
       </div>
@@ -1437,10 +1447,10 @@ function applyROI(cid, x1, y1, x2, y2) {
 setupROI(1, c1);
 setupROI(2, c2);
 
-const EYE_KEYS = ['p_glint_thresh','p_blur_ksize','p_thresh_offset','p_morph_ksize',
+const EYE_KEYS = ['p_glint_thresh','p_blur_ksize','p_dark_percentile','p_thresh_offset','p_morph_ksize',
   'p_min_radius','p_max_radius','p_circularity_min',
   'g_brightness_thresh','g_min_area','g_max_area','g_search_radius_factor','g_circularity_min'];
-const EYE_FLOAT_SCALE = {'p_circularity_min': 100, 'g_circularity_min': 100, 'g_search_radius_factor': 10};
+const EYE_FLOAT_SCALE = {'p_dark_percentile': 10, 'p_circularity_min': 100, 'g_circularity_min': 100, 'g_search_radius_factor': 10};
 
 function upd(el, scale=1) {
   const val = scale > 1 ? (el.value/scale).toFixed(scale>10?2:1) : el.value;

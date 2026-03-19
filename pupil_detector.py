@@ -33,7 +33,8 @@ class PupilDetector:
         self,
         glint_thresh: int = 200,        # suppress pixels brighter than this
         blur_ksize: int = 7,
-        thresh_offset: int = 30,        # threshold = mean_of_dark_region + offset
+        thresh_offset: int = 30,        # threshold = percentile_of_dark_region + offset
+        dark_percentile: float = 10.0,  # which percentile to use as the base (0..100)
         morph_ksize: int = 5,
         min_radius: int = 15,
         max_radius: int = 150,
@@ -42,6 +43,7 @@ class PupilDetector:
         self.glint_thresh = glint_thresh
         self.blur_ksize = blur_ksize
         self.thresh_offset = thresh_offset
+        self.dark_percentile = dark_percentile
         self.morph_ksize = morph_ksize
         self.min_radius = min_radius
         self.max_radius = max_radius
@@ -73,7 +75,7 @@ class PupilDetector:
 
         # 3. Adaptive threshold: find pixels darker than (darkest_percentile + offset)
         #    The pupil is the darkest region — use a threshold relative to its own intensity.
-        dark_val = int(np.percentile(blurred, 10))
+        dark_val = int(np.percentile(blurred, self.dark_percentile))
         tval = dark_val + self.thresh_offset
         tval = max(tval, 5)
         _, mask = cv2.threshold(blurred, tval, 255, cv2.THRESH_BINARY_INV)
