@@ -266,6 +266,8 @@ class MJPEGHandler(BaseHTTPRequestHandler):
         elif path == "/stats":     self._stats()
         elif path == "/settings":  self._get_settings()
         elif path == "/record/save": self._record_save()
+        elif path == "/recordings":  self._list_recordings()
+        elif path.startswith("/playback/"): self._playback_frame(path)
         elif self.path.startswith("/set?"): self._set_cmd(self.path[5:])
         else:
             try: self.send_error(404)
@@ -348,6 +350,113 @@ class MJPEGHandler(BaseHTTPRequestHandler):
                 for i, (ts_us, jpeg) in enumerate(frames):
                     (cam_dir / f"{i:05d}_{ts_us}.jpg").write_bytes(jpeg)
                 print(f"cam{cid}: saved {len(frames)} frames → {cam_dir}/")
+
+    # ── /recordings — list saved recordings ─────────────────────────────────
+    def _list_recordings(self):
+        rec_dir = _pathlib.Path(__file__).parent / "recordings"
+        result = []
+        if rec_dir.is_dir():
+            for d in sorted(rec_dir.iterdir(), reverse=True):
+                if not d.is_dir():
+                    continue
+                entry = {"name": d.name, "cams": {}}
+                for cid in [1, 2]:
+                    avi = d / f"cam{cid}.avi"
+                    jpgdir = d / f"cam{cid}"
+                    if avi.exists():
+                        entry["cams"][str(cid)] = {"type": "avi", "path": str(avi)}
+                    elif jpgdir.is_dir():
+                        frames = sorted(jpgdir.glob("*.jpg"))
+                        entry["cams"][str(cid)] = {"type": "jpg", "count": len(frames)}
+                if entry["cams"]:
+                    result.append(entry)
+        body = json.dumps(result).encode()
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except BrokenPipeError:
+            pass
+
+    # ── /playback/<rec_name>/cam<n>/<frame_idx>?analysis=0|1 ─────────────
+    def _playback_frame(self, path: str):
+        import urllib.parse
+        query = ""
+        if "?" in self.path:
+            query = self.path.split("?", 1)[1]
+        params = dict(urllib.parse.parse_qsl(query))
+        do_analysis = params.get("analysis", "0") != "0"
+
+        parts = path.strip("/").split("/")  # playback / <rec> / cam<n> / <idx>
+        if len(parts) != 4:
+            try: self.send_error(400)
+            except BrokenPipeError: pass
+            return
+        _, rec_name, cam_str, idx_str = parts
+        try:
+            cid = int(cam_str.replace("cam", ""))
+            idx = int(idx_str)
+        except ValueError:
+            try: self.send_error(400)
+            except BrokenPipeError: pass
+            return
+
+        rec_dir = _pathlib.Path(__file__).parent / "recordings" / rec_name
+        jpeg = None
+        total = 0
+
+        # Try AVI first
+        avi = rec_dir / f"cam{cid}.avi"
+        if avi.exists() and _PUPIL_OK:
+            cap = cv2.VideoCapture(str(avi))
+            total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            idx = max(0, min(idx, total - 1))
+            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            ret, frame = cap.read()
+            cap.release()
+            if ret:
+                if do_analysis:
+                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    gray = cv2.equalizeHist(gray)
+                    center, radius, _ = _detect_pupil(gray, 0)
+                    _draw_overlay(frame, center, radius)
+                _, enc = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+                jpeg = enc.tobytes()
+        else:
+            # Fallback: JPEG directory
+            jpgdir = rec_dir / f"cam{cid}"
+            if jpgdir.is_dir():
+                frames = sorted(jpgdir.glob("*.jpg"))
+                total = len(frames)
+                if 0 <= idx < total:
+                    jpeg = frames[idx].read_bytes()
+                    if do_analysis and _PUPIL_OK:
+                        arr = np.frombuffer(jpeg, np.uint8)
+                        bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                        if bgr is not None:
+                            gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+                            gray = cv2.equalizeHist(gray)
+                            center, radius, _ = _detect_pupil(gray, 0)
+                            _draw_overlay(bgr, center, radius)
+                            _, enc = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 90])
+                            jpeg = enc.tobytes()
+
+        if jpeg is None:
+            try: self.send_error(404)
+            except BrokenPipeError: pass
+            return
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "image/jpeg")
+            self.send_header("Content-Length", str(len(jpeg)))
+            self.send_header("X-Total-Frames", str(total))
+            self.send_header("Access-Control-Expose-Headers", "X-Total-Frames")
+            self.end_headers()
+            self.wfile.write(jpeg)
+        except BrokenPipeError:
+            pass
 
     # ── /set?quality=X&fps=Y&cam=1&analysis=0|1&brightness=0&... ────────────
     # All sensor params mapped to firmware command prefixes
@@ -483,6 +592,18 @@ class MJPEGHandler(BaseHTTPRequestHandler):
              border: none; border-radius: 3px; cursor: pointer; font-size: 11px; }
     button:active { background: #194; }
     #feedback { font-size: 11px; color: #fa0; min-height: 13px; }
+
+    .playback { width: 100%; max-width: 900px; background: #111;
+                 border: 1px solid #333; border-radius: 4px; padding: 10px;
+                 margin-top: 6px; }
+    .playback h3 { font-size: 13px; color: #fa0; margin-bottom: 8px; }
+    .playback .pb-controls { display: flex; gap: 8px; align-items: center;
+                              flex-wrap: wrap; font-size: 11px; margin-bottom: 8px; }
+    .playback select, .playback input[type=range] { font-size: 11px; }
+    .playback .pb-canvases { display: flex; gap: 8px; justify-content: center; }
+    .playback canvas { max-width: 48%; border: 1px solid #444; border-radius: 3px;
+                        background: #0a0a0a; }
+    .playback .pb-info { font-size: 11px; color: #8d8; margin-top: 4px; text-align: center; }
   </style>
 </head>
 <body>
@@ -614,6 +735,28 @@ class MJPEGHandler(BaseHTTPRequestHandler):
   </div>
   <div id="feedback"></div>
 
+  <div class="playback" id="pb-panel">
+    <h3>Recording Playback + Analysis</h3>
+    <div class="pb-controls">
+      <select id="pb-rec"><option value="">— select recording —</option></select>
+      <button onclick="pbLoad()" style="font-size:11px">Load</button>
+      <label><input type="checkbox" id="pb-analysis" checked> Pupil Analysis</label>
+      <button onclick="pbStep(-1)" style="font-size:11px">&lt;</button>
+      <button onclick="pbPlayPause()" id="pb-play" style="font-size:11px">Play</button>
+      <button onclick="pbStep(1)" style="font-size:11px">&gt;</button>
+      <span id="pb-frame-info">—</span>
+    </div>
+    <div>
+      <input type="range" min="0" max="0" value="0" id="pb-slider" style="width:100%"
+             oninput="pbSeek(+this.value)">
+    </div>
+    <div class="pb-canvases">
+      <canvas id="pb-c1" width="320" height="240"></canvas>
+      <canvas id="pb-c2" width="320" height="240"></canvas>
+    </div>
+    <div class="pb-info" id="pb-status">No recording loaded</div>
+  </div>
+
 <script>
 // ── Synchronized canvas display ───────────────────────────────────────────────
 // Both frames are fetched simultaneously, decoded in parallel, then drawn in
@@ -721,7 +864,108 @@ function saveRecording() {
   fb.textContent = 'Saving 2-min buffer...';
   fetch('/record/save').then(r => r.json()).then(d => {
     fb.textContent = d.ok ? 'Saved to recordings/' : 'Save failed';
+    pbRefreshList();  // refresh recordings dropdown
   }).catch(e => { fb.textContent = 'Error: ' + e; });
+}
+
+// ── Playback ─────────────────────────────────────────────────────────────────
+const pbC1 = document.getElementById('pb-c1');
+const pbC2 = document.getElementById('pb-c2');
+const pbCtx1 = pbC1.getContext('2d');
+const pbCtx2 = pbC2.getContext('2d');
+let pbRec = null;        // current recording name
+let pbTotal = {1: 0, 2: 0};
+let pbIdx = 0;
+let pbPlaying = false;
+let pbTimer = null;
+
+function pbRefreshList() {
+  fetch('/recordings').then(r => r.json()).then(recs => {
+    const sel = document.getElementById('pb-rec');
+    sel.innerHTML = '<option value="">— select recording —</option>';
+    recs.forEach(r => {
+      const cams = Object.keys(r.cams).map(c => 'cam'+c).join('+');
+      sel.innerHTML += `<option value="${r.name}">${r.name} (${cams})</option>`;
+    });
+  }).catch(() => {});
+}
+pbRefreshList();
+
+async function pbLoad() {
+  const name = document.getElementById('pb-rec').value;
+  if (!name) return;
+  pbRec = name;
+  pbIdx = 0;
+  pbPlaying = false;
+  if (pbTimer) { clearInterval(pbTimer); pbTimer = null; }
+  document.getElementById('pb-play').textContent = 'Play';
+
+  // Probe frame 0 of each cam to get total count
+  for (const cid of [1, 2]) {
+    try {
+      const r = await fetch(`/playback/${pbRec}/cam${cid}/0`);
+      pbTotal[cid] = parseInt(r.headers.get('X-Total-Frames') || '0');
+    } catch(_) { pbTotal[cid] = 0; }
+  }
+  const maxFrames = Math.max(pbTotal[1], pbTotal[2]);
+  const slider = document.getElementById('pb-slider');
+  slider.max = Math.max(0, maxFrames - 1);
+  slider.value = 0;
+  document.getElementById('pb-status').textContent =
+    `Loaded ${pbRec}: cam1=${pbTotal[1]} cam2=${pbTotal[2]} frames`;
+  pbRender();
+}
+
+async function pbRender() {
+  if (!pbRec) return;
+  const ana = document.getElementById('pb-analysis').checked ? '1' : '0';
+  const info = document.getElementById('pb-frame-info');
+  info.textContent = `Frame ${pbIdx} / ${Math.max(pbTotal[1], pbTotal[2]) - 1}`;
+  document.getElementById('pb-slider').value = pbIdx;
+
+  const draws = [];
+  for (const [cid, canvas, ctx] of [[1, pbC1, pbCtx1], [2, pbC2, pbCtx2]]) {
+    if (pbIdx < pbTotal[cid]) {
+      draws.push(
+        fetch(`/playback/${pbRec}/cam${cid}/${pbIdx}?analysis=${ana}`)
+          .then(r => r.blob())
+          .then(b => createImageBitmap(b))
+          .then(bmp => { canvas.width = bmp.width; canvas.height = bmp.height;
+                         ctx.drawImage(bmp, 0, 0); bmp.close(); })
+          .catch(() => {})
+      );
+    }
+  }
+  await Promise.all(draws);
+}
+
+function pbStep(delta) {
+  if (!pbRec) return;
+  const maxF = Math.max(pbTotal[1], pbTotal[2]);
+  pbIdx = Math.max(0, Math.min(pbIdx + delta, maxF - 1));
+  pbRender();
+}
+
+function pbSeek(idx) {
+  if (!pbRec) return;
+  pbIdx = idx;
+  pbRender();
+}
+
+function pbPlayPause() {
+  if (!pbRec) return;
+  pbPlaying = !pbPlaying;
+  document.getElementById('pb-play').textContent = pbPlaying ? 'Pause' : 'Play';
+  if (pbPlaying) {
+    pbTimer = setInterval(() => {
+      const maxF = Math.max(pbTotal[1], pbTotal[2]);
+      if (pbIdx >= maxF - 1) { pbPlayPause(); return; }
+      pbIdx++;
+      pbRender();
+    }, 66);  // ~15fps playback
+  } else {
+    if (pbTimer) { clearInterval(pbTimer); pbTimer = null; }
+  }
 }
 </script>
 </body>
