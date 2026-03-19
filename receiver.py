@@ -501,12 +501,13 @@ class MJPEGHandler(BaseHTTPRequestHandler):
                     cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
                     ret, frame = cap.read()
                 if ret:
-                    if do_analysis:
-                        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                        result = _eye_pipe.process(gray)
-                        frame = EyePipeline.draw(frame, result)
+                    # Convert to JPEG bytes to use _apply_pupil_overlay
                     _, enc = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
                     jpeg = enc.tobytes()
+                    if do_analysis:
+                        # Use the ROI from the live CAM state if it exists, or None
+                        roi = CAMS[cid].roi if cid in CAMS else None
+                        jpeg = _apply_pupil_overlay(jpeg, roi)
         else:
             # Fallback: JPEG directory
             jpgdir = rec_dir / f"cam{cid}"
@@ -516,14 +517,8 @@ class MJPEGHandler(BaseHTTPRequestHandler):
                 if 0 <= idx < total:
                     jpeg = frames[idx].read_bytes()
                     if do_analysis and _PUPIL_OK:
-                        arr = np.frombuffer(jpeg, np.uint8)
-                        bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-                        if bgr is not None:
-                            gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-                            result = _eye_pipe.process(gray)
-                            bgr = EyePipeline.draw(bgr, result)
-                            _, enc = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 90])
-                            jpeg = enc.tobytes()
+                        roi = CAMS[cid].roi if cid in CAMS else None
+                        jpeg = _apply_pupil_overlay(jpeg, roi)
 
         if jpeg is None:
             try: self.send_error(404)
