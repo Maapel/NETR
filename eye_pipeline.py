@@ -17,7 +17,7 @@ Usage:
 
 import cv2
 import numpy as np
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from pupil_detector import PupilDetector, PupilResult
 from glint_detector import GlintDetector, GlintResult
