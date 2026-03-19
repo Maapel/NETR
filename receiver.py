@@ -1250,7 +1250,8 @@ fetch('/eye_settings').then(r => r.json()).then(s => {
                  min-width: 0; }
     .cam-label { font-size: 11px; color: #fa0; margin-bottom: 4px; font-weight: bold; }
     .cam-panel canvas { width: 100%; flex: 1; object-fit: contain;
-                        background: #111; border: 1px solid #333; border-radius: 3px; }
+                        background: #111; border: 1px solid #333; border-radius: 3px;
+                        cursor: crosshair; }
 
     .status-bar { font-size: 11px; color: #777; padding: 6px 0 0 0;
                   border-top: 1px solid #222; margin-top: 8px; text-align: center; }
@@ -1373,6 +1374,68 @@ const c2 = document.getElementById('c2');
 const ctx1 = c1.getContext('2d');
 const ctx2 = c2.getContext('2d');
 
+// ROI State (for playback)
+let roi = {
+  1: { x1: 0, y1: 0, x2: 1, y2: 1, active: false, start: null, current: null },
+  2: { x1: 0, y1: 0, x2: 1, y2: 1, active: false, start: null, current: null }
+};
+
+function setupROI(cid, canvas) {
+  canvas.onmousedown = (e) => {
+    const rect = canvas.getBoundingClientRect();
+    roi[cid].start = {
+      x: (e.clientX - rect.left) / rect.width,
+      y: (e.clientY - rect.top) / rect.height
+    };
+    roi[cid].current = { ...roi[cid].start };
+    roi[cid].active = true;
+  };
+
+  window.addEventListener('mousemove', (e) => {
+    if (!roi[cid].active) return;
+    const rect = canvas.getBoundingClientRect();
+    roi[cid].current = {
+      x: (e.clientX - rect.left) / rect.width,
+      y: (e.clientY - rect.top) / rect.height
+    };
+    render(); // Update selection box immediately
+  });
+
+  window.addEventListener('mouseup', (e) => {
+    if (!roi[cid].active) return;
+    roi[cid].active = false;
+    
+    const x1 = Math.min(roi[cid].start.x, roi[cid].current.x);
+    const y1 = Math.min(roi[cid].start.y, roi[cid].current.y);
+    const x2 = Math.max(roi[cid].start.x, roi[cid].current.x);
+    const y2 = Math.max(roi[cid].start.y, roi[cid].current.y);
+
+    if (Math.abs(x2 - x1) > 0.01 && Math.abs(y2 - y1) > 0.01) {
+      applyROI(cid, x1, y1, x2, y2);
+    }
+    roi[cid].current = null;
+    render();
+  });
+
+  canvas.ondblclick = () => {
+    applyROI(cid, 0, 0, 1, 1);
+  };
+}
+
+function applyROI(cid, x1, y1, x2, y2) {
+  x1 = Math.max(0, Math.min(1, x1));
+  y1 = Math.max(0, Math.min(1, y1));
+  x2 = Math.max(0, Math.min(1, x2));
+  y2 = Math.max(0, Math.min(1, y2));
+  const qs = `cam=${cid}&roi=${x1.toFixed(3)},${y1.toFixed(3)},${x2.toFixed(3)},${y2.toFixed(3)}&analysis=1`;
+  fetch('/set?' + qs).then(r => r.json()).then(d => {
+    render();
+  });
+}
+
+setupROI(1, c1);
+setupROI(2, c2);
+
 const EYE_KEYS = ['p_glint_thresh','p_blur_ksize','p_thresh_offset','p_morph_ksize',
   'p_min_radius','p_max_radius','p_circularity_min',
   'g_brightness_thresh','g_min_area','g_max_area','g_search_radius_factor','g_circularity_min'];
@@ -1482,26 +1545,38 @@ async function render() {
   document.getElementById('slider').value = idx;
 
   const fetches = [1, 2].map(cid => {
-    if (idx >= total[cid] || total[cid] === 0) return Promise.resolve();
-    // Clamp to last frame for shorter cam
+    if (idx >= total[cid] || total[cid] === 0) return Promise.resolve(null);
     const fi = Math.min(idx, total[cid] - 1);
     return fetch(`/playback/${rec}/cam${cid}/${fi}?analysis=${ana}`)
-      .then(r => { if (!r.ok) throw new Error(r.status); return r.blob(); })
-      .then(b => createImageBitmap(b))
-      .then(bmp => {
-        const canvas = cid === 1 ? c1 : c2;
-        const ctx = cid === 1 ? ctx1 : ctx2;
-        canvas.width = bmp.width;
-        canvas.height = bmp.height;
-        ctx.drawImage(bmp, 0, 0);
-        bmp.close();
-      })
-      .catch(e => {
-        document.getElementById('status').textContent = `cam${cid} frame ${fi}: ${e}`;
-      });
+      .then(r => r.ok ? r.blob() : null)
+      .then(b => b ? createImageBitmap(b) : null)
+      .catch(() => null);
   });
-  await Promise.all(fetches);
+  
+  const bmps = await Promise.all(fetches);
+  drawBitmap(c1, ctx1, bmps[0], 1);
+  drawBitmap(c2, ctx2, bmps[1], 2);
+  
   rendering = false;
+}
+
+function drawBitmap(canvas, ctx, bmp, cid) {
+  if (!bmp) return;
+  canvas.width  = bmp.width;
+  canvas.height = bmp.height;
+  ctx.drawImage(bmp, 0, 0);
+  bmp.close();
+
+  // Draw local ROI selection box while dragging
+  if (roi[cid].active && roi[cid].current) {
+    const x1 = roi[cid].start.x * canvas.width;
+    const y1 = roi[cid].start.y * canvas.height;
+    const x2 = roi[cid].current.x * canvas.width;
+    const y2 = roi[cid].current.y * canvas.height;
+    ctx.strokeStyle = '#f00';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+  }
 }
 
 function step(delta) {
