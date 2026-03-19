@@ -1242,6 +1242,14 @@ fetch('/eye_settings').then(r => r.json()).then(s => {
     .slider-row { padding: 4px 0 8px 0; }
     .slider-row input { width: 100%; }
 
+    .ctrl-group { display: flex; flex-direction: column; gap: 3px; font-size: 11px; }
+    select { background: #1e1e1e; color: #ddd; border: 1px solid #444;
+             padding: 2px 4px; border-radius: 3px; }
+    input[type=range] { width: 100%; }
+    button.eye-btn { padding: 4px 14px; background: #286; color: #fff;
+             border: none; border-radius: 3px; cursor: pointer; font-size: 11px; }
+    button.eye-btn:active { background: #194; }
+
     .viewer { flex: 1; display: flex; gap: 8px; min-height: 0; }
     .cam-panel { flex: 1; display: flex; flex-direction: column; align-items: center;
                  min-width: 0; }
@@ -1289,6 +1297,78 @@ fetch('/eye_settings').then(r => r.json()).then(s => {
     </div>
   </div>
 
+  <details style="margin:8px 0; border:1px solid #444; border-radius:4px; padding:4px 8px; background:#1a1a2e">
+    <summary style="cursor:pointer; color:#8df; font-weight:bold; padding:2px 0; font-size:12px">
+      Eye Pipeline Settings (Applies to Playback)
+    </summary>
+    <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(200px, 1fr)); gap:6px 20px; padding:6px 0;">
+      <div class="ctrl-group">
+        <span style="color:#adf">Debug View</span>
+        <select id="debug_view" onchange="applyDebugView(this.value)">
+          <option value="original">Final Result (Overlay)</option>
+          <option value="p_suppressed">Pupil: Glint Suppressed</option>
+          <option value="p_blurred">Pupil: Blurred</option>
+          <option value="p_thresh">Pupil: Threshold</option>
+          <option value="p_morph">Pupil: Morphological</option>
+          <option value="g_thresh">Glint: Threshold</option>
+          <option value="g_morph">Glint: Morphological</option>
+        </select>
+      </div>
+      <div class="ctrl-group">
+        <span style="color:#8f8">Pupil -Glint suppress: <b id="p_glint_thresh_val">200</b></span>
+        <input type="range" min="10" max="255" value="200" id="p_glint_thresh" oninput="upd(this)">
+      </div>
+      <div class="ctrl-group">
+        <span style="color:#8f8">Pupil -Blur ksize: <b id="p_blur_ksize_val">7</b></span>
+        <input type="range" min="3" max="21" step="2" value="7" id="p_blur_ksize" oninput="upd(this)">
+      </div>
+      <div class="ctrl-group">
+        <span style="color:#8f8">Pupil -Thresh offset: <b id="p_thresh_offset_val">30</b></span>
+        <input type="range" min="5" max="100" value="30" id="p_thresh_offset" oninput="upd(this)">
+      </div>
+      <div class="ctrl-group">
+        <span style="color:#8f8">Pupil -Morph ksize: <b id="p_morph_ksize_val">5</b></span>
+        <input type="range" min="3" max="15" step="2" value="5" id="p_morph_ksize" oninput="upd(this)">
+      </div>
+      <div class="ctrl-group">
+        <span style="color:#8f8">Pupil -Min r: <b id="p_min_radius_val">15</b></span>
+        <input type="range" min="5" max="200" value="15" id="p_min_radius" oninput="upd(this)">
+      </div>
+      <div class="ctrl-group">
+        <span style="color:#8f8">Pupil -Max r: <b id="p_max_radius_val">150</b></span>
+        <input type="range" min="20" max="400" value="150" id="p_max_radius" oninput="upd(this)">
+      </div>
+      <div class="ctrl-group">
+        <span style="color:#8f8">Pupil -Circ min: <b id="p_circularity_min_val">0.4</b></span>
+        <input type="range" min="10" max="100" value="40" id="p_circularity_min" oninput="upd(this,100)">
+      </div>
+      <div class="ctrl-group">
+        <span style="color:#ff8">Glint -Bright thresh: <b id="g_brightness_thresh_val">230</b></span>
+        <input type="range" min="150" max="255" value="230" id="g_brightness_thresh" oninput="upd(this)">
+      </div>
+      <div class="ctrl-group">
+        <span style="color:#ff8">Glint -Min area: <b id="g_min_area_val">5</b></span>
+        <input type="range" min="1" max="500" value="5" id="g_min_area" oninput="upd(this)">
+      </div>
+      <div class="ctrl-group">
+        <span style="color:#ff8">Glint -Max area: <b id="g_max_area_val">800</b></span>
+        <input type="range" min="50" max="5000" value="800" id="g_max_area" oninput="upd(this)">
+      </div>
+      <div class="ctrl-group">
+        <span style="color:#ff8">Glint -Search r x: <b id="g_search_radius_factor_val">2.5</b></span>
+        <input type="range" min="10" max="50" value="25" id="g_search_radius_factor" oninput="upd(this,10)">
+      </div>
+      <div class="ctrl-group">
+        <span style="color:#ff8">Glint -Circ min: <b id="g_circularity_min_val">0.3</b></span>
+        <input type="range" min="10" max="100" value="30" id="g_circularity_min" oninput="upd(this,100)">
+      </div>
+    </div>
+    <div style="display:flex; gap:8px; padding-top:6px">
+      <button class="eye-btn" onclick="applyEyeSettings()">Apply to Pipeline</button>
+      <span id="eye-feedback" style="font-size:10px; color:#8df; align-self:center"></span>
+    </div>
+  </details>
+
   <div class="status-bar" id="status">—</div>
   <div class="kb">Space: play/pause &nbsp; Left/Right: step &nbsp; Shift+Left/Right: skip 10 &nbsp; A: toggle analysis &nbsp; 1-4: speed</div>
 
@@ -1297,6 +1377,47 @@ const c1 = document.getElementById('c1');
 const c2 = document.getElementById('c2');
 const ctx1 = c1.getContext('2d');
 const ctx2 = c2.getContext('2d');
+
+const EYE_KEYS = ['p_glint_thresh','p_blur_ksize','p_thresh_offset','p_morph_ksize',
+  'p_min_radius','p_max_radius','p_circularity_min',
+  'g_brightness_thresh','g_min_area','g_max_area','g_search_radius_factor','g_circularity_min'];
+const EYE_FLOAT_SCALE = {'p_circularity_min': 100, 'g_circularity_min': 100, 'g_search_radius_factor': 10};
+
+function upd(el, scale=1) {
+  const val = scale > 1 ? (el.value/scale).toFixed(scale>10?2:1) : el.value;
+  document.getElementById(el.id + '_val').textContent = val;
+}
+
+function applyDebugView(val) {
+  fetch('/set?debug_view=' + val + '&analysis=1').then(r => r.json()).then(() => render());
+}
+
+function applyEyeSettings() {
+  const fb = document.getElementById('eye-feedback');
+  fb.textContent = 'Applying...';
+  const qs = EYE_KEYS.map(k => {
+    const el = document.getElementById(k);
+    const scale = EYE_FLOAT_SCALE[k] || 1;
+    return k + '=' + (el.value / scale);
+  }).join('&');
+  fetch('/set?' + qs + '&analysis=1').then(r => r.json()).then(d => {
+    fb.textContent = d.ok ? 'Applied' : 'Failed';
+    setTimeout(() => fb.textContent = '', 2000);
+    render();
+  });
+}
+
+// Fetch current eye settings
+fetch('/eye_settings').then(r => r.json()).then(s => {
+  for (const k of EYE_KEYS) {
+    const el = document.getElementById(k);
+    if (el && s[k] !== undefined) {
+      const scale = EYE_FLOAT_SCALE[k] || 1;
+      el.value = s[k] * scale;
+      upd(el, scale);
+    }
+  }
+}).catch(() => {});
 
 let rec = null;
 let total = {1: 0, 2: 0};
