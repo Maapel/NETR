@@ -118,7 +118,7 @@ import collections
 import os
 from datetime import datetime
 
-RECORD_BUF_SECS = 120  # 2-minute rolling buffer
+RECORD_BUF_SECS = 30  # 30-seconds rolling buffer
 RECORD_MAX_FRAMES = 30 * RECORD_BUF_SECS  # ~3600 frames at 30fps
 
 HTTP_PORT      = 8080
@@ -883,7 +883,6 @@ function saveRecording() {
   fb.textContent = 'Saving 2-min buffer...';
   fetch('/record/save').then(r => r.json()).then(d => {
     fb.textContent = d.ok ? 'Saved to recordings/' : 'Save failed';
-    pbRefreshList();  // refresh recordings dropdown
   }).catch(e => { fb.textContent = 'Error: ' + e; });
 }
 
