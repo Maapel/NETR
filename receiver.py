@@ -876,6 +876,7 @@ fetch('/settings').then(r => r.json()).then(s => {
       if (LABEL_MAP[k]) document.getElementById(LABEL_MAP[k]).textContent = s[k];
     }
   }
+  applySettings();
 }).catch(() => {});
 
 function saveRecording() {
