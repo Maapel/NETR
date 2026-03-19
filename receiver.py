@@ -266,6 +266,7 @@ class MJPEGHandler(BaseHTTPRequestHandler):
         elif path == "/stats":     self._stats()
         elif path == "/settings":  self._get_settings()
         elif path == "/record/save": self._record_save()
+        elif path == "/player":      self._player()
         elif path == "/recordings":  self._list_recordings()
         elif path.startswith("/playback/"): self._playback_frame(path)
         elif self.path.startswith("/set?"): self._set_cmd(self.path[5:])
@@ -593,17 +594,6 @@ class MJPEGHandler(BaseHTTPRequestHandler):
     button:active { background: #194; }
     #feedback { font-size: 11px; color: #fa0; min-height: 13px; }
 
-    .playback { width: 100%; max-width: 900px; background: #111;
-                 border: 1px solid #333; border-radius: 4px; padding: 10px;
-                 margin-top: 6px; }
-    .playback h3 { font-size: 13px; color: #fa0; margin-bottom: 8px; }
-    .playback .pb-controls { display: flex; gap: 8px; align-items: center;
-                              flex-wrap: wrap; font-size: 11px; margin-bottom: 8px; }
-    .playback select, .playback input[type=range] { font-size: 11px; }
-    .playback .pb-canvases { display: flex; gap: 8px; justify-content: center; }
-    .playback canvas { max-width: 48%; border: 1px solid #444; border-radius: 3px;
-                        background: #0a0a0a; }
-    .playback .pb-info { font-size: 11px; color: #8d8; margin-top: 4px; text-align: center; }
   </style>
 </head>
 <body>
@@ -732,30 +722,9 @@ class MJPEGHandler(BaseHTTPRequestHandler):
     </div>
     <button onclick="applySettings()">Apply</button>
     <button onclick="saveRecording()" style="background:#c33">Save 2min Buffer</button>
+    <button onclick="window.open('/player','_blank')" style="background:#669">Player</button>
   </div>
   <div id="feedback"></div>
-
-  <div class="playback" id="pb-panel">
-    <h3>Recording Playback + Analysis</h3>
-    <div class="pb-controls">
-      <select id="pb-rec"><option value="">— select recording —</option></select>
-      <button onclick="pbLoad()" style="font-size:11px">Load</button>
-      <label><input type="checkbox" id="pb-analysis" checked> Pupil Analysis</label>
-      <button onclick="pbStep(-1)" style="font-size:11px">&lt;</button>
-      <button onclick="pbPlayPause()" id="pb-play" style="font-size:11px">Play</button>
-      <button onclick="pbStep(1)" style="font-size:11px">&gt;</button>
-      <span id="pb-frame-info">—</span>
-    </div>
-    <div>
-      <input type="range" min="0" max="0" value="0" id="pb-slider" style="width:100%"
-             oninput="pbSeek(+this.value)">
-    </div>
-    <div class="pb-canvases">
-      <canvas id="pb-c1" width="320" height="240"></canvas>
-      <canvas id="pb-c2" width="320" height="240"></canvas>
-    </div>
-    <div class="pb-info" id="pb-status">No recording loaded</div>
-  </div>
 
 <script>
 // ── Synchronized canvas display ───────────────────────────────────────────────
@@ -868,105 +837,233 @@ function saveRecording() {
   }).catch(e => { fb.textContent = 'Error: ' + e; });
 }
 
-// ── Playback ─────────────────────────────────────────────────────────────────
-const pbC1 = document.getElementById('pb-c1');
-const pbC2 = document.getElementById('pb-c2');
-const pbCtx1 = pbC1.getContext('2d');
-const pbCtx2 = pbC2.getContext('2d');
-let pbRec = null;        // current recording name
-let pbTotal = {1: 0, 2: 0};
-let pbIdx = 0;
-let pbPlaying = false;
-let pbTimer = null;
 
-function pbRefreshList() {
-  fetch('/recordings').then(r => r.json()).then(recs => {
-    const sel = document.getElementById('pb-rec');
-    sel.innerHTML = '<option value="">— select recording —</option>';
-    recs.forEach(r => {
-      const cams = Object.keys(r.cams).map(c => 'cam'+c).join('+');
-      sel.innerHTML += `<option value="${r.name}">${r.name} (${cams})</option>`;
-    });
-  }).catch(() => {});
-}
-pbRefreshList();
+</script>
+</body>
+</html>"""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.end_headers()
+        self.wfile.write(html.encode())
 
-async function pbLoad() {
-  const name = document.getElementById('pb-rec').value;
+
+    # ── /player — dedicated recording playback page ─────────────────────────
+    def _player(self):
+        html = r"""<!DOCTYPE html>
+<html>
+<head>
+  <title>NETR Player</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #0a0a0a; color: #ddd; font-family: monospace;
+           display: flex; flex-direction: column; height: 100vh; padding: 10px; }
+    .top-bar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+               padding: 8px 0; border-bottom: 1px solid #333; margin-bottom: 8px; }
+    .top-bar h2 { font-size: 14px; color: #fa0; margin-right: 10px; }
+    .top-bar select, .top-bar button, .top-bar label {
+      font-size: 12px; font-family: monospace; }
+    .top-bar select { background: #1e1e1e; color: #ddd; border: 1px solid #444;
+                      padding: 3px 6px; border-radius: 3px; }
+    .top-bar button { padding: 4px 12px; border: none; border-radius: 3px;
+                      cursor: pointer; color: #fff; }
+    .btn-load { background: #2a5; }
+    .btn-play { background: #47a; min-width: 60px; }
+    .btn-step { background: #555; }
+    .btn-speed { background: #444; font-size: 11px !important; padding: 3px 8px !important; }
+    .btn-speed.active { background: #f80; color: #000; }
+    label { color: #adf; cursor: pointer; user-select: none; }
+    label input { margin-right: 4px; }
+    .info { font-size: 11px; color: #8d8; margin-left: auto; }
+
+    .slider-row { padding: 4px 0 8px 0; }
+    .slider-row input { width: 100%; }
+
+    .viewer { flex: 1; display: flex; gap: 8px; min-height: 0; }
+    .cam-panel { flex: 1; display: flex; flex-direction: column; align-items: center;
+                 min-width: 0; }
+    .cam-label { font-size: 11px; color: #fa0; margin-bottom: 4px; font-weight: bold; }
+    .cam-panel canvas { width: 100%; flex: 1; object-fit: contain;
+                        background: #111; border: 1px solid #333; border-radius: 3px; }
+
+    .status-bar { font-size: 11px; color: #777; padding: 6px 0 0 0;
+                  border-top: 1px solid #222; margin-top: 8px; text-align: center; }
+    .kb { font-size: 10px; color: #555; margin-top: 4px; text-align: center; }
+  </style>
+</head>
+<body>
+  <div class="top-bar">
+    <h2>NETR Player</h2>
+    <select id="rec"><option value="">— select recording —</option></select>
+    <button class="btn-load" onclick="loadRec()">Load</button>
+    <button class="btn-step" onclick="step(-10)">-10</button>
+    <button class="btn-step" onclick="step(-1)">&lt;</button>
+    <button class="btn-play" onclick="togglePlay()" id="btn-play">Play</button>
+    <button class="btn-step" onclick="step(1)">&gt;</button>
+    <button class="btn-step" onclick="step(10)">+10</button>
+    <span style="color:#555">|</span>
+    <button class="btn-speed" data-speed="0.25">0.25x</button>
+    <button class="btn-speed" data-speed="0.5">0.5x</button>
+    <button class="btn-speed active" data-speed="1">1x</button>
+    <button class="btn-speed" data-speed="2">2x</button>
+    <label><input type="checkbox" id="analysis" checked> Analysis</label>
+    <span class="info" id="info">No recording loaded</span>
+  </div>
+
+  <div class="slider-row">
+    <input type="range" min="0" max="0" value="0" id="slider"
+           oninput="seek(+this.value)">
+  </div>
+
+  <div class="viewer">
+    <div class="cam-panel">
+      <div class="cam-label">CAM 1</div>
+      <canvas id="c1"></canvas>
+    </div>
+    <div class="cam-panel">
+      <div class="cam-label">CAM 2</div>
+      <canvas id="c2"></canvas>
+    </div>
+  </div>
+
+  <div class="status-bar" id="status">—</div>
+  <div class="kb">Space: play/pause &nbsp; Left/Right: step &nbsp; Shift+Left/Right: skip 10 &nbsp; A: toggle analysis &nbsp; 1-4: speed</div>
+
+<script>
+const c1 = document.getElementById('c1');
+const c2 = document.getElementById('c2');
+const ctx1 = c1.getContext('2d');
+const ctx2 = c2.getContext('2d');
+
+let rec = null;
+let total = {1: 0, 2: 0};
+let idx = 0;
+let playing = false;
+let speed = 1;
+let rendering = false;
+let rafId = null;
+
+// Refresh recordings list
+fetch('/recordings').then(r => r.json()).then(recs => {
+  const sel = document.getElementById('rec');
+  recs.forEach(r => {
+    const cams = Object.keys(r.cams).map(c => 'cam'+c).join('+');
+    sel.innerHTML += `<option value="${r.name}">${r.name} (${cams})</option>`;
+  });
+}).catch(() => {});
+
+// Speed buttons
+document.querySelectorAll('.btn-speed').forEach(btn => {
+  btn.onclick = () => {
+    document.querySelectorAll('.btn-speed').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    speed = parseFloat(btn.dataset.speed);
+  };
+});
+
+async function loadRec() {
+  const name = document.getElementById('rec').value;
   if (!name) return;
-  pbRec = name;
-  pbIdx = 0;
-  pbPlaying = false;
-  if (pbTimer) { clearInterval(pbTimer); pbTimer = null; }
-  document.getElementById('pb-play').textContent = 'Play';
-
-  // Probe frame 0 of each cam to get total count
+  rec = name;
+  idx = 0;
+  stop();
+  document.getElementById('status').textContent = 'Loading...';
   for (const cid of [1, 2]) {
     try {
-      const r = await fetch(`/playback/${pbRec}/cam${cid}/0`);
-      pbTotal[cid] = parseInt(r.headers.get('X-Total-Frames') || '0');
-    } catch(_) { pbTotal[cid] = 0; }
+      const r = await fetch(`/playback/${rec}/cam${cid}/0`);
+      total[cid] = parseInt(r.headers.get('X-Total-Frames') || '0');
+    } catch(_) { total[cid] = 0; }
   }
-  const maxFrames = Math.max(pbTotal[1], pbTotal[2]);
-  const slider = document.getElementById('pb-slider');
-  slider.max = Math.max(0, maxFrames - 1);
+  const slider = document.getElementById('slider');
+  const maxF = Math.max(total[1], total[2]);
+  slider.max = Math.max(0, maxF - 1);
   slider.value = 0;
-  document.getElementById('pb-status').textContent =
-    `Loaded ${pbRec}: cam1=${pbTotal[1]} cam2=${pbTotal[2]} frames`;
-  pbRender();
+  document.getElementById('status').textContent =
+    `${rec}: cam1=${total[1]} cam2=${total[2]} frames`;
+  render();
 }
 
-async function pbRender() {
-  if (!pbRec) return;
-  const ana = document.getElementById('pb-analysis').checked ? '1' : '0';
-  const info = document.getElementById('pb-frame-info');
-  info.textContent = `Frame ${pbIdx} / ${Math.max(pbTotal[1], pbTotal[2]) - 1}`;
-  document.getElementById('pb-slider').value = pbIdx;
+async function render() {
+  if (!rec || rendering) return;
+  rendering = true;
+  const ana = document.getElementById('analysis').checked ? '1' : '0';
+  const maxF = Math.max(total[1], total[2]);
+  document.getElementById('info').textContent =
+    `Frame ${idx} / ${maxF - 1}`;
+  document.getElementById('slider').value = idx;
 
-  const draws = [];
-  for (const [cid, canvas, ctx] of [[1, pbC1, pbCtx1], [2, pbC2, pbCtx2]]) {
-    if (pbIdx < pbTotal[cid]) {
-      draws.push(
-        fetch(`/playback/${pbRec}/cam${cid}/${pbIdx}?analysis=${ana}`)
-          .then(r => r.blob())
-          .then(b => createImageBitmap(b))
-          .then(bmp => { canvas.width = bmp.width; canvas.height = bmp.height;
-                         ctx.drawImage(bmp, 0, 0); bmp.close(); })
-          .catch(() => {})
-      );
-    }
+  const fetches = [1, 2].filter(cid => idx < total[cid]).map(cid =>
+    fetch(`/playback/${rec}/cam${cid}/${idx}?analysis=${ana}`)
+      .then(r => r.blob())
+      .then(b => createImageBitmap(b))
+      .then(bmp => {
+        const canvas = cid === 1 ? c1 : c2;
+        const ctx = cid === 1 ? ctx1 : ctx2;
+        canvas.width = bmp.width;
+        canvas.height = bmp.height;
+        ctx.drawImage(bmp, 0, 0);
+        bmp.close();
+      })
+      .catch(() => {})
+  );
+  await Promise.all(fetches);
+  rendering = false;
+}
+
+function step(delta) {
+  if (!rec) return;
+  const maxF = Math.max(total[1], total[2]);
+  idx = Math.max(0, Math.min(idx + delta, maxF - 1));
+  render();
+}
+
+function seek(val) {
+  if (!rec) return;
+  idx = val;
+  render();
+}
+
+function stop() {
+  playing = false;
+  if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
+  document.getElementById('btn-play').textContent = 'Play';
+}
+
+function togglePlay() {
+  if (!rec) return;
+  playing = !playing;
+  document.getElementById('btn-play').textContent = playing ? 'Pause' : 'Play';
+  if (playing) playLoop();
+}
+
+let lastFrame = 0;
+async function playLoop() {
+  if (!playing) return;
+  const now = performance.now();
+  const interval = (1000 / 30) / speed;  // base 30fps adjusted by speed
+  if (now - lastFrame >= interval) {
+    const maxF = Math.max(total[1], total[2]);
+    if (idx >= maxF - 1) { stop(); return; }
+    idx++;
+    await render();
+    lastFrame = performance.now();
   }
-  await Promise.all(draws);
+  rafId = requestAnimationFrame(playLoop);
 }
 
-function pbStep(delta) {
-  if (!pbRec) return;
-  const maxF = Math.max(pbTotal[1], pbTotal[2]);
-  pbIdx = Math.max(0, Math.min(pbIdx + delta, maxF - 1));
-  pbRender();
-}
-
-function pbSeek(idx) {
-  if (!pbRec) return;
-  pbIdx = idx;
-  pbRender();
-}
-
-function pbPlayPause() {
-  if (!pbRec) return;
-  pbPlaying = !pbPlaying;
-  document.getElementById('pb-play').textContent = pbPlaying ? 'Pause' : 'Play';
-  if (pbPlaying) {
-    pbTimer = setInterval(() => {
-      const maxF = Math.max(pbTotal[1], pbTotal[2]);
-      if (pbIdx >= maxF - 1) { pbPlayPause(); return; }
-      pbIdx++;
-      pbRender();
-    }, 66);  // ~15fps playback
-  } else {
-    if (pbTimer) { clearInterval(pbTimer); pbTimer = null; }
+// Keyboard shortcuts
+document.addEventListener('keydown', e => {
+  if (e.target.tagName === 'SELECT') return;
+  switch(e.code) {
+    case 'Space':      e.preventDefault(); togglePlay(); break;
+    case 'ArrowLeft':  e.preventDefault(); step(e.shiftKey ? -10 : -1); break;
+    case 'ArrowRight': e.preventDefault(); step(e.shiftKey ? 10 : 1); break;
+    case 'KeyA':       document.getElementById('analysis').click(); break;
+    case 'Digit1':     document.querySelectorAll('.btn-speed')[0].click(); break;
+    case 'Digit2':     document.querySelectorAll('.btn-speed')[1].click(); break;
+    case 'Digit3':     document.querySelectorAll('.btn-speed')[2].click(); break;
+    case 'Digit4':     document.querySelectorAll('.btn-speed')[3].click(); break;
   }
-}
+});
 </script>
 </body>
 </html>"""
