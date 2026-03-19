@@ -172,14 +172,12 @@ Button.usb     { background: $warning-darken-2; }
 }
 
 .log-filters {
-    height: 1;
+    height: 3;
     align: left middle;
 }
 .log-filters Button {
     min-width: 6;
-    height: 1;
     margin: 0;
-    padding: 0 1;
 }
 .log-filters Button.filter-active {
     background: $accent;
