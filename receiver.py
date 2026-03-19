@@ -22,17 +22,19 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 
 # ── Eye analysis (optional — requires cv2/numpy) ─────────────────────────────
-# Uses modular pipeline from /home/maadhav/iot-software/
+# Uses modular pipeline from current directory
 try:
     import cv2
     import numpy as np
     import sys as _sys
-    if "/home/maadhav/iot-software" not in _sys.path:
-        _sys.path.insert(0, "/home/maadhav/iot-software")
+    # Ensure current directory is in path so we use local eye_pipeline.py
+    if "." not in _sys.path:
+        _sys.path.insert(0, ".")
     from eye_pipeline import EyePipeline
     _eye_pipe = EyePipeline()
     _PUPIL_OK = True
-except ImportError:
+except ImportError as e:
+    print(f"Failed to load eye_pipeline: {e}")
     _PUPIL_OK = False
 
 g_analysis_enabled = False   # toggled via /set?analysis=1|0
@@ -580,9 +582,11 @@ class MJPEGHandler(BaseHTTPRequestHandler):
         cmds = []
         if "analysis" in params:
             g_analysis_enabled = params["analysis"] != "0"
+            print(f"Analysis toggled: {g_analysis_enabled}")
         
         if "debug_view" in params:
             g_debug_view = params["debug_view"]
+            print(f"Debug view set to: {g_debug_view}")
 
         # ROI settings (x1,y1,x2,y2 normalized)
         new_roi = None
@@ -1163,7 +1167,7 @@ function eyeSliderVal(key) {
 }
 
 function applyDebugView(val) {
-  fetch('/set?debug_view=' + val).then(r => r.json());
+  fetch('/set?debug_view=' + val + '&analysis=1').then(r => r.json());
 }
 
 function applyEyeSettings() {
