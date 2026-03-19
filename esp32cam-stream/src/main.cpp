@@ -313,10 +313,26 @@ void cmdTask(void *) {
             if      (strncmp(buf, "br:", 3) == 0) { s->set_brightness(s, atoi(buf+3));      udp_log("Brightness → %d", atoi(buf+3)); }
             else if (strncmp(buf, "ct:", 3) == 0) { s->set_contrast(s, atoi(buf+3));        udp_log("Contrast → %d", atoi(buf+3)); }
             else if (strncmp(buf, "sa:", 3) == 0) { s->set_saturation(s, atoi(buf+3));      udp_log("Saturation → %d", atoi(buf+3)); }
-            else if (strncmp(buf, "ae:", 3) == 0) { s->set_exposure_ctrl(s, atoi(buf+3));   udp_log("Auto-exposure → %d", atoi(buf+3)); }
-            else if (strncmp(buf, "ev:", 3) == 0) { s->set_aec_value(s, atoi(buf+3));       udp_log("Exposure → %d", atoi(buf+3)); }
+            else if (strncmp(buf, "ae:", 3) == 0) {
+                int v = atoi(buf+3);
+                s->set_exposure_ctrl(s, v);
+                s->set_aec2(s, v);  // OV2640 has two AEC stages — both must match
+                udp_log("Auto-exposure → %d (aec+aec2)", v);
+            }
+            else if (strncmp(buf, "ev:", 3) == 0) {
+                int v = atoi(buf+3);
+                s->set_exposure_ctrl(s, 0);  // ensure auto off before setting manual
+                s->set_aec2(s, 0);
+                s->set_aec_value(s, v);
+                udp_log("Exposure → %d (auto off)", v);
+            }
             else if (strncmp(buf, "ag:", 3) == 0) { s->set_gain_ctrl(s, atoi(buf+3));       udp_log("Auto-gain → %d", atoi(buf+3)); }
-            else if (strncmp(buf, "gv:", 3) == 0) { s->set_agc_gain(s, atoi(buf+3));        udp_log("Gain → %d", atoi(buf+3)); }
+            else if (strncmp(buf, "gv:", 3) == 0) {
+                int v = atoi(buf+3);
+                s->set_gain_ctrl(s, 0);  // ensure auto off before setting manual
+                s->set_agc_gain(s, v);
+                udp_log("Gain → %d (auto off)", v);
+            }
             else if (strncmp(buf, "al:", 3) == 0) { s->set_ae_level(s, atoi(buf+3));        udp_log("AE level → %d", atoi(buf+3)); }
             else if (strncmp(buf, "hm:", 3) == 0) { s->set_hmirror(s, atoi(buf+3));         udp_log("H-mirror → %d", atoi(buf+3)); }
             else if (strncmp(buf, "vf:", 3) == 0) { s->set_vflip(s, atoi(buf+3));           udp_log("V-flip → %d", atoi(buf+3)); }
