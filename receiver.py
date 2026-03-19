@@ -37,6 +37,27 @@ except ImportError:
 
 g_analysis_enabled = False   # toggled via /set?analysis=1|0
 
+# ── Eye pipeline settings (persistent) ────────────────────────────────────────
+import pathlib as _pathlib_eye
+_EYE_SETTINGS_FILE = _pathlib_eye.Path(__file__).parent / "eye_settings.json"
+
+def _load_eye_settings():
+    try:
+        with open(_EYE_SETTINGS_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+def _save_eye_settings(s):
+    with open(_EYE_SETTINGS_FILE, "w") as f:
+        json.dump(s, f, indent=2)
+
+# Apply saved eye settings on startup
+if _PUPIL_OK:
+    _saved_eye = _load_eye_settings()
+    if _saved_eye:
+        _eye_pipe.update_params(_saved_eye)
+
 # ── Persistent settings ───────────────────────────────────────────────────────
 import pathlib as _pathlib
 _SETTINGS_FILE = _pathlib.Path(__file__).parent / "cam_settings.json"
@@ -246,6 +267,7 @@ class MJPEGHandler(BaseHTTPRequestHandler):
         elif path == "/jpeg/2":    self._jpeg(CAMS[2])
         elif path == "/stats":     self._stats()
         elif path == "/settings":  self._get_settings()
+        elif path == "/eye_settings": self._get_eye_settings()
         elif path == "/record/save": self._record_save()
         elif path == "/player":      self._player()
         elif path == "/recordings":  self._list_recordings()
@@ -276,6 +298,19 @@ class MJPEGHandler(BaseHTTPRequestHandler):
     def _get_settings(self):
         try:
             body = json.dumps(g_settings).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except BrokenPipeError:
+            pass
+
+    # ── /eye_settings ────────────────────────────────────────────────────────
+    def _get_eye_settings(self):
+        try:
+            d = _eye_pipe.get_params() if _PUPIL_OK else {}
+            body = json.dumps(d).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -483,6 +518,22 @@ class MJPEGHandler(BaseHTTPRequestHandler):
         "wb_mode":       ("wm:",  0,  4),
     }
 
+    # Eye pipeline parameter ranges for validation
+    _EYE_PARAM_MAP = {
+        "p_glint_thresh":    (10, 255),
+        "p_blur_ksize":      (3, 21),
+        "p_thresh_offset":   (5, 100),
+        "p_morph_ksize":     (3, 15),
+        "p_min_radius":      (5, 200),
+        "p_max_radius":      (20, 400),
+        "p_circularity_min": (0.1, 1.0),
+        "g_brightness_thresh": (150, 255),
+        "g_min_area":        (1, 500),
+        "g_max_area":        (50, 5000),
+        "g_search_radius_factor": (1.0, 5.0),
+        "g_circularity_min": (0.1, 1.0),
+    }
+
     def _set_cmd(self, query: str):
         global g_analysis_enabled, g_settings
         import urllib.parse
@@ -490,6 +541,24 @@ class MJPEGHandler(BaseHTTPRequestHandler):
         cmds = []
         if "analysis" in params:
             g_analysis_enabled = params["analysis"] != "0"
+
+        # Eye pipeline parameters
+        eye_updates = {}
+        for key, (lo, hi) in self._EYE_PARAM_MAP.items():
+            if key in params:
+                val = max(lo, min(hi, float(params[key])))
+                if isinstance(lo, int) and isinstance(hi, int):
+                    val = int(val)
+                    # blur_ksize and morph_ksize must be odd
+                    if key in ("p_blur_ksize", "p_morph_ksize") and val % 2 == 0:
+                        val += 1
+                eye_updates[key] = val
+        if eye_updates and _PUPIL_OK:
+            _eye_pipe.update_params(eye_updates)
+
+        if "save_eye" in params and _PUPIL_OK:
+            _save_eye_settings(_eye_pipe.get_params())
+
         for key, (prefix, lo, hi) in self._PARAM_MAP.items():
             if key in params:
                 val = max(lo, min(hi, int(params[key])))
@@ -520,7 +589,7 @@ class MJPEGHandler(BaseHTTPRequestHandler):
                 msg = "cam" + "+cam".join(str(c) for c in sent_to)
             elif cmds:
                 msg = "no cams online"
-            body = json.dumps({"ok": bool(sent_to or "analysis" in params), "to": msg}).encode()
+            body = json.dumps({"ok": bool(sent_to or "analysis" in params or eye_updates or "save_eye" in params), "to": msg}).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -629,8 +698,8 @@ class MJPEGHandler(BaseHTTPRequestHandler):
 
   <div class="sync-bar" id="sync-info">sync: —</div>
 
-  <div class="ctrl">
-    <div class="ctrl-group">
+  <div style="display:flex; gap:8px; margin:4px 0; flex-wrap:wrap; align-items:center">
+    <div class="ctrl-group" style="margin:0">
       <span>Target</span>
       <select id="target">
         <option value="">Both</option>
@@ -638,108 +707,189 @@ class MJPEGHandler(BaseHTTPRequestHandler):
         <option value="2">Cam 2</option>
       </select>
     </div>
-    <div class="ctrl-group">
-      <span>Quality (lower=better): <b id="qval">12</b></span>
-      <input type="range" min="4" max="63" value="12" id="quality"
-             oninput="document.getElementById('qval').textContent=this.value">
-    </div>
-    <div class="ctrl-group">
-      <span>FPS: <b id="fval">30</b></span>
-      <input type="range" min="1" max="30" value="30" id="fps"
-             oninput="document.getElementById('fval').textContent=this.value">
-    </div>
-    <div class="ctrl-group">
-      <span>Resolution</span>
-      <select id="res">
-        <option value="0">96x96</option>
-        <option value="1">QQVGA 160x120</option>
-        <option value="2">QCIF 176x144</option>
-        <option value="3">HQVGA 240x176</option>
-        <option value="4">240x240</option>
-        <option value="5" selected>QVGA 320x240</option>
-        <option value="6">CIF 400x296</option>
-        <option value="7">HVGA 480x320</option>
-        <option value="8">VGA 640x480</option>
-        <option value="9">SVGA 800x600</option>
-        <option value="10">XGA 1024x768</option>
-        <option value="11">HD 1280x720</option>
-        <option value="12">SXGA 1280x1024</option>
-        <option value="13">UXGA 1600x1200</option>
-      </select>
-    </div>
-    <div class="ctrl-group">
-      <span>Brightness: <b id="brval">0</b></span>
-      <input type="range" min="-2" max="2" value="0" id="brightness"
-             oninput="document.getElementById('brval').textContent=this.value">
-    </div>
-    <div class="ctrl-group">
-      <span>Contrast: <b id="ctval">0</b></span>
-      <input type="range" min="-2" max="2" value="0" id="contrast"
-             oninput="document.getElementById('ctval').textContent=this.value">
-    </div>
-    <div class="ctrl-group">
-      <span>Saturation: <b id="saval">0</b></span>
-      <input type="range" min="-2" max="2" value="0" id="saturation"
-             oninput="document.getElementById('saval').textContent=this.value">
-    </div>
-    <div class="ctrl-group">
-      <span>AE Level: <b id="alval">0</b></span>
-      <input type="range" min="-2" max="2" value="0" id="ae_level"
-             oninput="document.getElementById('alval').textContent=this.value">
-    </div>
-    <div class="ctrl-group">
-      <span>Auto Exposure</span>
-      <select id="auto_exposure">
-        <option value="1" selected>On</option>
-        <option value="0">Off</option>
-      </select>
-    </div>
-    <div class="ctrl-group">
-      <span>Exposure: <b id="evval">300</b></span>
-      <input type="range" min="0" max="1200" value="300" id="exposure"
-             oninput="document.getElementById('evval').textContent=this.value">
-    </div>
-    <div class="ctrl-group">
-      <span>Auto Gain</span>
-      <select id="auto_gain">
-        <option value="1" selected>On</option>
-        <option value="0">Off</option>
-      </select>
-    </div>
-    <div class="ctrl-group">
-      <span>Gain: <b id="gvval">0</b></span>
-      <input type="range" min="0" max="30" value="0" id="gain"
-             oninput="document.getElementById('gvval').textContent=this.value">
-    </div>
-    <div class="ctrl-group">
-      <span>WB Mode</span>
-      <select id="wb_mode">
-        <option value="0" selected>Auto</option>
-        <option value="1">Sunny</option>
-        <option value="2">Cloudy</option>
-        <option value="3">Office</option>
-        <option value="4">Home</option>
-      </select>
-    </div>
-    <div class="ctrl-group">
-      <span>H-Mirror</span>
-      <select id="hmirror">
-        <option value="0" selected>Off</option>
-        <option value="1">On</option>
-      </select>
-    </div>
-    <div class="ctrl-group">
-      <span>V-Flip</span>
-      <select id="vflip">
-        <option value="0" selected>Off</option>
-        <option value="1">On</option>
-      </select>
-    </div>
-    <button onclick="applySettings()">Apply</button>
     <button onclick="saveRecording()" style="background:#c33">Save 2min Buffer</button>
     <button onclick="window.open('/player','_blank')" style="background:#669">Player</button>
   </div>
   <div id="feedback"></div>
+
+  <details style="margin:8px 0; border:1px solid #444; border-radius:4px; padding:4px 8px; background:#1a2a1a">
+    <summary style="cursor:pointer; color:#8f8; font-weight:bold; padding:4px 0">
+      Camera Hardware Settings
+    </summary>
+    <div style="display:grid; grid-template-columns:1fr 1fr; gap:4px 16px; padding:8px 0; font-size:12px">
+      <div class="ctrl-group">
+        <span>Quality (lower=better): <b id="qval">12</b></span>
+        <input type="range" min="4" max="63" value="12" id="quality"
+               oninput="document.getElementById('qval').textContent=this.value">
+      </div>
+      <div class="ctrl-group">
+        <span>FPS: <b id="fval">30</b></span>
+        <input type="range" min="1" max="30" value="30" id="fps"
+               oninput="document.getElementById('fval').textContent=this.value">
+      </div>
+      <div class="ctrl-group">
+        <span>Resolution</span>
+        <select id="res">
+          <option value="0">96x96</option>
+          <option value="1">QQVGA 160x120</option>
+          <option value="2">QCIF 176x144</option>
+          <option value="3">HQVGA 240x176</option>
+          <option value="4">240x240</option>
+          <option value="5" selected>QVGA 320x240</option>
+          <option value="6">CIF 400x296</option>
+          <option value="7">HVGA 480x320</option>
+          <option value="8">VGA 640x480</option>
+          <option value="9">SVGA 800x600</option>
+          <option value="10">XGA 1024x768</option>
+          <option value="11">HD 1280x720</option>
+          <option value="12">SXGA 1280x1024</option>
+          <option value="13">UXGA 1600x1200</option>
+        </select>
+      </div>
+      <div class="ctrl-group">
+        <span>Brightness: <b id="brval">0</b></span>
+        <input type="range" min="-2" max="2" value="0" id="brightness"
+               oninput="document.getElementById('brval').textContent=this.value">
+      </div>
+      <div class="ctrl-group">
+        <span>Contrast: <b id="ctval">0</b></span>
+        <input type="range" min="-2" max="2" value="0" id="contrast"
+               oninput="document.getElementById('ctval').textContent=this.value">
+      </div>
+      <div class="ctrl-group">
+        <span>Saturation: <b id="saval">0</b></span>
+        <input type="range" min="-2" max="2" value="0" id="saturation"
+               oninput="document.getElementById('saval').textContent=this.value">
+      </div>
+      <div class="ctrl-group">
+        <span>AE Level: <b id="alval">0</b></span>
+        <input type="range" min="-2" max="2" value="0" id="ae_level"
+               oninput="document.getElementById('alval').textContent=this.value">
+      </div>
+      <div class="ctrl-group">
+        <span>Auto Exposure</span>
+        <select id="auto_exposure">
+          <option value="1" selected>On</option>
+          <option value="0">Off</option>
+        </select>
+      </div>
+      <div class="ctrl-group">
+        <span>Exposure: <b id="evval">300</b></span>
+        <input type="range" min="0" max="1200" value="300" id="exposure"
+               oninput="document.getElementById('evval').textContent=this.value">
+      </div>
+      <div class="ctrl-group">
+        <span>Auto Gain</span>
+        <select id="auto_gain">
+          <option value="1" selected>On</option>
+          <option value="0">Off</option>
+        </select>
+      </div>
+      <div class="ctrl-group">
+        <span>Gain: <b id="gvval">0</b></span>
+        <input type="range" min="0" max="30" value="0" id="gain"
+               oninput="document.getElementById('gvval').textContent=this.value">
+      </div>
+      <div class="ctrl-group">
+        <span>WB Mode</span>
+        <select id="wb_mode">
+          <option value="0" selected>Auto</option>
+          <option value="1">Sunny</option>
+          <option value="2">Cloudy</option>
+          <option value="3">Office</option>
+          <option value="4">Home</option>
+        </select>
+      </div>
+      <div class="ctrl-group">
+        <span>H-Mirror</span>
+        <select id="hmirror">
+          <option value="0" selected>Off</option>
+          <option value="1">On</option>
+        </select>
+      </div>
+      <div class="ctrl-group">
+        <span>V-Flip</span>
+        <select id="vflip">
+          <option value="0" selected>Off</option>
+          <option value="1">On</option>
+        </select>
+      </div>
+    </div>
+    <button onclick="applySettings()">Apply</button>
+  </details>
+
+  <details style="margin:8px 0; border:1px solid #444; border-radius:4px; padding:4px 8px; background:#1a1a2e">
+    <summary style="cursor:pointer; color:#8df; font-weight:bold; padding:4px 0">
+      Eye Pipeline Settings
+    </summary>
+    <div style="display:grid; grid-template-columns:1fr 1fr; gap:4px 16px; padding:8px 0; font-size:12px">
+      <div class="ctrl-group">
+        <span style="color:#8f8">Pupil -Glint suppress thresh: <b id="p_glint_thresh_val">200</b></span>
+        <input type="range" min="10" max="255" value="200" id="p_glint_thresh"
+               oninput="document.getElementById('p_glint_thresh_val').textContent=this.value">
+      </div>
+      <div class="ctrl-group">
+        <span style="color:#8f8">Pupil -Blur ksize: <b id="p_blur_ksize_val">7</b></span>
+        <input type="range" min="3" max="21" step="2" value="7" id="p_blur_ksize"
+               oninput="document.getElementById('p_blur_ksize_val').textContent=this.value">
+      </div>
+      <div class="ctrl-group">
+        <span style="color:#8f8">Pupil -Threshold offset: <b id="p_thresh_offset_val">30</b></span>
+        <input type="range" min="5" max="100" value="30" id="p_thresh_offset"
+               oninput="document.getElementById('p_thresh_offset_val').textContent=this.value">
+      </div>
+      <div class="ctrl-group">
+        <span style="color:#8f8">Pupil -Morph ksize: <b id="p_morph_ksize_val">5</b></span>
+        <input type="range" min="3" max="15" step="2" value="5" id="p_morph_ksize"
+               oninput="document.getElementById('p_morph_ksize_val').textContent=this.value">
+      </div>
+      <div class="ctrl-group">
+        <span style="color:#8f8">Pupil -Min radius: <b id="p_min_radius_val">15</b></span>
+        <input type="range" min="5" max="200" value="15" id="p_min_radius"
+               oninput="document.getElementById('p_min_radius_val').textContent=this.value">
+      </div>
+      <div class="ctrl-group">
+        <span style="color:#8f8">Pupil -Max radius: <b id="p_max_radius_val">150</b></span>
+        <input type="range" min="20" max="400" value="150" id="p_max_radius"
+               oninput="document.getElementById('p_max_radius_val').textContent=this.value">
+      </div>
+      <div class="ctrl-group">
+        <span style="color:#8f8">Pupil -Circularity min: <b id="p_circularity_min_val">0.4</b></span>
+        <input type="range" min="10" max="100" value="40" id="p_circularity_min"
+               oninput="document.getElementById('p_circularity_min_val').textContent=(this.value/100).toFixed(2)">
+      </div>
+      <div class="ctrl-group">
+        <span style="color:#ff8">Glint -Brightness thresh: <b id="g_brightness_thresh_val">230</b></span>
+        <input type="range" min="150" max="255" value="230" id="g_brightness_thresh"
+               oninput="document.getElementById('g_brightness_thresh_val').textContent=this.value">
+      </div>
+      <div class="ctrl-group">
+        <span style="color:#ff8">Glint -Min area: <b id="g_min_area_val">5</b></span>
+        <input type="range" min="1" max="500" value="5" id="g_min_area"
+               oninput="document.getElementById('g_min_area_val').textContent=this.value">
+      </div>
+      <div class="ctrl-group">
+        <span style="color:#ff8">Glint -Max area: <b id="g_max_area_val">800</b></span>
+        <input type="range" min="50" max="5000" value="800" id="g_max_area"
+               oninput="document.getElementById('g_max_area_val').textContent=this.value">
+      </div>
+      <div class="ctrl-group">
+        <span style="color:#ff8">Glint -Search radius x: <b id="g_search_radius_factor_val">2.5</b></span>
+        <input type="range" min="10" max="50" value="25" id="g_search_radius_factor"
+               oninput="document.getElementById('g_search_radius_factor_val').textContent=(this.value/10).toFixed(1)">
+      </div>
+      <div class="ctrl-group">
+        <span style="color:#ff8">Glint -Circularity min: <b id="g_circularity_min_val">0.3</b></span>
+        <input type="range" min="10" max="100" value="30" id="g_circularity_min"
+               oninput="document.getElementById('g_circularity_min_val').textContent=(this.value/100).toFixed(2)">
+      </div>
+    </div>
+    <div style="display:flex; gap:8px; padding:4px 0">
+      <button onclick="applyEyeSettings()" style="background:#286">Apply Eye</button>
+      <button onclick="saveEyeSettings()" style="background:#862">Save Eye</button>
+    </div>
+    <div id="eye-feedback" style="font-size:11px; color:#8df; min-height:14px"></div>
+  </details>
 
 <script>
 // ── Synchronized canvas display ───────────────────────────────────────────────
@@ -753,6 +903,7 @@ const ctx2 = c2.getContext('2d');
 
 let displayFps = 20;   // how often we poll for new frames (Hz)
 let running    = true;
+let camOnline  = {1: false, 2: false};
 
 async function fetchBitmap(url) {
   const r = await fetch(url + '?t=' + Date.now());
@@ -774,13 +925,11 @@ async function loop() {
   const start = performance.now();
 
   try {
-    // Fetch both frames at the exact same time
-    const [bmp1, bmp2] = await Promise.all([
-      fetchBitmap('/jpeg/1'),
-      fetchBitmap('/jpeg/2'),
-    ]);
+    const fetches = [];
+    if (camOnline[1]) fetches.push(fetchBitmap('/jpeg/1')); else fetches.push(Promise.resolve(null));
+    if (camOnline[2]) fetches.push(fetchBitmap('/jpeg/2')); else fetches.push(Promise.resolve(null));
+    const [bmp1, bmp2] = await Promise.all(fetches);
 
-    // Draw both in one RAF — guaranteed same browser frame (vsync)
     requestAnimationFrame(() => {
       drawBitmap(c1, ctx1, bmp1);
       drawBitmap(c2, ctx2, bmp2);
@@ -806,6 +955,8 @@ setInterval(() => {
     document.getElementById('s2').textContent = fmtCam(d.cam2);
     c1.className = d.cam1.online ? 'online' : 'offline';
     c2.className = d.cam2.online ? 'online' : 'offline';
+    camOnline[1] = d.cam1.online;
+    camOnline[2] = d.cam2.online;
 
     const off = d.sync_offset_ms;
     const color = off < 20 ? '#5f5' : off < 50 ? '#fa0' : '#f55';
@@ -851,6 +1002,52 @@ function saveRecording() {
     fb.textContent = d.ok ? 'Saved to recordings/' : 'Save failed';
   }).catch(e => { fb.textContent = 'Error: ' + e; });
 }
+
+// ── Eye pipeline controls ─────────────────────────────────────────────────────
+const EYE_KEYS = ['p_glint_thresh','p_blur_ksize','p_thresh_offset','p_morph_ksize',
+  'p_min_radius','p_max_radius','p_circularity_min',
+  'g_brightness_thresh','g_min_area','g_max_area','g_search_radius_factor','g_circularity_min'];
+
+// Float params use scaled integer sliders
+const EYE_FLOAT_SCALE = {
+  'p_circularity_min': 100, 'g_circularity_min': 100, 'g_search_radius_factor': 10
+};
+
+function eyeSliderVal(key) {
+  const raw = +document.getElementById(key).value;
+  return (key in EYE_FLOAT_SCALE) ? raw / EYE_FLOAT_SCALE[key] : raw;
+}
+
+function applyEyeSettings() {
+  const fb = document.getElementById('eye-feedback');
+  fb.textContent = 'Applying...';
+  let qs = EYE_KEYS.map(k => k + '=' + eyeSliderVal(k)).join('&');
+  fetch('/set?' + qs).then(r => r.json()).then(d => {
+    fb.textContent = d.ok ? 'Applied' : 'Failed';
+  }).catch(e => { fb.textContent = 'Error: ' + e; });
+}
+
+function saveEyeSettings() {
+  const fb = document.getElementById('eye-feedback');
+  fb.textContent = 'Saving...';
+  let qs = EYE_KEYS.map(k => k + '=' + eyeSliderVal(k)).join('&') + '&save_eye=1';
+  fetch('/set?' + qs).then(r => r.json()).then(d => {
+    fb.textContent = d.ok ? 'Saved to eye_settings.json' : 'Failed';
+  }).catch(e => { fb.textContent = 'Error: ' + e; });
+}
+
+// Load saved eye settings on page load
+fetch('/eye_settings').then(r => r.json()).then(s => {
+  for (const k of EYE_KEYS) {
+    if (s[k] === undefined) continue;
+    const el = document.getElementById(k);
+    if (!el) continue;
+    const scale = EYE_FLOAT_SCALE[k] || 1;
+    el.value = Math.round(s[k] * scale);
+    const lbl = document.getElementById(k + '_val');
+    if (lbl) lbl.textContent = (scale > 1) ? (s[k]).toFixed(scale > 10 ? 1 : 2) : s[k];
+  }
+}).catch(() => {});
 
 
 </script>
