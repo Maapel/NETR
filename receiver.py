@@ -21,57 +21,16 @@ import json
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 
-# ── Pupil detection (optional — requires cv2/numpy) ───────────────────────────
-# Inlined from /home/maadhav/iot-software/pupil_detection.py — cv2/numpy only,
-# no pygame dependency.
+# ── Eye analysis (optional — requires cv2/numpy) ─────────────────────────────
+# Uses modular pipeline from /home/maadhav/iot-software/
 try:
     import cv2
     import numpy as np
-
-    _clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-    _GLINT_THRESH = 190
-    _HOUGH_P1, _HOUGH_P2 = 50, 20
-    _R_MIN, _R_MAX = 30, 160
-    _SX, _SY = (0.25, 0.75), (0.10, 0.75)
-
-    def _detect_pupil(gray, _unused):
-        h, w = gray.shape
-        _, glint = cv2.threshold(gray, _GLINT_THRESH, 255, cv2.THRESH_BINARY)
-        glint = cv2.dilate(glint,
-                           cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)),
-                           iterations=2)
-        clean    = cv2.inpaint(gray, glint, inpaintRadius=9, flags=cv2.INPAINT_TELEA)
-        enhanced = _clahe.apply(clean)
-        blurred  = cv2.GaussianBlur(enhanced, (5, 5), 0)
-        x0, x1 = int(w * _SX[0]), int(w * _SX[1])
-        y0, y1 = int(h * _SY[0]), int(h * _SY[1])
-        crop = blurred[y0:y1, x0:x1]
-        circles = cv2.HoughCircles(crop, cv2.HOUGH_GRADIENT,
-                                   dp=1.2, minDist=50,
-                                   param1=_HOUGH_P1, param2=_HOUGH_P2,
-                                   minRadius=_R_MIN, maxRadius=_R_MAX)
-        debug = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
-        if circles is None:
-            return None, None, debug
-        circles = np.round(circles[0]).astype(int)
-        circles[:, 0] += x0
-        circles[:, 1] += y0
-        cx, cy, r = circles[0]
-        return (int(cx), int(cy)), int(r), debug
-
-    def _draw_overlay(frame, center, radius):
-        if center is None:
-            return frame
-        cx, cy = center
-        r = radius if radius else 20
-        cv2.circle(frame, (cx, cy), r, (0, 200, 255), 2)
-        cv2.circle(frame, (cx, cy), 4, (0, 255,   0), -1)
-        cv2.line(frame, (cx - r, cy), (cx + r, cy), (0, 255, 0), 1)
-        cv2.line(frame, (cx, cy - r), (cx, cy + r), (0, 255, 0), 1)
-        cv2.putText(frame, f"({cx},{cy})", (cx + r + 4, cy - 4),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
-        return frame
-
+    import sys as _sys
+    if "/home/maadhav/iot-software" not in _sys.path:
+        _sys.path.insert(0, "/home/maadhav/iot-software")
+    from eye_pipeline import EyePipeline
+    _eye_pipe = EyePipeline()
     _PUPIL_OK = True
 except ImportError:
     _PUPIL_OK = False
@@ -100,7 +59,7 @@ def _save_settings(s):
 g_settings = _load_settings()
 
 def _apply_pupil_overlay(data: bytes) -> bytes:
-    """Decode JPEG, run pupil detection, draw overlay, re-encode. Returns JPEG bytes."""
+    """Decode JPEG, run eye pipeline (pupil + glint + PCCR), draw overlay, re-encode."""
     if not _PUPIL_OK or not data:
         return data
     arr = np.frombuffer(data, np.uint8)
@@ -108,9 +67,8 @@ def _apply_pupil_overlay(data: bytes) -> bytes:
     if bgr is None:
         return data
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    gray = cv2.equalizeHist(gray)
-    center, radius, _ = _detect_pupil(gray, 0)
-    _draw_overlay(bgr, center, radius)
+    result = _eye_pipe.process(gray)
+    bgr = EyePipeline.draw(bgr, result)
     _, enc = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
     return enc.tobytes()
 
@@ -547,15 +505,24 @@ class MJPEGHandler(BaseHTTPRequestHandler):
         if not target_ids:
             target_ids = [1, 2]
 
+        sent_to = []
         if cmds:
             for cid in target_ids:
+                if not CAMS[cid].ip:
+                    continue
                 for cmd in cmds:
                     CAMS[cid].send_cmd(cmd)
                     time.sleep(0.06)  # ESP32 cmdTask polls every 50ms
+                sent_to.append(cid)
             _save_settings(g_settings)
 
         try:
-            body = json.dumps({"ok": bool(cmds or "analysis" in params)}).encode()
+            msg = ""
+            if sent_to:
+                msg = "cam" + "+cam".join(str(c) for c in sent_to)
+            elif cmds:
+                msg = "no cams online"
+            body = json.dumps({"ok": bool(sent_to or "analysis" in params), "to": msg}).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -863,7 +830,7 @@ function applySettings() {
   let qs = ALL_KEYS.map(k => k + '=' + document.getElementById(k).value).join('&');
   if (cam) qs += '&cam=' + cam;
   fetch('/set?' + qs).then(r => r.json()).then(d => {
-    fb.textContent = d.ok ? 'Applied to ' + (cam ? 'cam'+cam : 'both') : 'Send failed';
+    fb.textContent = d.ok ? 'Applied to ' + (d.to || 'both') : (d.to || 'Send failed');
   }).catch(e => { fb.textContent = 'Error: ' + e; });
 }
 
