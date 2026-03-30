@@ -315,6 +315,7 @@ class MJPEGHandler(BaseHTTPRequestHandler):
         elif path.startswith("/recordings/info/"): self._recording_info(path)
         elif path.startswith("/playback/"): self._playback_frame(path)
         elif self.path.startswith("/set?"): self._set_cmd(self.path[5:])
+        elif self.path.startswith("/reset_cam?"): self._reset_cam(self.path)
         else:
             try: self.send_error(404)
             except BrokenPipeError: pass
@@ -355,6 +356,31 @@ class MJPEGHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except BrokenPipeError:
+            pass
+
+    # ── /reset_cam — software reset an ESP32-CAM ───────────────────────────
+    def _reset_cam(self, full_path):
+        import urllib.parse
+        qs = urllib.parse.urlparse(full_path).query
+        params = dict(urllib.parse.parse_qsl(qs))
+        cid = int(params.get("cam", 0))
+        cam = CAMS.get(cid)
+        msg = "no cam"
+        if cam and cam.ip:
+            import socket
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.sendto(b"rst", (cam.ip, cam.cmd_port))
+            sock.close()
+            cam.stats["online"] = False
+            msg = f"Reset sent to cam{cid} ({cam.ip})"
+            print(msg)
+        body = json.dumps({"ok": bool(cam and cam.ip), "msg": msg}).encode()
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(body)
         except BrokenPipeError:
@@ -565,6 +591,16 @@ class MJPEGHandler(BaseHTTPRequestHandler):
         "p_min_radius":      (5, 200),
         "p_max_radius":      (20, 400),
         "p_circularity_min": (0.1, 1.0),
+        # Edge algorithm params
+        "p_canny_low":       (5, 200),
+        "p_canny_high":      (20, 300),
+        "p_hough_param1":    (10, 300),
+        "p_hough_param2":    (5, 100),
+        # Gradient algorithm params
+        "p_gradient_downscale": (1, 4),
+        # Seed algorithm params
+        "p_seed_flood_tolerance": (5, 100),
+
         "g_brightness_thresh": (150, 255),
         "g_min_area":        (1, 500),
         "g_max_area":        (50, 5000),
@@ -597,6 +633,9 @@ class MJPEGHandler(BaseHTTPRequestHandler):
 
         # Eye pipeline parameters
         eye_updates = {}
+        # Algorithm is a string param, not numeric
+        if "p_algorithm" in params and params["p_algorithm"] in ("threshold", "edge", "gradient", "seed"):
+            eye_updates["p_algorithm"] = params["p_algorithm"]
         for key, (lo, hi) in self._EYE_PARAM_MAP.items():
             if key in params:
                 val = max(lo, min(hi, float(params[key])))
@@ -889,10 +928,19 @@ class MJPEGHandler(BaseHTTPRequestHandler):
           <option value="original">Final Result (Overlay)</option>
           <option value="p_suppressed">Pupil: Glint Suppressed</option>
           <option value="p_blurred">Pupil: Blurred</option>
-          <option value="p_thresh">Pupil: Threshold</option>
-          <option value="p_morph">Pupil: Morphological</option>
+          <option value="p_thresh">Pupil: Threshold / Edges / Gradients</option>
+          <option value="p_morph">Pupil: Morphological / Circles / Vote Map</option>
           <option value="g_thresh">Glint: Threshold</option>
           <option value="g_morph">Glint: Morphological</option>
+        </select>
+      </div>
+      <div class="ctrl-group">
+        <span style="color:#adf">Algorithm</span>
+        <select id="p_algorithm" onchange="applyEyeSettings()">
+          <option value="threshold">1: Threshold (dark blob)</option>
+          <option value="edge">2: Edge (Canny + Hough)</option>
+          <option value="gradient">3: Gradient (Timm &amp; Barth)</option>
+          <option value="seed">4: Seed (flood-fill + ellipse)</option>
         </select>
       </div>
       <div class="ctrl-group">
@@ -934,6 +982,36 @@ class MJPEGHandler(BaseHTTPRequestHandler):
         <span style="color:#8f8">Pupil -Circularity min: <b id="p_circularity_min_val">0.4</b></span>
         <input type="range" min="10" max="100" value="40" id="p_circularity_min"
                oninput="document.getElementById('p_circularity_min_val').textContent=(this.value/100).toFixed(2)">
+      </div>
+      <div class="ctrl-group algo-edge">
+        <span style="color:#9df">Edge -Canny low: <b id="p_canny_low_val">30</b></span>
+        <input type="range" min="5" max="200" value="30" id="p_canny_low"
+               oninput="document.getElementById('p_canny_low_val').textContent=this.value">
+      </div>
+      <div class="ctrl-group algo-edge">
+        <span style="color:#9df">Edge -Canny high: <b id="p_canny_high_val">100</b></span>
+        <input type="range" min="20" max="300" value="100" id="p_canny_high"
+               oninput="document.getElementById('p_canny_high_val').textContent=this.value">
+      </div>
+      <div class="ctrl-group algo-edge">
+        <span style="color:#9df">Edge -Hough sensitivity: <b id="p_hough_param1_val">100</b></span>
+        <input type="range" min="10" max="300" value="100" id="p_hough_param1"
+               oninput="document.getElementById('p_hough_param1_val').textContent=this.value">
+      </div>
+      <div class="ctrl-group algo-edge">
+        <span style="color:#9df">Edge -Hough accumulator: <b id="p_hough_param2_val">30</b></span>
+        <input type="range" min="5" max="100" value="30" id="p_hough_param2"
+               oninput="document.getElementById('p_hough_param2_val').textContent=this.value">
+      </div>
+      <div class="ctrl-group algo-gradient">
+        <span style="color:#d9f">Gradient -Downscale: <b id="p_gradient_downscale_val">2</b></span>
+        <input type="range" min="1" max="4" value="2" id="p_gradient_downscale"
+               oninput="document.getElementById('p_gradient_downscale_val').textContent=this.value">
+      </div>
+      <div class="ctrl-group algo-seed">
+        <span style="color:#fc8">Seed -Flood tolerance: <b id="p_seed_flood_tolerance_val">40</b></span>
+        <input type="range" min="5" max="100" value="40" id="p_seed_flood_tolerance"
+               oninput="document.getElementById('p_seed_flood_tolerance_val').textContent=this.value">
       </div>
       <div class="ctrl-group">
         <span style="color:#ff8">Glint -Brightness thresh: <b id="g_brightness_thresh_val">230</b></span>
@@ -1156,6 +1234,7 @@ function saveRecording() {
 // ── Eye pipeline controls ─────────────────────────────────────────────────────
 const EYE_KEYS = ['p_glint_thresh','p_blur_ksize','p_dark_percentile','p_thresh_offset','p_morph_ksize',
   'p_min_radius','p_max_radius','p_circularity_min',
+  'p_canny_low','p_canny_high','p_hough_param1','p_hough_param2','p_gradient_downscale','p_seed_flood_tolerance',
   'g_brightness_thresh','g_min_area','g_max_area','g_search_radius_factor','g_circularity_min'];
 
 // Float params use scaled integer sliders
@@ -1168,6 +1247,16 @@ function eyeSliderVal(key) {
   return (key in EYE_FLOAT_SCALE) ? raw / EYE_FLOAT_SCALE[key] : raw;
 }
 
+function updateAlgoVisibility() {
+  const algo = document.getElementById('p_algorithm').value;
+  document.querySelectorAll('.algo-edge').forEach(el => el.style.display = algo === 'edge' ? '' : 'none');
+  document.querySelectorAll('.algo-gradient').forEach(el => el.style.display = algo === 'gradient' ? '' : 'none');
+  document.querySelectorAll('.algo-seed').forEach(el => el.style.display = algo === 'seed' ? '' : 'none');
+}
+// Run on load and when algorithm changes
+document.getElementById('p_algorithm').addEventListener('change', updateAlgoVisibility);
+updateAlgoVisibility();
+
 function applyDebugView(val) {
   fetch('/set?debug_view=' + val + '&analysis=1').then(r => r.json());
 }
@@ -1175,16 +1264,19 @@ function applyDebugView(val) {
 function applyEyeSettings() {
   const fb = document.getElementById('eye-feedback');
   fb.textContent = 'Applying...';
-  let qs = EYE_KEYS.map(k => k + '=' + eyeSliderVal(k)).join('&');
+  const algo = document.getElementById('p_algorithm').value;
+  let qs = 'p_algorithm=' + algo + '&' + EYE_KEYS.map(k => k + '=' + eyeSliderVal(k)).join('&');
   fetch('/set?' + qs).then(r => r.json()).then(d => {
     fb.textContent = d.ok ? 'Applied' : 'Failed';
   }).catch(e => { fb.textContent = 'Error: ' + e; });
+  updateAlgoVisibility();
 }
 
 function saveEyeSettings() {
   const fb = document.getElementById('eye-feedback');
   fb.textContent = 'Saving...';
-  let qs = EYE_KEYS.map(k => k + '=' + eyeSliderVal(k)).join('&') + '&save_eye=1';
+  const algo = document.getElementById('p_algorithm').value;
+  let qs = 'p_algorithm=' + algo + '&' + EYE_KEYS.map(k => k + '=' + eyeSliderVal(k)).join('&') + '&save_eye=1';
   fetch('/set?' + qs).then(r => r.json()).then(d => {
     fb.textContent = d.ok ? 'Saved to eye_settings.json' : 'Failed';
   }).catch(e => { fb.textContent = 'Error: ' + e; });
@@ -1192,6 +1284,10 @@ function saveEyeSettings() {
 
 // Load saved eye settings on page load
 fetch('/eye_settings').then(r => r.json()).then(s => {
+  // Algorithm dropdown
+  if (s.p_algorithm) {
+    document.getElementById('p_algorithm').value = s.p_algorithm;
+  }
   for (const k of EYE_KEYS) {
     if (s[k] === undefined) continue;
     const el = document.getElementById(k);
@@ -1201,6 +1297,7 @@ fetch('/eye_settings').then(r => r.json()).then(s => {
     const lbl = document.getElementById(k + '_val');
     if (lbl) lbl.textContent = (scale > 1) ? (s[k]).toFixed(scale > 10 ? 1 : 2) : s[k];
   }
+  updateAlgoVisibility();
 }).catch(() => {});
 
 
@@ -1311,10 +1408,19 @@ fetch('/eye_settings').then(r => r.json()).then(s => {
           <option value="original">Final Result (Overlay)</option>
           <option value="p_suppressed">Pupil: Glint Suppressed</option>
           <option value="p_blurred">Pupil: Blurred</option>
-          <option value="p_thresh">Pupil: Threshold</option>
-          <option value="p_morph">Pupil: Morphological</option>
+          <option value="p_thresh">Pupil: Threshold / Edges / Gradients</option>
+          <option value="p_morph">Pupil: Morphological / Circles / Vote Map</option>
           <option value="g_thresh">Glint: Threshold</option>
           <option value="g_morph">Glint: Morphological</option>
+        </select>
+      </div>
+      <div class="ctrl-group">
+        <span style="color:#adf">Algorithm</span>
+        <select id="p_algorithm" onchange="applyEyeSettings(true)">
+          <option value="threshold">1: Threshold (dark blob)</option>
+          <option value="edge">2: Edge (Canny + Hough)</option>
+          <option value="gradient">3: Gradient (Timm &amp; Barth)</option>
+          <option value="seed">4: Seed (flood-fill + ellipse)</option>
         </select>
       </div>
       <div class="ctrl-group">
@@ -1348,6 +1454,30 @@ fetch('/eye_settings').then(r => r.json()).then(s => {
       <div class="ctrl-group">
         <span style="color:#8f8">Pupil -Circ min: <b id="p_circularity_min_val">0.4</b></span>
         <input type="range" min="10" max="100" value="40" id="p_circularity_min" oninput="upd(this,100)">
+      </div>
+      <div class="ctrl-group algo-edge">
+        <span style="color:#9df">Edge -Canny low: <b id="p_canny_low_val">30</b></span>
+        <input type="range" min="5" max="200" value="30" id="p_canny_low" oninput="upd(this)">
+      </div>
+      <div class="ctrl-group algo-edge">
+        <span style="color:#9df">Edge -Canny high: <b id="p_canny_high_val">100</b></span>
+        <input type="range" min="20" max="300" value="100" id="p_canny_high" oninput="upd(this)">
+      </div>
+      <div class="ctrl-group algo-edge">
+        <span style="color:#9df">Edge -Hough sensitivity: <b id="p_hough_param1_val">100</b></span>
+        <input type="range" min="10" max="300" value="100" id="p_hough_param1" oninput="upd(this)">
+      </div>
+      <div class="ctrl-group algo-edge">
+        <span style="color:#9df">Edge -Hough accumulator: <b id="p_hough_param2_val">30</b></span>
+        <input type="range" min="5" max="100" value="30" id="p_hough_param2" oninput="upd(this)">
+      </div>
+      <div class="ctrl-group algo-gradient">
+        <span style="color:#d9f">Gradient -Downscale: <b id="p_gradient_downscale_val">2</b></span>
+        <input type="range" min="1" max="4" value="2" id="p_gradient_downscale" oninput="upd(this)">
+      </div>
+      <div class="ctrl-group algo-seed">
+        <span style="color:#fc8">Seed -Flood tol: <b id="p_seed_flood_tolerance_val">40</b></span>
+        <input type="range" min="5" max="100" value="40" id="p_seed_flood_tolerance" oninput="upd(this)">
       </div>
       <div class="ctrl-group">
         <span style="color:#ff8">Glint -Bright thresh: <b id="g_brightness_thresh_val">230</b></span>
@@ -1449,8 +1579,18 @@ setupROI(2, c2);
 
 const EYE_KEYS = ['p_glint_thresh','p_blur_ksize','p_dark_percentile','p_thresh_offset','p_morph_ksize',
   'p_min_radius','p_max_radius','p_circularity_min',
+  'p_canny_low','p_canny_high','p_hough_param1','p_hough_param2','p_gradient_downscale','p_seed_flood_tolerance',
   'g_brightness_thresh','g_min_area','g_max_area','g_search_radius_factor','g_circularity_min'];
 const EYE_FLOAT_SCALE = {'p_dark_percentile': 10, 'p_circularity_min': 100, 'g_circularity_min': 100, 'g_search_radius_factor': 10};
+
+function updateAlgoVisibility() {
+  const algo = document.getElementById('p_algorithm').value;
+  document.querySelectorAll('.algo-edge').forEach(el => el.style.display = algo === 'edge' ? '' : 'none');
+  document.querySelectorAll('.algo-gradient').forEach(el => el.style.display = algo === 'gradient' ? '' : 'none');
+  document.querySelectorAll('.algo-seed').forEach(el => el.style.display = algo === 'seed' ? '' : 'none');
+}
+document.getElementById('p_algorithm').addEventListener('change', updateAlgoVisibility);
+updateAlgoVisibility();
 
 function upd(el, scale=1) {
   const val = scale > 1 ? (el.value/scale).toFixed(scale>10?2:1) : el.value;
@@ -1465,7 +1605,8 @@ function applyDebugView(val) {
 function applyEyeSettings(quiet=false) {
   const fb = document.getElementById('eye-feedback');
   if (!quiet) fb.textContent = 'Applying...';
-  const qs = EYE_KEYS.map(k => {
+  const algo = document.getElementById('p_algorithm').value;
+  const qs = 'p_algorithm=' + algo + '&' + EYE_KEYS.map(k => {
     const el = document.getElementById(k);
     const scale = EYE_FLOAT_SCALE[k] || 1;
     return k + '=' + (el.value / scale);
@@ -1475,6 +1616,7 @@ function applyEyeSettings(quiet=false) {
       fb.textContent = d.ok ? 'Applied' : 'Failed';
       setTimeout(() => fb.textContent = '', 2000);
     }
+    updateAlgoVisibility();
     render();
   });
 }
@@ -1482,7 +1624,13 @@ function applyEyeSettings(quiet=false) {
 function saveEyeSettings() {
   const fb = document.getElementById('eye-feedback');
   fb.textContent = 'Saving...';
-  fetch('/set?save_eye=1').then(r => r.json()).then(d => {
+  const algo = document.getElementById('p_algorithm').value;
+  const qs = 'p_algorithm=' + algo + '&' + EYE_KEYS.map(k => {
+    const el = document.getElementById(k);
+    const scale = EYE_FLOAT_SCALE[k] || 1;
+    return k + '=' + (el.value / scale);
+  }).join('&') + '&save_eye=1';
+  fetch('/set?' + qs).then(r => r.json()).then(d => {
     fb.textContent = d.ok ? 'Saved' : 'Save failed';
     setTimeout(() => fb.textContent = '', 2000);
   });
@@ -1490,6 +1638,9 @@ function saveEyeSettings() {
 
 // Fetch current eye settings
 fetch('/eye_settings').then(r => r.json()).then(s => {
+  if (s.p_algorithm) {
+    document.getElementById('p_algorithm').value = s.p_algorithm;
+  }
   for (const k of EYE_KEYS) {
     const el = document.getElementById(k);
     if (el && s[k] !== undefined) {
@@ -1498,6 +1649,7 @@ fetch('/eye_settings').then(r => r.json()).then(s => {
       upd(el, scale);
     }
   }
+  updateAlgoVisibility();
 }).catch(() => {});
 
 let rec = null;

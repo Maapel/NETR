@@ -247,6 +247,11 @@ class RigManager(App):
                     yield Button("⬆ cam1", id="btn-cam1-ota", variant="primary")
                     yield Button("⬆ cam2", id="btn-cam2-ota", variant="primary")
 
+                yield Static("── RESET ──", classes="panel-title")
+                with Horizontal(classes="service-row"):
+                    yield Button("↺ cam1", id="btn-cam1-rst", variant="error")
+                    yield Button("↺ cam2", id="btn-cam2-rst", variant="error")
+
                 yield Static("── USB FLASH ──", classes="panel-title")
                 with Horizontal(classes="service-row"):
                     yield Button("⚡ cam1", id="btn-cam1-usb", classes="usb")
@@ -448,6 +453,8 @@ class RigManager(App):
         if   bid == "btn-receiver":  self._toggle_receiver()
         elif bid == "btn-cam1-ota":  self._ota_upload("cam1")
         elif bid == "btn-cam2-ota":  self._ota_upload("cam2")
+        elif bid == "btn-cam1-rst":  self._reset_cam("cam1")
+        elif bid == "btn-cam2-rst":  self._reset_cam("cam2")
         elif bid == "btn-cam1-usb":  self._usb_flash("cam1")
         elif bid == "btn-cam2-usb":  self._usb_flash("cam2")
         elif bid == "btn-analysis":  self._toggle_analysis()
@@ -482,6 +489,19 @@ class RigManager(App):
             self.receiver_running = True
             btn.label = "■ Receiver"; btn.add_class("running")
             self.log_msg("[green]Receiver started[/] → http://localhost:8080", "sys")
+
+    # ── Software reset ─────────────────────────────────────────────────────────
+    _CMD_PORTS = {"cam1": 5001, "cam2": 5003}
+
+    def _reset_cam(self, cam: str):
+        cam_state = self.cams[cam]
+        if not cam_state.ip:
+            self.log_msg(f"[red]{cam} IP unknown — run Discover first[/]", "sys"); return
+        import socket
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.sendto(b"rst", (cam_state.ip, self._CMD_PORTS[cam]))
+        sock.close()
+        self.log_msg(f"[yellow]Reset sent to {cam} ({cam_state.ip})[/]", "sys")
 
     # ── OTA upload ────────────────────────────────────────────────────────────
     def _ota_upload(self, cam: str):

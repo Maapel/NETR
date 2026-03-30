@@ -337,6 +337,7 @@ void cmdTask(void *) {
             else if (strncmp(buf, "hm:", 3) == 0) { s->set_hmirror(s, atoi(buf+3));         udp_log("H-mirror → %d", atoi(buf+3)); }
             else if (strncmp(buf, "vf:", 3) == 0) { s->set_vflip(s, atoi(buf+3));           udp_log("V-flip → %d", atoi(buf+3)); }
             else if (strncmp(buf, "wm:", 3) == 0) { s->set_wb_mode(s, atoi(buf+3));         udp_log("WB mode → %d", atoi(buf+3)); }
+            else if (strncmp(buf, "rst", 3) == 0) { udp_log("Restarting via software reset..."); delay(200); ESP.restart(); }
             else { Serial.printf("Unknown cmd: %s\n", buf); }
         }
     }

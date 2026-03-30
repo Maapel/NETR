@@ -19,7 +19,7 @@ import cv2
 import numpy as np
 from dataclasses import dataclass, field
 
-from pupil_detector import PupilDetector, PupilResult
+from pupil_detector import PupilDetector, PupilResult, ALGORITHMS
 from glint_detector import GlintDetector, GlintResult
 
 
@@ -45,7 +45,10 @@ class EyePipeline:
         """Update detector parameters at runtime. Keys prefixed with 'p_' go to
         PupilDetector, 'g_' go to GlintDetector."""
         for k, v in params.items():
-            if k.startswith("p_"):
+            if k == "p_algorithm":
+                if v in ALGORITHMS:
+                    self._pupil_det.algorithm = v
+            elif k.startswith("p_"):
                 attr = k[2:]
                 if hasattr(self._pupil_det, attr):
                     setattr(self._pupil_det, attr, type(getattr(self._pupil_det, attr))(v))
@@ -57,8 +60,12 @@ class EyePipeline:
     def get_params(self) -> dict:
         """Return all tuneable parameters as a flat dict."""
         d = {}
-        for attr in ("glint_thresh", "blur_ksize", "thresh_offset",
-                      "morph_ksize", "min_radius", "max_radius", "circularity_min"):
+        d["p_algorithm"] = self._pupil_det.algorithm
+        for attr in ("glint_thresh", "blur_ksize", "thresh_offset", "dark_percentile",
+                      "morph_ksize", "min_radius", "max_radius", "circularity_min",
+                      "canny_low", "canny_high", "hough_dp", "hough_param1",
+                      "hough_param2", "gradient_downscale",
+                      "seed_flood_tolerance"):
             d["p_" + attr] = getattr(self._pupil_det, attr)
         for attr in ("brightness_thresh", "min_area", "max_area",
                       "search_radius_factor", "circularity_min"):
