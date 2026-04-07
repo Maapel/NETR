@@ -34,6 +34,8 @@ PIO        = Path("/home/maadhav/pio-venv/bin/pio")
 PYTHON     = Path("/home/maadhav/pio-venv/bin/python")
 PIO_INI    = ROOT / "esp32cam-stream" / "platformio.ini"
 RECEIVER   = ROOT / "receiver.py"
+ENGINE     = ROOT / "compute" / "engine.py"
+CALIBRATION = ROOT / "calibration_server.py"
 NTP_SRV    = ROOT / "ntp_server.py"
 SERIAL_DEV = "/dev/ttyUSB0"
 
@@ -211,8 +213,10 @@ class RigManager(App):
         Binding("q",     "quit",            "Quit"),
     ]
 
-    receiver_running  = reactive(False)
-    analysis_enabled  = reactive(False)
+    receiver_running    = reactive(False)
+    engine_running      = reactive(False)
+    calibration_running = reactive(False)
+    analysis_enabled    = reactive(False)
 
     LOG_GROUPS = ("all", "cam1", "cam2", "ota", "sys")
 
@@ -222,7 +226,9 @@ class RigManager(App):
             "cam1": CamState("cam1"),
             "cam2": CamState("cam2"),
         }
-        self._receiver_proc: subprocess.Popen | None = None
+        self._receiver_proc:    subprocess.Popen | None = None
+        self._engine_proc:      subprocess.Popen | None = None
+        self._calibration_proc: subprocess.Popen | None = None
         self._upload_procs:  dict[str, subprocess.Popen] = {}  # keyed by cam id
         self._log_entries: list[tuple[str, str]] = []  # (group, rendered_msg)
         self._log_filter: str = "all"
@@ -240,7 +246,11 @@ class RigManager(App):
 
                 yield Static("── SERVICES ──", classes="panel-title")
                 with Horizontal(classes="service-row"):
-                    yield Button("▶ Receiver", id="btn-receiver")
+                    yield Button("▶ Receiver",    id="btn-receiver")
+                with Horizontal(classes="service-row"):
+                    yield Button("▶ Engine",      id="btn-engine")
+                with Horizontal(classes="service-row"):
+                    yield Button("▶ Calibration", id="btn-calibration")
 
                 yield Static("── OTA UPLOAD ──", classes="panel-title")
                 with Horizontal(classes="service-row"):
@@ -294,8 +304,9 @@ class RigManager(App):
         threading.Thread(target=self._timesync_server,  daemon=True).start()
 
     def on_unmount(self) -> None:
-        if self._receiver_proc and self._receiver_proc.poll() is None:
-            self._receiver_proc.terminate()
+        for proc in (self._receiver_proc, self._engine_proc, self._calibration_proc):
+            if proc and proc.poll() is None:
+                proc.terminate()
         for p in self._upload_procs.values():
             if p.poll() is None:
                 p.terminate()
@@ -426,9 +437,23 @@ class RigManager(App):
         if self._receiver_proc and self._receiver_proc.poll() is not None:
             self._receiver_proc = None
             self.receiver_running = False
-            self.query_one("#btn-receiver", Button).label = "▶ Receiver"
-            self.query_one("#btn-receiver", Button).remove_class("running")
+            btn = self.query_one("#btn-receiver", Button)
+            btn.label = "▶ Receiver"; btn.remove_class("running")
             self.log_msg("[yellow]Receiver stopped[/]", "sys")
+
+        if self._engine_proc and self._engine_proc.poll() is not None:
+            self._engine_proc = None
+            self.engine_running = False
+            btn = self.query_one("#btn-engine", Button)
+            btn.label = "▶ Engine"; btn.remove_class("running")
+            self.log_msg("[yellow]Engine stopped[/]", "sys")
+
+        if self._calibration_proc and self._calibration_proc.poll() is not None:
+            self._calibration_proc = None
+            self.calibration_running = False
+            btn = self.query_one("#btn-calibration", Button)
+            btn.label = "▶ Calibration"; btn.remove_class("running")
+            self.log_msg("[yellow]Calibration server stopped[/]", "sys")
 
         done = [cam for cam, p in self._upload_procs.items() if p.poll() is not None]
         for cam in done:
@@ -450,8 +475,10 @@ class RigManager(App):
     # ── Button handler ────────────────────────────────────────────────────────
     def on_button_pressed(self, event: Button.Pressed) -> None:
         bid = event.button.id
-        if   bid == "btn-receiver":  self._toggle_receiver()
-        elif bid == "btn-cam1-ota":  self._ota_upload("cam1")
+        if   bid == "btn-receiver":    self._toggle_receiver()
+        elif bid == "btn-engine":      self._toggle_engine()
+        elif bid == "btn-calibration": self._toggle_calibration()
+        elif bid == "btn-cam1-ota":    self._ota_upload("cam1")
         elif bid == "btn-cam2-ota":  self._ota_upload("cam2")
         elif bid == "btn-cam1-rst":  self._reset_cam("cam1")
         elif bid == "btn-cam2-rst":  self._reset_cam("cam2")
@@ -489,6 +516,43 @@ class RigManager(App):
             self.receiver_running = True
             btn.label = "■ Receiver"; btn.add_class("running")
             self.log_msg("[green]Receiver started[/] → http://localhost:8080", "sys")
+
+    # ── Engine ────────────────────────────────────────────────────────────────
+    def _toggle_engine(self):
+        btn = self.query_one("#btn-engine", Button)
+        if self._engine_proc and self._engine_proc.poll() is None:
+            self._engine_proc.terminate()
+            self._engine_proc = None
+            self.engine_running = False
+            btn.label = "▶ Engine"; btn.remove_class("running")
+            self.log_msg("[yellow]Engine stopped[/]", "sys")
+        else:
+            self._engine_proc = subprocess.Popen(
+                [str(PYTHON), str(ENGINE)],
+                cwd=ROOT / "compute",
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            self.engine_running = True
+            btn.label = "■ Engine"; btn.add_class("running")
+            self.log_msg("[green]Engine started[/] → http://localhost:8081", "sys")
+
+    # ── Calibration ───────────────────────────────────────────────────────────
+    def _toggle_calibration(self):
+        btn = self.query_one("#btn-calibration", Button)
+        if self._calibration_proc and self._calibration_proc.poll() is None:
+            self._calibration_proc.terminate()
+            self._calibration_proc = None
+            self.calibration_running = False
+            btn.label = "▶ Calibration"; btn.remove_class("running")
+            self.log_msg("[yellow]Calibration server stopped[/]", "sys")
+        else:
+            self._calibration_proc = subprocess.Popen(
+                [str(PYTHON), str(CALIBRATION)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            self.calibration_running = True
+            btn.label = "■ Calibration"; btn.add_class("running")
+            self.log_msg("[green]Calibration started[/] → http://localhost:8090", "sys")
 
     # ── Software reset ─────────────────────────────────────────────────────────
     _CMD_PORTS = {"cam1": 5001, "cam2": 5003}
