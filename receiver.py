@@ -124,6 +124,7 @@ def _save_settings(s):
         json.dump(s, f, indent=2)
 g_settings = _load_settings()
 
+
 def _apply_pupil_overlay(data: bytes, roi: list[float] = None) -> bytes:
     """Push JPEG frame to compute engine; return annotated JPEG.
     If engine is unreachable, falls back to returning the original frame."""
@@ -651,7 +652,6 @@ class MJPEGHandler(BaseHTTPRequestHandler):
         cmds = []
         if "analysis" in params:
             g_analysis_enabled = params["analysis"] != "0"
-            print(f"Analysis toggled: {g_analysis_enabled}")
         
         if "debug_view" in params:
             g_debug_view = params["debug_view"]
@@ -813,13 +813,19 @@ class MJPEGHandler(BaseHTTPRequestHandler):
 
   <div class="feeds">
     <div class="feed">
-      <div class="feed-label">CAM 1</div>
+      <div style="display:flex;align-items:center;gap:8px">
+        <div class="feed-label">CAM 1</div>
+        <button onclick="rotateView(1)" style="padding:2px 8px;font-size:10px;background:#446">⟳</button>
+      </div>
       <canvas id="c1" width="320" height="240"></canvas>
       <div class="feed-stats" id="s1">—</div>
       <div class="feed-roi-hint">Drag to set ROI · Dbl-click to reset</div>
     </div>
     <div class="feed">
-      <div class="feed-label">CAM 2</div>
+      <div style="display:flex;align-items:center;gap:8px">
+        <div class="feed-label">CAM 2</div>
+        <button onclick="rotateView(2)" style="padding:2px 8px;font-size:10px;background:#446">⟳</button>
+      </div>
       <canvas id="c2" width="320" height="240"></canvas>
       <div class="feed-stats" id="s2">—</div>
       <div class="feed-roi-hint">Drag to set ROI · Dbl-click to reset</div>
@@ -1153,6 +1159,13 @@ setupROI(2, c2);
 let displayFps = 20;   // how often we poll for new frames (Hz)
 let running    = true;
 let camOnline  = {1: false, 2: false};
+
+const camRotation = {1: 0, 2: 0};
+function rotateView(id) {
+  camRotation[id] = (camRotation[id] + 90) % 360;
+  const el = id === 1 ? c1 : c2;
+  el.style.transform = `rotate(${camRotation[id]}deg)`;
+}
 
 async function fetchBitmap(url) {
   const r = await fetch(url + '?t=' + Date.now());
