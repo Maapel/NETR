@@ -39,6 +39,7 @@ except ImportError as e:
 
 g_analysis_enabled = False   # toggled via /set?analysis=1|0
 g_debug_view = "original"    # "original", "p_suppressed", "p_blurred", "p_thresh", "p_morph", "g_thresh", "g_morph"
+g_latest_pccr: tuple[float, float] | None = None  # most recent pupil-glint vector
 
 # ── Eye pipeline settings (persistent) ────────────────────────────────────────
 import pathlib as _pathlib_eye
@@ -84,6 +85,7 @@ g_settings = _load_settings()
 
 def _apply_pupil_overlay(data: bytes, roi: list[float] = None) -> bytes:
     """Decode JPEG, run eye pipeline (pupil + glint + PCCR) on ROI, draw overlay, re-encode."""
+    global g_latest_pccr
     if not _PUPIL_OK or not data:
         return data
     arr = np.frombuffer(data, np.uint8)
@@ -129,6 +131,9 @@ def _apply_pupil_overlay(data: bytes, roi: list[float] = None) -> bytes:
             bgr = dbg
         else:
             bgr = EyePipeline.draw(bgr, result)
+
+    if result is not None:
+        g_latest_pccr = result.pccr_vector
 
     _, enc = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
     return enc.tobytes()
@@ -326,6 +331,7 @@ class MJPEGHandler(BaseHTTPRequestHandler):
             "cam1": CAMS[1].stats,
             "cam2": CAMS[2].stats,
             "sync_offset_ms": round(sync_offset_ms, 1),
+            "pccr_vector": list(g_latest_pccr) if g_latest_pccr else None,
         }).encode()
         try:
             self.send_response(200)
@@ -1592,10 +1598,11 @@ function updateAlgoVisibility() {
 document.getElementById('p_algorithm').addEventListener('change', updateAlgoVisibility);
 updateAlgoVisibility();
 
+let _eyeLoading = true;
 function upd(el, scale=1) {
   const val = scale > 1 ? (el.value/scale).toFixed(scale>10?2:1) : el.value;
   document.getElementById(el.id + '_val').textContent = val;
-  applyEyeSettings(true); // Auto-apply
+  if (!_eyeLoading) applyEyeSettings(true);
 }
 
 function applyDebugView(val) {
@@ -1650,7 +1657,8 @@ fetch('/eye_settings').then(r => r.json()).then(s => {
     }
   }
   updateAlgoVisibility();
-}).catch(() => {});
+  _eyeLoading = false;
+}).catch(() => { _eyeLoading = false; });
 
 let rec = null;
 let total = {1: 0, 2: 0};
