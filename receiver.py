@@ -38,8 +38,49 @@ except ImportError as e:
     _PUPIL_OK = False
 
 g_analysis_enabled = False   # toggled via /set?analysis=1|0
-g_debug_view = "original"    # "original", "p_suppressed", "p_blurred", "p_thresh", "p_morph", "g_thresh", "g_morph"
-g_latest_pccr: tuple[float, float] | None = None  # most recent pupil-glint vector
+g_debug_view = "original"    # passed through to engine
+g_latest_pccr: tuple[float, float] | None = None  # cached from engine /result
+
+# ── Compute engine client ─────────────────────────────────────────────────────
+ENGINE_URL = "http://localhost:8081"
+
+def _engine_push(jpeg: bytes) -> bytes | None:
+    """POST a JPEG frame to the compute engine. Returns annotated JPEG or None."""
+    import urllib.request
+    try:
+        req = urllib.request.Request(
+            ENGINE_URL + "/process",
+            data=jpeg,
+            headers={"Content-Type": "image/jpeg"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=0.5) as r:
+            return r.read()
+    except Exception:
+        return None
+
+def _engine_get_result() -> dict | None:
+    import urllib.request
+    try:
+        with urllib.request.urlopen(ENGINE_URL + "/result", timeout=0.3) as r:
+            return json.loads(r.read())
+    except Exception:
+        return None
+
+def _engine_post_settings(params: dict) -> bool:
+    import urllib.request
+    try:
+        body = json.dumps(params).encode()
+        req  = urllib.request.Request(
+            ENGINE_URL + "/settings",
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=0.5):
+            return True
+    except Exception:
+        return False
 
 # ── Eye pipeline settings (persistent) ────────────────────────────────────────
 import pathlib as _pathlib_eye
@@ -84,59 +125,39 @@ def _save_settings(s):
 g_settings = _load_settings()
 
 def _apply_pupil_overlay(data: bytes, roi: list[float] = None) -> bytes:
-    """Decode JPEG, run eye pipeline (pupil + glint + PCCR) on ROI, draw overlay, re-encode."""
+    """Push JPEG frame to compute engine; return annotated JPEG.
+    If engine is unreachable, falls back to returning the original frame."""
     global g_latest_pccr
-    if not _PUPIL_OK or not data:
-        return data
-    arr = np.frombuffer(data, np.uint8)
-    bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    if bgr is None:
+    if not data:
         return data
 
-    h, w = bgr.shape[:2]
-    result = None
-    
+    # Crop to ROI before sending — reduces bytes over loopback
     if roi and roi != [0.0, 0.0, 1.0, 1.0]:
-        x1, y1, x2, y2 = int(roi[0]*w), int(roi[1]*h), int(roi[2]*w), int(roi[3]*h)
-        x1, y1 = max(0, x1), max(0, y1)
-        x2, y2 = min(w, x2), min(h, y2)
-        if x2 > x1 and y2 > y1:
-            crop = bgr[y1:y2, x1:x2]
-            gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-            result = _eye_pipe.process(gray)
-            
-            # If a specific debug view is requested, replace the crop with that view
-            if g_debug_view in result.intermediate_frames:
-                dbg = result.intermediate_frames[g_debug_view]
-                if len(dbg.shape) == 2: # grayscale
-                    dbg = cv2.cvtColor(dbg, cv2.COLOR_GRAY2BGR)
-                # Resize if necessary (though it should match the crop)
-                if dbg.shape[:2] != (y2-y1, x2-x1):
-                    dbg = cv2.resize(dbg, (x2-x1, y2-y1))
-                bgr[y1:y2, x1:x2] = dbg
-            else:
-                crop = EyePipeline.draw(crop, result)
-                bgr[y1:y2, x1:x2] = crop
-            
-            # Draw ROI box
-            cv2.rectangle(bgr, (x1, y1), (x2, y2), (0, 0, 255), 1)
-    else:
-        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-        result = _eye_pipe.process(gray)
-        
-        if g_debug_view in result.intermediate_frames:
-            dbg = result.intermediate_frames[g_debug_view]
-            if len(dbg.shape) == 2:
-                dbg = cv2.cvtColor(dbg, cv2.COLOR_GRAY2BGR)
-            bgr = dbg
-        else:
-            bgr = EyePipeline.draw(bgr, result)
+        try:
+            arr = np.frombuffer(data, dtype=np.uint8)
+            bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            if bgr is not None:
+                h, w = bgr.shape[:2]
+                x1 = max(0, int(roi[0]*w)); y1 = max(0, int(roi[1]*h))
+                x2 = min(w, int(roi[2]*w)); y2 = min(h, int(roi[3]*h))
+                if x2 > x1 and y2 > y1:
+                    crop = bgr[y1:y2, x1:x2]
+                    _, enc = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 90])
+                    data = enc.tobytes()
+        except Exception:
+            pass
 
-    if result is not None:
-        g_latest_pccr = result.pccr_vector
+    annotated = _engine_push(data)
 
-    _, enc = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
-    return enc.tobytes()
+    # Cache latest PCCR from engine (non-blocking, best-effort)
+    def _refresh_pccr():
+        global g_latest_pccr
+        r = _engine_get_result()
+        if r and r.get("ready"):
+            g_latest_pccr = tuple(r["pccr_vector"]) if r.get("pccr_vector") else None
+    threading.Thread(target=_refresh_pccr, daemon=True).start()
+
+    return annotated if annotated is not None else data
 
 import collections
 import os
@@ -331,7 +352,8 @@ class MJPEGHandler(BaseHTTPRequestHandler):
             "cam1": CAMS[1].stats,
             "cam2": CAMS[2].stats,
             "sync_offset_ms": round(sync_offset_ms, 1),
-            "pccr_vector": list(g_latest_pccr) if g_latest_pccr else None,
+            "pccr_vector": list(g_latest_pccr) if g_latest_pccr else None,  # cached from engine
+
         }).encode()
         try:
             self.send_response(200)
@@ -354,10 +376,18 @@ class MJPEGHandler(BaseHTTPRequestHandler):
         except BrokenPipeError:
             pass
 
-    # ── /eye_settings ────────────────────────────────────────────────────────
+    # ── /eye_settings — proxy to compute engine ───────────────────────────────
     def _get_eye_settings(self):
         try:
-            d = _eye_pipe.get_params() if _PUPIL_OK else {}
+            d = _engine_get_result()  # get live params from engine
+            # Fall back to file if engine unreachable
+            if d is None:
+                import urllib.request
+                try:
+                    with urllib.request.urlopen(ENGINE_URL + "/settings", timeout=0.5) as r:
+                        d = json.loads(r.read())
+                except Exception:
+                    d = _load_eye_settings()
             body = json.dumps(d).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -625,7 +655,7 @@ class MJPEGHandler(BaseHTTPRequestHandler):
         
         if "debug_view" in params:
             g_debug_view = params["debug_view"]
-            print(f"Debug view set to: {g_debug_view}")
+            _engine_post_settings({"debug_view": g_debug_view})
 
         # ROI settings (x1,y1,x2,y2 normalized)
         new_roi = None
@@ -637,9 +667,8 @@ class MJPEGHandler(BaseHTTPRequestHandler):
             except ValueError:
                 new_roi = None
 
-        # Eye pipeline parameters
+        # Eye pipeline parameters — forward to compute engine
         eye_updates = {}
-        # Algorithm is a string param, not numeric
         if "p_algorithm" in params and params["p_algorithm"] in ("threshold", "edge", "gradient", "seed"):
             eye_updates["p_algorithm"] = params["p_algorithm"]
         for key, (lo, hi) in self._EYE_PARAM_MAP.items():
@@ -647,15 +676,12 @@ class MJPEGHandler(BaseHTTPRequestHandler):
                 val = max(lo, min(hi, float(params[key])))
                 if isinstance(lo, int) and isinstance(hi, int):
                     val = int(val)
-                    # blur_ksize and morph_ksize must be odd
                     if key in ("p_blur_ksize", "p_morph_ksize") and val % 2 == 0:
                         val += 1
                 eye_updates[key] = val
-        if eye_updates and _PUPIL_OK:
-            _eye_pipe.update_params(eye_updates)
-
-        if "save_eye" in params and _PUPIL_OK:
-            _save_eye_settings(_eye_pipe.get_params())
+        if eye_updates:
+            save = "save_eye" in params
+            _engine_post_settings({**eye_updates, **({"save": True} if save else {})})
 
         for key, (prefix, lo, hi) in self._PARAM_MAP.items():
             if key in params:
