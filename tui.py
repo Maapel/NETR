@@ -217,6 +217,7 @@ class RigManager(App):
     engine_running      = reactive(False)
     calibration_running = reactive(False)
     analysis_enabled    = reactive(False)
+    eye_cam             = reactive(2)   # which cam runs the eye pipeline
 
     LOG_GROUPS = ("all", "cam1", "cam2", "ota", "sys")
 
@@ -287,6 +288,7 @@ class RigManager(App):
                 with Vertical(id="analysis-section"):
                     with Horizontal(classes="service-row"):
                         yield Button("⊙ Overlay OFF", id="btn-analysis", variant="default")
+                        yield Button("Eye: cam2", id="btn-eye-cam", variant="default")
                     yield Static(
                         "[dim]cv2/numpy missing[/]" if not _PUPIL_OK else "[dim]press to enable pupil overlay in browser[/]",
                         id="analysis-status", classes="pupil-row", markup=True
@@ -334,6 +336,19 @@ class RigManager(App):
                         sock.sendto(f"SYNC_RESP:{parts[1]}:{t2}:{t3}".encode(), addr)
             except Exception:
                 continue
+
+    # ── Eye cam selector ─────────────────────────────────────────────────────
+    def _toggle_eye_cam(self):
+        self.eye_cam = 1 if self.eye_cam == 2 else 2
+        btn = self.query_one("#btn-eye-cam", Button)
+        btn.label = f"Eye: cam{self.eye_cam}"
+        try:
+            urllib.request.urlopen(
+                f"http://localhost:8080/set?eye_cam={self.eye_cam}", timeout=1
+            ).close()
+        except Exception:
+            pass
+        self.log_msg(f"Eye cam → [bold]cam{self.eye_cam}[/]", "sys")
 
     # ── Pupil overlay toggle ──────────────────────────────────────────────────
     def _toggle_analysis(self):
@@ -485,6 +500,7 @@ class RigManager(App):
         elif bid == "btn-cam1-usb":  self._usb_flash("cam1")
         elif bid == "btn-cam2-usb":  self._usb_flash("cam2")
         elif bid == "btn-analysis":  self._toggle_analysis()
+        elif bid == "btn-eye-cam":   self._toggle_eye_cam()
         elif bid == "btn-discover":  self.run_worker(self._discover(), exclusive=True)
         elif bid == "btn-scan":      self.run_worker(self._scan(),    exclusive=True)
         elif bid == "btn-monitor":   self._open_monitor()

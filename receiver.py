@@ -39,6 +39,7 @@ except ImportError as e:
 
 g_analysis_enabled = False   # toggled via /set?analysis=1|0
 g_debug_view = "original"    # passed through to engine
+g_eye_cam = 2                # which cam runs the eye pipeline (1 or 2)
 g_latest_pccr: tuple[float, float] | None = None  # cached from engine /result
 
 # ── Compute engine client ─────────────────────────────────────────────────────
@@ -353,8 +354,8 @@ class MJPEGHandler(BaseHTTPRequestHandler):
             "cam1": CAMS[1].stats,
             "cam2": CAMS[2].stats,
             "sync_offset_ms": round(sync_offset_ms, 1),
-            "pccr_vector": list(g_latest_pccr) if g_latest_pccr else None,  # cached from engine
-
+            "pccr_vector": list(g_latest_pccr) if g_latest_pccr else None,
+            "eye_cam": g_eye_cam,
         }).encode()
         try:
             self.send_response(200)
@@ -652,6 +653,13 @@ class MJPEGHandler(BaseHTTPRequestHandler):
         cmds = []
         if "analysis" in params:
             g_analysis_enabled = params["analysis"] != "0"
+
+        if "eye_cam" in params:
+            global g_eye_cam
+            try:
+                g_eye_cam = int(params["eye_cam"])
+            except ValueError:
+                pass
         
         if "debug_view" in params:
             g_debug_view = params["debug_view"]
@@ -734,7 +742,7 @@ class MJPEGHandler(BaseHTTPRequestHandler):
             try: self.send_error(503)
             except BrokenPipeError: pass
             return
-        if g_analysis_enabled:
+        if g_analysis_enabled and cam.cam_id == g_eye_cam:
             data = _apply_pupil_overlay(data, cam.roi)
         try:
             self.send_response(200)
@@ -759,7 +767,7 @@ class MJPEGHandler(BaseHTTPRequestHandler):
                     data = cam.latest_frame
                 if not data:
                     continue
-                if g_analysis_enabled:
+                if g_analysis_enabled and cam.cam_id == g_eye_cam:
                     data = _apply_pupil_overlay(data, cam.roi)
                 hdr = (b"--frame\r\nContent-Type: image/jpeg\r\n"
                        b"Content-Length: " + str(len(data)).encode() + b"\r\n\r\n")
