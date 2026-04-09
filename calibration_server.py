@@ -302,7 +302,7 @@ def _scene_cam_thread():
                 _debug["scene_cam_error"] = err
                 _debug["homography_ok"] = False
             print(f"[scene] Error fetching {snap_url}: {err}")
-        time.sleep(0.5)
+        time.sleep(0.15)  # ~6-7 fps for scene cam view
 
 _last_screen_size = [0, 0]   # updated by websocket messages
 
@@ -645,13 +645,13 @@ button.paused-on  { background: #2a1a0a; color: #ffaa44; border-color: #ffaa44; 
   color: #888; font-size: 13px; min-width: 320px; text-align: center;
 }
 #reopen-debug {
-  position: fixed; bottom: 40vh; left: 12px; z-index: 25;
+  position: fixed; bottom: 30vh; left: 12px; z-index: 25;
   display: none;
   padding: 4px 10px; font-size: 11px; background: rgba(0,0,0,0.7);
   border: 1px solid #555; border-radius: 4px; color: #aaa; cursor: pointer;
 }
 #debug-panel {
-  position: fixed; bottom: 40vh; left: 12px; z-index: 20;
+  position: fixed; bottom: 30vh; left: 12px; z-index: 20;
   background: rgba(0,0,0,0.82); border: 1px solid #333; border-radius: 6px;
   padding: 10px 14px; font-size: 12px; color: #ccc; min-width: 280px;
   max-width: 340px;
@@ -1216,7 +1216,7 @@ function refreshScene() {
     .catch(() => {});
 }
 refreshScene();
-setInterval(refreshScene, 600);
+setInterval(refreshScene, 150);  // ~6-7 fps
 </script>
 </body>
 </html>"""
@@ -1284,7 +1284,9 @@ class Handler(BaseHTTPRequestHandler):
 
         elif self.path.startswith("/marker/"):
             try:
-                mid = int(self.path.split("/marker/")[1].split(".")[0])
+                # Strip query string before parsing ID
+                raw = self.path.split("/marker/")[1].split("?")[0].split(".")[0]
+                mid = int(raw)
                 png = _marker_pngs[mid]
                 self.send_response(200)
                 self.send_header("Content-Type", "image/png")
