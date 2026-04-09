@@ -73,6 +73,7 @@ _debug = {
     "scene_cam_error": "",
     "aruco_detected": 0,          # number of ArUco markers found in last frame
     "aruco_ids": [],
+    "aruco_expected_met": False,  # last frame had all ARUCO_IDS corners (see _detect_aruco_corners)
     "homography_ok": False,
     "eye_poll_ok": False,
     "eye_poll_error": "",
@@ -654,6 +655,7 @@ def _scene_cam_thread():
                     _debug["scene_cam_error"] = ""
                     _debug["aruco_detected"] = n
                     _debug["aruco_ids"] = all_ids
+                    _debug["aruco_expected_met"] = detected is not None
                     _debug["frame_size"] = [w_px, h_px]
                     _debug["brightness"] = round(mean_brightness, 1)
                 if n != prev_aruco_count:
@@ -734,12 +736,14 @@ def _scene_cam_thread():
                 with _debug_lock:
                     _debug["scene_cam_ok"] = False
                     _debug["scene_cam_error"] = "frame decode failed"
+                    _debug["aruco_expected_met"] = False
         except Exception as e:
             err = str(e)
             with _debug_lock:
                 _debug["scene_cam_ok"] = False
                 _debug["scene_cam_error"] = err
                 _debug["homography_ok"] = False
+                _debug["aruco_expected_met"] = False
             print(f"[scene] Error fetching {snap_url}: {err}")
         time.sleep(0.05)  # ~20 fps
 
@@ -1511,8 +1515,8 @@ function readingPos(t) {
 
 // ── Saccade mode — stratified 9-zone grid, max-distance sequencing ───────────
 const SETTLE_MS = 700;   // eye settling time after jump (ms)
-const FIXATE_MS = 300;   // sample window after settling (ms)
-const POINT_MS  = SETTLE_MS + FIXATE_MS;
+const FIXATE_MS = 300;   // sample window after gated fixation (ms)
+const ARUCO_POLL_MS = 80;  // /debug poll rate during saccade (homography + IDs)
 
 // 3×3 zone grid — (row, col) for distance math
 const ZONE_POS = [
@@ -1570,6 +1574,20 @@ let saccadePos   = { x: 0, y: 0 };
 let saccadeStart = 0;
 let saccadeSampled = false;
 let saccadeCount = 0;
+let fixationSentAt = null;   // performance.now() when fixation WS was sent
+let lastArucoPoll  = 0;
+let arucoGateOk    = false;
+
+function pollArucoGate(now) {
+  if (now - lastArucoPoll < ARUCO_POLL_MS) return;
+  lastArucoPoll = now;
+  fetch('/debug').then(r => r.json()).then(d => {
+    const exp = d.expected_aruco_ids || [];
+    const ids = d.aruco_ids || [];
+    arucoGateOk = !!(d.homography_ok && d.aruco_expected_met &&
+      exp.length > 0 && exp.every(id => ids.includes(id)));
+  }).catch(() => { arucoGateOk = false; });
+}
 
 function nextSaccadePoint() {
   if (zoneSeqIdx >= zoneSeq.length) {
@@ -1582,20 +1600,24 @@ function nextSaccadePoint() {
   saccadePos   = randomInZone(zone);
   saccadeStart = performance.now();
   saccadeSampled = false;
+  fixationSentAt = null;
 }
 
 function initSaccade() {
   zoneSeq    = buildZoneSequence();
   zoneSeqIdx = 0;
   saccadeCount = 0;
+  arucoGateOk   = false;
+  lastArucoPoll = 0;
   nextSaccadePoint();  // first point = center zone
 }
 
 function tickSaccade(now) {
+  pollArucoGate(now);
   const dwell   = now - saccadeStart;
   const settled = dwell >= SETTLE_MS;
 
-  if (settled && !saccadeSampled) {
+  if (settled && !saccadeSampled && arucoGateOk) {
     if (ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({
         type: 'fixation',
@@ -1604,14 +1626,23 @@ function tickSaccade(now) {
         y:    saccadePos.y,
       }));
     }
+    fixationSentAt = now;
     saccadeSampled = true;
     saccadeCount++;
     const round = Math.ceil(saccadeCount / 9);
     const inRound = ((saccadeCount - 1) % 9) + 1;
     statusEl.textContent = `Saccade: ${saccadeCount} pts  (round ${round}, point ${inRound}/9)`;
+  } else if (settled && !saccadeSampled) {
+    const nextIdx = saccadeCount + 1;
+    const round = Math.ceil(nextIdx / 9);
+    const inRound = ((nextIdx - 1) % 9) + 1;
+    statusEl.textContent =
+      `Saccade: ${saccadeCount} pts  (round ${round}, point ${inRound}/9) — waiting for 4 ArUco markers`;
   }
 
-  if (dwell >= POINT_MS) nextSaccadePoint();
+  if (saccadeSampled && fixationSentAt !== null && (now - fixationSentAt) >= FIXATE_MS) {
+    nextSaccadePoint();
+  }
 
   // Shrinking ring: large yellow → small green as eye should settle
   const progress = Math.min(dwell / SETTLE_MS, 1);
@@ -1746,8 +1777,10 @@ function dbg(id, text, ok) {
 function pollDebug() {
   fetch('/debug').then(r => r.json()).then(d => {
     dbg('d-scene', d.scene_cam_ok ? 'OK' : ('ERR: ' + d.scene_cam_error), d.scene_cam_ok);
-    const arucoOk = d.aruco_detected >= 4;
-    dbg('d-aruco', `${d.aruco_detected} found  IDs=[${d.aruco_ids}]`, arucoOk ? true : (d.aruco_detected > 0 ? null : false));
+    const exp = d.expected_aruco_ids || [];
+    const ids = d.aruco_ids || [];
+    const arucoOk = !!(d.aruco_expected_met && exp.length > 0 && exp.every(id => ids.includes(id)));
+    dbg('d-aruco', `${d.aruco_detected} found  IDs=[${d.aruco_ids}]  need=[${exp}]`, arucoOk ? true : (d.aruco_detected > 0 ? null : false));
     dbg('d-homo', d.homography_ok ? 'OK' : 'MISSING', d.homography_ok);
     if (d.pccr_vector) {
       dbg('d-pccr', `[${d.pccr_vector[0]}, ${d.pccr_vector[1]}]`, true);
@@ -2127,6 +2160,8 @@ class Handler(BaseHTTPRequestHandler):
                 d = dict(_debug)
             d.setdefault("frame_size", None)
             d.setdefault("brightness", None)
+            d.setdefault("aruco_expected_met", False)
+            d["expected_aruco_ids"] = list(ARUCO_IDS)
             with _homography_lock:
                 d["homography_ok"] = _homography is not None
             d["calibrating"]     = _calibrating
