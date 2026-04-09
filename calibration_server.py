@@ -115,7 +115,25 @@ def _refit_models():
 # ── ArUco helpers ─────────────────────────────────────────────────────────────
 _aruco_dict = cv2.aruco.getPredefinedDictionary(ARUCO_DICT)
 _aruco_params = cv2.aruco.DetectorParameters()
+# Loosen detection params to help with screen glare / low-res camera captures
+_aruco_params.adaptiveThreshWinSizeMin  = 3
+_aruco_params.adaptiveThreshWinSizeMax  = 53
+_aruco_params.adaptiveThreshWinSizeStep = 4
+_aruco_params.minMarkerPerimeterRate    = 0.01   # allow markers as small as 1% of frame
+_aruco_params.polygonalApproxAccuracyRate = 0.08
 _aruco_detector = cv2.aruco.ArucoDetector(_aruco_dict, _aruco_params)
+
+
+def _generate_marker_png(marker_id: int, size: int = 200) -> bytes:
+    """Generate correct ArUco marker PNG using OpenCV — guaranteed to be detectable."""
+    img = cv2.aruco.generateImageMarker(_aruco_dict, marker_id, size)
+    _, buf = cv2.imencode(".png", img)
+    return buf.tobytes()
+
+
+# Pre-generate all 4 markers at startup
+_marker_pngs: dict[int, bytes] = {i: _generate_marker_png(i) for i in ARUCO_IDS}
+print(f"[aruco] Pre-generated {len(_marker_pngs)} markers for DICT_4X4_50 IDs {ARUCO_IDS}")
 
 # Cached homography (recomputed when scene frame updates)
 _homography: np.ndarray | None = None
@@ -209,6 +227,9 @@ def _scene_cam_thread():
             arr = np.frombuffer(data, dtype=np.uint8)
             frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
             if frame is not None:
+                h_px, w_px = frame.shape[:2]
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                mean_brightness = float(gray.mean())
                 detected, all_ids = _detect_aruco_corners(frame)
                 # Store annotated frame for /scene_frame endpoint
                 _last_scene_jpeg = _annotate_scene_frame(frame, detected, all_ids)
@@ -218,8 +239,11 @@ def _scene_cam_thread():
                     _debug["scene_cam_error"] = ""
                     _debug["aruco_detected"] = n
                     _debug["aruco_ids"] = all_ids
+                    _debug["frame_size"] = [w_px, h_px]
+                    _debug["brightness"] = round(mean_brightness, 1)
                 if n != prev_aruco_count:
-                    print(f"[scene] ArUco: {n} markers found, IDs={all_ids}" +
+                    print(f"[scene] frame={w_px}×{h_px}  brightness={mean_brightness:.0f}/255"
+                          f"  ArUco: {n} found IDs={all_ids}" +
                           (f"  MISSING={sorted(set(ARUCO_IDS)-set(all_ids))}" if n < 4 else "  → homography OK"))
                     prev_aruco_count = n
                 if detected:
@@ -611,6 +635,11 @@ button.paused-on  { background: #2a1a0a; color: #ffaa44; border-color: #ffaa44; 
   border: 1px solid #444; border-radius: 4px;
   width: 320px; display: block;
 }
+.aruco-marker {
+  position: fixed; z-index: 5;
+  background: white;
+  image-rendering: pixelated;
+}
 </style>
 </head>
 <body>
@@ -632,6 +661,8 @@ button.paused-on  { background: #2a1a0a; color: #ffaa44; border-color: #ffaa44; 
   <div class="row"><span>Eye poll</span><span id="d-eye">…</span></div>
   <div class="row"><span>Target buf</span><span id="d-tbuf">…</span></div>
   <div class="row"><span>Eye buf</span><span id="d-ebuf">…</span></div>
+  <div class="row"><span>Frame size</span><span id="d-frame">…</span></div>
+  <div class="row"><span>Brightness</span><span id="d-bright">…</span></div>
   <div class="row"><span>Screen size</span><span id="d-screen">…</span></div>
   <div class="row"><span>Last sync</span><span id="d-sync">…</span></div>
   <div class="row"><span>Saccade pts</span><span id="d-sacc">…</span></div>
@@ -642,6 +673,10 @@ button.paused-on  { background: #2a1a0a; color: #ffaa44; border-color: #ffaa44; 
 </div>
 <img id="scene-view" alt="scene cam" style="display:none">
 <canvas id="c"></canvas>
+<img id="m0" class="aruco-marker" src="/marker/0" alt="">
+<img id="m1" class="aruco-marker" src="/marker/1" alt="">
+<img id="m2" class="aruco-marker" src="/marker/2" alt="">
+<img id="m3" class="aruco-marker" src="/marker/3" alt="">
 <script>
 const canvas = document.getElementById('c');
 const ctx = canvas.getContext('2d');
@@ -656,7 +691,8 @@ const btnPause  = document.getElementById('btnPause');
 let streamsPaused = false;
 function setStreamsPaused(val) {
   streamsPaused = val;
-  fetch(`http://localhost:8080/set?pause_streams=${val ? 1 : 0}`).catch(() => {});
+  // Proxy through calibration server to avoid CORS (8090→8080)
+  fetch(`/pause_receiver?v=${val ? 1 : 0}`).catch(() => {});
   if (val) {
     btnPause.textContent = '▶ Resume Streams';
     btnPause.classList.add('paused-on');
@@ -698,8 +734,8 @@ ws.onopen = () => {
   statusEl.textContent = 'Connected';
   ws.send(JSON.stringify({type:'screen_size', w:W, h:H}));
   ws.send(JSON.stringify({type:'status'}));
-  // Send marker positions (may not be built yet — buildBackground sends them too)
-  setTimeout(buildBackground, 100);
+  // Send marker positions after WS is open
+  setTimeout(updateMarkers, 100);
 };
 ws.onclose = () => statusEl.textContent = 'Disconnected';
 ws.onmessage = e => {
@@ -724,21 +760,14 @@ ws.onmessage = e => {
   }
 };
 
-// ── ArUco corner markers (drawn as patterns) ─────────────────────────────────
-// Render simple ArUco-style markers (4x4 bit patterns for IDs 0-3) in corners.
-// These match the DICT_4X4_50 patterns so OpenCV can detect them.
-// Bits read MSB-first, row by row (4x4 inner grid + 1px black border = 6x6 cells).
-const ARUCO_BITS = {
-  0: [[0,1,1,0],[1,1,0,1],[0,0,1,1],[0,0,0,0]],
-  1: [[1,1,0,1],[1,0,0,0],[0,0,0,1],[1,0,1,1]],
-  2: [[1,1,1,0],[0,1,1,1],[0,0,1,1],[0,1,1,0]],
-  3: [[1,0,1,0],[0,0,0,0],[1,0,0,1],[0,1,1,1]],
-};
-
-
-// ── Offscreen background (ArUco corners, redrawn on resize or slider change) ──
+// ── ArUco markers — server-generated PNGs placed as DOM elements ─────────────
+// Markers are generated with cv2.aruco.generateImageMarker() server-side,
+// guaranteed to match what OpenCV detects. Each img has white CSS padding
+// to provide the required quiet zone.
 let bgCanvas = null;
 let markerPct = 20;  // % of min(W,H) — controlled by slider
+const QUIET_PX = 16;  // white quiet-zone padding around each marker (px)
+const EDGE_PX  = 4;   // gap from screen edge
 
 function buildBackground() {
   bgCanvas = document.createElement('canvas');
@@ -747,42 +776,37 @@ function buildBackground() {
   const bctx = bgCanvas.getContext('2d');
   bctx.fillStyle = '#111';
   bctx.fillRect(0, 0, W, H);
+}
 
-  const S    = Math.min(W, H) * markerPct / 100;  // marker size
-  const cell = S / 6;
-  const pad  = cell * 1.5;   // white quiet zone around marker (OpenCV requires ~1 cell)
-  const edge = pad + 4;      // gap from screen edge to quiet zone edge
-  const M    = edge + pad + S / 2;  // marker center from screen edge
+function updateMarkers() {
+  const S = Math.min(W, H) * markerPct / 100;  // marker display size in px
+  // Each img element: size=S, padding=QUIET_PX on all sides (white bg)
+  // Total element size = S + 2*QUIET_PX
+  // Element placed EDGE_PX from screen edge
+  // Marker center (for homography) = EDGE_PX + QUIET_PX + S/2 from that edge
+  const M = EDGE_PX + QUIET_PX + S / 2;
 
-  function bDrawAruco(id, cx, cy) {
-    // White quiet zone (must surround marker for detector)
-    bctx.fillStyle = '#fff';
-    bctx.fillRect(cx - S/2 - pad, cy - S/2 - pad, S + 2*pad, S + 2*pad);
-    // Black outer border
-    bctx.fillStyle = '#000';
-    bctx.fillRect(cx - S/2, cy - S/2, S, cell);          // top
-    bctx.fillRect(cx - S/2, cy + S/2 - cell, S, cell);   // bottom
-    bctx.fillRect(cx - S/2, cy - S/2, cell, S);          // left
-    bctx.fillRect(cx + S/2 - cell, cy - S/2, cell, S);   // right
-    // Data bits (inner 4×4 grid)
-    const bits = ARUCO_BITS[id];
-    for (let r = 0; r < 4; r++) {
-      for (let c = 0; c < 4; c++) {
-        bctx.fillStyle = bits[r][c] === 0 ? '#000' : '#fff';
-        bctx.fillRect(cx - S/2 + (c+1)*cell, cy - S/2 + (r+1)*cell, cell, cell);
-      }
-    }
-  }
-
-  // Corner positions: TL=0, TR=1, BL=2, BR=3
-  const positions = {
-    0: [M,     M    ],
-    1: [W - M, M    ],
-    2: [M,     H - M],
-    3: [W - M, H - M],
-  };
-  for (const [id, [cx, cy]] of Object.entries(positions)) {
-    bDrawAruco(Number(id), cx, cy);
+  const corners = [
+    { id: 0, left: EDGE_PX,       top:    EDGE_PX },       // TL
+    { id: 1, right: EDGE_PX,      top:    EDGE_PX },       // TR
+    { id: 2, left: EDGE_PX,       bottom: EDGE_PX },       // BL
+    { id: 3, right: EDGE_PX,      bottom: EDGE_PX },       // BR
+  ];
+  const positions = {};
+  for (const c of corners) {
+    const el = document.getElementById(`m${c.id}`);
+    el.style.width   = S + 'px';
+    el.style.height  = S + 'px';
+    el.style.padding = QUIET_PX + 'px';
+    el.style.left = el.style.right = el.style.top = el.style.bottom = '';
+    if (c.left   !== undefined) el.style.left   = c.left   + 'px';
+    if (c.right  !== undefined) el.style.right  = c.right  + 'px';
+    if (c.top    !== undefined) el.style.top    = c.top    + 'px';
+    if (c.bottom !== undefined) el.style.bottom = c.bottom + 'px';
+    // Compute center position in screen coords
+    const cx = c.left  !== undefined ? M : W - M;
+    const cy = c.top   !== undefined ? M : H - M;
+    positions[c.id] = [cx, cy];
   }
 
   // Send actual marker centers to server for homography
@@ -790,14 +814,16 @@ function buildBackground() {
     ws.send(JSON.stringify({ type: 'marker_positions', positions }));
   }
 }
+
 buildBackground();
-window.addEventListener('resize', () => { resize(); buildBackground(); });
+updateMarkers();
+window.addEventListener('resize', () => { resize(); buildBackground(); updateMarkers(); });
 
 // Marker size slider
 document.getElementById('marker-size').addEventListener('input', function() {
   markerPct = Number(this.value);
   document.getElementById('marker-size-val').textContent = markerPct;
-  buildBackground();
+  updateMarkers();
 });
 
 // ── Sweep mode (reading lines) ────────────────────────────────────────────────
@@ -1062,6 +1088,17 @@ function pollDebug() {
     dbg('d-eye', d.eye_poll_ok ? 'OK' : ('ERR: ' + d.eye_poll_error), d.eye_poll_ok);
     dbg('d-tbuf', d.target_buf_size, d.target_buf_size > 0 ? true : null);
     dbg('d-ebuf', d.eye_buf_size, d.eye_buf_size > 0 ? true : null);
+    if (d.frame_size) {
+      dbg('d-frame', `${d.frame_size[0]}×${d.frame_size[1]}`, true);
+    } else {
+      dbg('d-frame', 'no frame', false);
+    }
+    if (d.brightness !== null && d.brightness !== undefined) {
+      const bOk = d.brightness > 30 && d.brightness < 220;
+      dbg('d-bright', `${d.brightness}/255 ${bOk ? '' : '⚠ check lighting'}`, bOk ? true : null);
+    } else {
+      dbg('d-bright', '—', null);
+    }
     const ss = d.screen_size;
     dbg('d-screen', ss && ss[0] ? `${ss[0]}×${ss[1]}` : 'not sent', ss && ss[0]);
     dbg('d-sync', `tried=${d.last_sync_tried} matched=${d.last_sync_matched}`,
@@ -1142,9 +1179,38 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
 
+        elif self.path.startswith("/marker/"):
+            try:
+                mid = int(self.path.split("/marker/")[1].split(".")[0])
+                png = _marker_pngs[mid]
+                self.send_response(200)
+                self.send_header("Content-Type", "image/png")
+                self.send_header("Content-Length", str(len(png)))
+                self.send_header("Cache-Control", "max-age=3600")
+                self.end_headers()
+                self.wfile.write(png)
+            except (KeyError, ValueError):
+                self.send_response(404); self.end_headers()
+
+        elif self.path.startswith("/pause_receiver"):
+            import urllib.parse
+            val = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("v", ["1"])[0]
+            try:
+                urllib.request.urlopen(f"{RECEIVER_URL}/set?pause_streams={val}", timeout=1).close()
+                body = b'{"ok":true}'
+            except Exception as e:
+                body = json.dumps({"ok": False, "error": str(e)}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
         elif self.path == "/debug":
             with _debug_lock:
                 d = dict(_debug)
+            d.setdefault("frame_size", None)
+            d.setdefault("brightness", None)
             with _homography_lock:
                 d["homography_ok"] = _homography is not None
             d["calibrating"]     = _calibrating
