@@ -626,7 +626,7 @@ button.live-on { background: #1a3320; color: #44ff88; border-color: #44ff88; }
   <div class="row"><span>Last sync</span><span id="d-sync">…</span></div>
   <div class="row"><span>Saccade pts</span><span id="d-sacc">…</span></div>
 </div>
-<img id="scene-view" src="/scene_frame" alt="scene cam">
+<img id="scene-view" alt="scene cam" style="display:none">
 <canvas id="c"></canvas>
 <script>
 const canvas = document.getElementById('c');
@@ -1014,11 +1014,21 @@ function pollDebug() {
 pollDebug();
 setInterval(pollDebug, 800);
 
-// Refresh scene frame image
+// Refresh scene frame via fetch so a 503/error doesn't put img into broken state
 function refreshScene() {
-  const img = document.getElementById('scene-view');
-  img.src = '/scene_frame?' + Date.now();
+  fetch('/scene_frame')
+    .then(r => r.ok ? r.blob() : null)
+    .then(blob => {
+      if (!blob) return;
+      const img = document.getElementById('scene-view');
+      const old = img.src;
+      img.src = URL.createObjectURL(blob);
+      img.style.display = 'block';
+      if (old.startsWith('blob:')) URL.revokeObjectURL(old);
+    })
+    .catch(() => {});
 }
+refreshScene();
 setInterval(refreshScene, 600);
 </script>
 </body>
