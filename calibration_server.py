@@ -250,28 +250,40 @@ def _flush_pending_target(eyes: list | None = None, target: dict | None = None):
 
     # Build per-sample synced tuples: fetch world frame at each eye timestamp
     synced: list[tuple] = []   # (dx, dy, X, Y, r|nan)
-    miss_no_frame = miss_no_aruco = miss_no_homo = 0
+    # Cache the global homography once as fallback for frames where per-frame
+    # ArUco fails (transient occlusion, motion blur).  If it's also None the
+    # session never had a valid homography — samples will still be 0.
+    with _homography_lock:
+        cached_H = _homography
+
+    miss_no_frame = miss_no_aruco = miss_no_homo = miss_no_cached = 0
     for e in eyes:
         frame = _fetch_world_frame_at(e["ts"])
         if frame is None:
             miss_no_frame += 1
-            continue
-        detected, _ = _detect_aruco_corners(frame)
-        if not detected:
-            miss_no_aruco += 1
-            continue
-        H = _compute_homography(detected)
-        if H is None:
-            miss_no_homo += 1
+            H_use = cached_H   # frame gone from buffer — use cached homography
+        else:
+            detected, _ = _detect_aruco_corners(frame)
+            if not detected:
+                miss_no_aruco += 1
+                H_use = cached_H
+            else:
+                H_use = _compute_homography(detected)
+                if H_use is None:
+                    miss_no_homo += 1
+                    H_use = cached_H
+        if H_use is None:
+            miss_no_cached += 1
             continue
         pt = np.array([[[sx, sy]]], dtype=np.float32)
-        sc = cv2.perspectiveTransform(pt, H)[0][0]
+        sc = cv2.perspectiveTransform(pt, H_use)[0][0]
         r  = e.get("r", float("nan"))
         synced.append((e["dx"], e["dy"], float(sc[0]), float(sc[1]), r))
 
     n_synced = len(synced)
     print(f"[calib] Target ({sx:.0f},{sy:.0f}) n={len(eyes)} synced={n_synced} "
-          f"miss(no_frame={miss_no_frame} no_aruco={miss_no_aruco} no_homo={miss_no_homo})")
+          f"miss(no_frame={miss_no_frame} no_aruco={miss_no_aruco} "
+          f"no_homo={miss_no_homo} no_cached={miss_no_cached})")
     if n_synced == 0:
         print(f"[calib] No synced samples for target ({sx:.0f},{sy:.0f}) — skipped")
         return
@@ -610,6 +622,7 @@ def _flush_calib_video_buf():
 def _scene_cam_thread():
     """Periodically grab a frame from the receiver MJPEG stream and update homography."""
     global _homography, _last_scene_jpeg
+    global _rec_world_writer, _rec_homo_writer
     snap_url = f"{RECEIVER_URL}/jpeg/{SCENE_CAM_ID}"
     prev_aruco_count = -1
     while True:
