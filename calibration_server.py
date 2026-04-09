@@ -222,15 +222,26 @@ def _fetch_world_frame_at(ts_ms: float) -> np.ndarray | None:
         return None
 
 
-def _flush_pending_target():
-    """For each captured eye frame, fetch the world frame at the same timestamp,
-    run ArUco, compute scene_xy, then average all synced (dx,dy,X,Y) pairs."""
+def _snapshot_pending() -> tuple[list, dict | None]:
+    """Atomically drain _pending_eye/_pending_target and return the snapshot."""
     global _pending_eye, _pending_target
     with _pending_lock:
-        eyes   = list(_pending_eye)
-        target = _pending_target
-        _pending_eye    = []
+        eyes          = list(_pending_eye)
+        target        = _pending_target
+        _pending_eye   = []
         _pending_target = None
+    return eyes, target
+
+
+def _flush_pending_target(eyes: list | None = None, target: dict | None = None):
+    """For each captured eye frame, fetch the world frame at the same timestamp,
+    run ArUco, compute scene_xy, then average all synced (dx,dy,X,Y) pairs.
+
+    Pass eyes/target when caller has already snapshotted (fixation handler).
+    Call with no args to snapshot now (stop handler).
+    """
+    if eyes is None or target is None:
+        eyes, target = _snapshot_pending()
     if not eyes or not target:
         return
     import numpy as _np
@@ -1041,12 +1052,21 @@ def _handle_ws(rfile, wfile):
                 if _calibrating:
                     ts = msg["ts"]   # ms, same clock as receiver's time.time()*1000
                     x, y = msg["x"], msg["y"]
-                    # Flush previous target's accumulated frames → adds to dataset
-                    threading.Thread(target=_flush_pending_target, daemon=True).start()
-                    # Register new target and open capture window on receiver
+                    # Snapshot previous target's data BEFORE setting the new target,
+                    # then start the flush thread with captured data.  If we started
+                    # the thread first and set the new target after, the thread could
+                    # race ahead, read _pending_target as the NEW target, and clear it —
+                    # dropping all subsequent eye frames for that point.
+                    prev_eyes, prev_target = _snapshot_pending()
                     with _pending_lock:
                         _pending_target = {"x": x, "y": y}
                     _set_calib_window(x, y, from_ms=ts, until_ms=ts + FIXATE_MS)
+                    if prev_eyes and prev_target:
+                        threading.Thread(
+                            target=_flush_pending_target,
+                            args=(prev_eyes, prev_target),
+                            daemon=True,
+                        ).start()
                     # Record fixation event
                     if _recording and _rec_target_f:
                         try:
