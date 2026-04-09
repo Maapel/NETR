@@ -44,6 +44,7 @@ except Exception:
 
 # ── Config ────────────────────────────────────────────────────────────────────
 RECEIVER_URL  = "http://localhost:8080"
+ENGINE_URL    = "http://localhost:8081"
 SCENE_CAM_ID  = _WORLD_CAM     # which cam to use for ArUco detection (world cam from rig_config)
 ARUCO_DICT    = cv2.aruco.DICT_4X4_50
 ARUCO_IDS     = [0, 1, 2, 3]   # TL, TR, BL, BR order
@@ -84,6 +85,7 @@ _debug = {
 }
 _debug_lock = threading.Lock()
 _last_scene_jpeg: bytes | None = None   # annotated scene frame for /scene_frame
+_last_eye_jpeg:   bytes | None = None   # analyzed eye frame from engine /frame
 _last_pccr_ts: float = 0.0
 
 # Saccade mode: directly collected fixation samples {dx, dy, X, Y, sx, sy}
@@ -357,6 +359,21 @@ def _scene_cam_thread():
                 _debug["homography_ok"] = False
             print(f"[scene] Error fetching {snap_url}: {err}")
         time.sleep(0.05)  # ~20 fps
+
+# ── Eye cam poller (engine /frame — has pupil/glint overlay) ─────────────────
+def _eye_cam_thread():
+    """Fetch analyzed eye frame from engine at ~20fps for /eye_stream."""
+    global _last_eye_jpeg
+    frame_url = f"{ENGINE_URL}/frame"
+    while True:
+        try:
+            with urllib.request.urlopen(frame_url, timeout=1) as resp:
+                data = resp.read()
+            if data:
+                _last_eye_jpeg = data
+        except Exception:
+            pass
+        time.sleep(0.05)
 
 _last_screen_size = [0, 0]   # updated by websocket messages
 
@@ -777,11 +794,26 @@ button.rec-on     { animation: recblink 1.2s infinite; }
 .dict-btn { padding: 3px 10px; font-size: 11px; background: #1a1a1a; color: #aaa;
   border: 1px solid #444; border-radius: 3px; cursor: pointer; }
 .dict-btn.active { background: #333; color: #ffcc00; border-color: #ffcc00; }
-#scene-view {
+#cam-container {
   position: fixed; bottom: 40vh; right: 12px; z-index: 20;
+  display: none; flex-direction: column; gap: 4px;
+}
+#scene-view {
   border: 1px solid #444; border-radius: 4px;
   width: 320px; display: block;
 }
+#cam-switch {
+  display: flex; gap: 0;
+}
+#cam-switch button {
+  flex: 1; padding: 4px 0; font-size: 11px; border-radius: 0;
+  border: 1px solid #444; background: #1a1a1a; color: #888; cursor: pointer;
+}
+#cam-switch button.active {
+  background: #333; color: #ffcc00; border-color: #ffcc00;
+}
+#cam-switch button:first-child { border-radius: 4px 0 0 4px; }
+#cam-switch button:last-child  { border-radius: 0 4px 4px 0; }
 .aruco-marker {
   position: fixed; z-index: 5;
   background: white;
@@ -830,7 +862,13 @@ button.rec-on     { animation: recblink 1.2s infinite; }
   </div>
 </div>
 <button id="reopen-debug">⬛ DEBUG</button>
-<img id="scene-view" alt="scene cam" style="display:none">
+<div id="cam-container">
+  <div id="cam-switch">
+    <button id="btnWorld" class="active">🌍 World (ArUco)</button>
+    <button id="btnEye">👁 Eye (PCCR)</button>
+  </div>
+  <img id="scene-view" alt="cam feed">
+</div>
 <canvas id="c"></canvas>
 <img id="m0" class="aruco-marker" src="/marker/0" alt="">
 <img id="m1" class="aruco-marker" src="/marker/1" alt="">
@@ -1368,14 +1406,31 @@ document.querySelectorAll('.dict-btn').forEach(btn => {
 // (already handled inline in ws.onmessage below)
 
 // ── Scene cam refresh ─────────────────────────────────────────────────────────
-// Scene cam — MJPEG stream, browser pulls frames automatically at camera FPS
-const sceneImg = document.getElementById('scene-view');
-sceneImg.src = '/scene_stream';
-sceneImg.style.display = 'block';
+// ── Cam view toggle (world ↔ eye) ────────────────────────────────────────────
+const sceneImg    = document.getElementById('scene-view');
+const camContainer= document.getElementById('cam-container');
+const btnWorld    = document.getElementById('btnWorld');
+const btnEye      = document.getElementById('btnEye');
+
+let camView = 'world';  // 'world' | 'eye'
+
+function startCamStream(view) {
+  camView = view;
+  const url = view === 'eye' ? '/eye_stream' : '/scene_stream';
+  sceneImg.src = url;
+  camContainer.style.display = 'flex';
+  btnWorld.classList.toggle('active', view === 'world');
+  btnEye.classList.toggle('active', view === 'eye');
+}
+
 sceneImg.onerror = () => {
-  // Retry after 1s if stream drops
-  setTimeout(() => { sceneImg.src = '/scene_stream?' + Date.now(); }, 1000);
+  setTimeout(() => startCamStream(camView), 1000);
 };
+
+startCamStream('world');
+
+btnWorld.onclick = () => startCamStream('world');
+btnEye.onclick   = () => startCamStream('eye');
 </script>
 </body>
 </html>"""
@@ -1622,15 +1677,16 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(jpg)
 
-        elif self.path == "/scene_stream":
+        elif self.path in ("/scene_stream", "/eye_stream"):
             self.send_response(200)
             self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
             self.send_header("Cache-Control", "no-cache")
             self.end_headers()
+            is_eye = self.path == "/eye_stream"
             try:
                 last_sent = None
                 while True:
-                    jpg = _last_scene_jpeg
+                    jpg = _last_eye_jpeg if is_eye else _last_scene_jpeg
                     if jpg is not None and jpg is not last_sent:
                         hdr = (b"--frame\r\nContent-Type: image/jpeg\r\n"
                                b"Content-Length: " + str(len(jpg)).encode() + b"\r\n\r\n")
@@ -1702,6 +1758,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 def main():
     threading.Thread(target=_scene_cam_thread, daemon=True).start()
+    threading.Thread(target=_eye_cam_thread,   daemon=True).start()
     threading.Thread(target=_eye_poll_thread,  daemon=True).start()
 
     server = ThreadedHTTPServer(("", 8090), Handler)
