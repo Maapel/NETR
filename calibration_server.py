@@ -87,6 +87,7 @@ _debug_lock = threading.Lock()
 _last_scene_jpeg: bytes | None = None   # annotated scene frame for /scene_frame
 _last_eye_jpeg:   bytes | None = None   # analyzed eye frame from engine /frame
 _last_pccr_ts: float = 0.0
+_last_homography_debug_jpeg: bytes | None = None  # plane-overlay debug frame
 
 # Saccade mode: directly collected fixation samples {dx, dy, X, Y, sx, sy}
 _saccade_samples: list[dict] = []
@@ -474,6 +475,66 @@ def _screen_to_scene(x: float, y: float) -> tuple[float, float] | None:
     return float(res[0][0][0]), float(res[0][0][1])
 
 
+def _make_homography_debug(frame_bgr: np.ndarray, H: np.ndarray) -> bytes:
+    """
+    Render a homography verification frame:
+      • Semi-transparent green quad showing the projected screen plane
+      • Corner marker centers (cyan dots)
+      • Active calibration target projected into scene space (red crosshair)
+    Saved to _last_homography_debug_jpeg on each new homography.
+    """
+    out = frame_bgr.copy()
+
+    with _screen_markers_lock:
+        sm = dict(_screen_markers)
+
+    # Screen corners in screen space ordered TL→TR→BR→BL (IDs 0,1,3,2)
+    corner_order = [0, 1, 3, 2]
+    if all(i in sm for i in corner_order):
+        screen_quad = np.array([[sm[i]] for i in corner_order], dtype=np.float32)
+        # Project all 4 corners through H into scene space
+        scene_quad = cv2.perspectiveTransform(screen_quad, H)
+        pts = scene_quad.reshape(-1, 1, 2).astype(np.int32)
+
+        # Semi-transparent fill (30% opacity green)
+        overlay = out.copy()
+        cv2.fillPoly(overlay, [pts], (0, 200, 60))
+        cv2.addWeighted(overlay, 0.30, out, 0.70, 0, out)
+
+        # Border
+        cv2.polylines(out, [pts], isClosed=True, color=(0, 255, 80), thickness=2)
+
+        # Corner dots + labels
+        labels = {0: "TL", 1: "TR", 2: "BL", 3: "BR"}
+        for idx, sid in enumerate(corner_order):
+            px = int(scene_quad[idx, 0, 0])
+            py = int(scene_quad[idx, 0, 1])
+            cv2.circle(out, (px, py), 7, (0, 255, 255), -1)
+            cv2.putText(out, labels[sid], (px + 9, py - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
+
+    # Active calibration target
+    with _pending_lock:
+        tgt = _pending_target
+    if tgt is not None:
+        pt = np.array([[[tgt["x"], tgt["y"]]]], dtype=np.float32)
+        sc = cv2.perspectiveTransform(pt, H)[0][0]
+        tx, ty = int(sc[0]), int(sc[1])
+        cv2.circle(out, (tx, ty), 14, (0, 0, 255), -1)
+        cv2.circle(out, (tx, ty), 14, (255, 255, 255), 2)
+        cv2.line(out, (tx - 22, ty), (tx + 22, ty), (255, 255, 255), 1)
+        cv2.line(out, (tx, ty - 22), (tx, ty + 22), (255, 255, 255), 1)
+        cv2.putText(out, f"target ({tgt['x']:.0f},{tgt['y']:.0f})",
+                    (tx + 17, ty + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1, cv2.LINE_AA)
+
+    # Timestamp watermark
+    cv2.putText(out, f"homography check  {time.strftime('%H:%M:%S')}",
+                (6, out.shape[0] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1, cv2.LINE_AA)
+
+    _, jpg = cv2.imencode(".jpg", out, [cv2.IMWRITE_JPEG_QUALITY, 90])
+    return jpg.tobytes()
+
+
 # ── Scene cam poller ──────────────────────────────────────────────────────────
 def _scene_cam_thread():
     """Periodically grab a frame from the receiver MJPEG stream and update homography."""
@@ -524,6 +585,8 @@ def _scene_cam_thread():
                             _homography = H
                         with _debug_lock:
                             _debug["homography_ok"] = True
+                        global _last_homography_debug_jpeg
+                        _last_homography_debug_jpeg = _make_homography_debug(frame, H)
                     else:
                         print("[scene] Waiting for marker positions from browser (resize the window or move slider)…")
                 else:
@@ -1922,6 +1985,17 @@ class Handler(BaseHTTPRequestHandler):
 
         elif self.path == "/scene_frame":
             jpg = _last_scene_jpeg
+            if jpg is None:
+                self.send_response(503); self.end_headers(); return
+            self.send_response(200)
+            self.send_header("Content-Type", "image/jpeg")
+            self.send_header("Content-Length", str(len(jpg)))
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            self.wfile.write(jpg)
+
+        elif self.path == "/homography_debug":
+            jpg = _last_homography_debug_jpeg
             if jpg is None:
                 self.send_response(503); self.end_headers(); return
             self.send_response(200)
