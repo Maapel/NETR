@@ -994,12 +994,12 @@ def _handle_ws(rfile, wfile):
 
             elif mtype == "stop":
                 _calibrating = False
-                if _calib_mode == "saccade":
-                    with _saccade_lock:
-                        samples = list(_saccade_samples)
-                else:
-                    sw, sh = _last_screen_size
-                    samples = _sync_and_build_dataset(sw, sh)
+                # Flush the last pending target (fixation handler only flushes
+                # the *previous* target when a new one arrives, so the final
+                # point is never flushed otherwise).
+                _flush_pending_target()
+                with _saccade_lock:
+                    samples = list(_saccade_samples)
                 # Save samples to recording
                 if _recording and _rec_dir:
                     try:
