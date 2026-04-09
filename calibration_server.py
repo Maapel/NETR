@@ -214,19 +214,19 @@ def _flush_pending_target():
 
     # Build per-sample synced tuples: fetch world frame at each eye timestamp
     synced: list[tuple] = []   # (dx, dy, X, Y, r|nan)
-    aruco_miss = 0
+    miss_no_frame = miss_no_aruco = miss_no_homo = 0
     for e in eyes:
         frame = _fetch_world_frame_at(e["ts"])
         if frame is None:
-            aruco_miss += 1
+            miss_no_frame += 1
             continue
         detected, _ = _detect_aruco_corners(frame)
         if not detected:
-            aruco_miss += 1
+            miss_no_aruco += 1
             continue
         H = _compute_homography(detected)
         if H is None:
-            aruco_miss += 1
+            miss_no_homo += 1
             continue
         pt = np.array([[[sx, sy]]], dtype=np.float32)
         sc = cv2.perspectiveTransform(pt, H)[0][0]
@@ -234,7 +234,8 @@ def _flush_pending_target():
         synced.append((e["dx"], e["dy"], float(sc[0]), float(sc[1]), r))
 
     n_synced = len(synced)
-    print(f"[calib] Target ({sx:.0f},{sy:.0f}) n={len(eyes)} synced={n_synced} aruco_miss={aruco_miss}")
+    print(f"[calib] Target ({sx:.0f},{sy:.0f}) n={len(eyes)} synced={n_synced} "
+          f"miss(no_frame={miss_no_frame} no_aruco={miss_no_aruco} no_homo={miss_no_homo})")
     if n_synced == 0:
         print(f"[calib] No synced samples for target ({sx:.0f},{sy:.0f}) — skipped")
         return

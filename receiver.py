@@ -222,8 +222,8 @@ HTTP_PORT      = 8080
 DISCOVERY_PORT = 5004
 TIMESYNC_PORT  = 5005
 FRAME_TIMEOUT  = 0.25    # discard incomplete frames older than this (s)
-SYNC_WINDOW_US = 200_000 # max |ts1-ts2| to call frames "paired" (200 ms)
-RECENT_BUF_US  = 500_000 # how long to keep frames for pairing (500 ms)
+SYNC_WINDOW_US = 200_000  # max |ts1-ts2| to call frames "paired" (200 ms)
+RECENT_BUF_US  = 10_000_000  # keep 10 s of frames — flush runs at next fixation (2-3 s later)
 
 HDR      = struct.Struct("<IHHq")
 HDR_SIZE = HDR.size   # 16 bytes
