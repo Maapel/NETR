@@ -302,7 +302,7 @@ def _scene_cam_thread():
                 _debug["scene_cam_error"] = err
                 _debug["homography_ok"] = False
             print(f"[scene] Error fetching {snap_url}: {err}")
-        time.sleep(0.15)  # ~6-7 fps for scene cam view
+        time.sleep(0.05)  # ~20 fps
 
 _last_screen_size = [0, 0]   # updated by websocket messages
 
@@ -1201,22 +1201,14 @@ document.querySelectorAll('.dict-btn').forEach(btn => {
 // (already handled inline in ws.onmessage below)
 
 // ── Scene cam refresh ─────────────────────────────────────────────────────────
-// Refresh scene frame via fetch so a 503/error doesn't put img into broken state
-function refreshScene() {
-  fetch('/scene_frame')
-    .then(r => r.ok ? r.blob() : null)
-    .then(blob => {
-      if (!blob) return;
-      const img = document.getElementById('scene-view');
-      const old = img.src;
-      img.src = URL.createObjectURL(blob);
-      img.style.display = 'block';
-      if (old.startsWith('blob:')) URL.revokeObjectURL(old);
-    })
-    .catch(() => {});
-}
-refreshScene();
-setInterval(refreshScene, 150);  // ~6-7 fps
+// Scene cam — MJPEG stream, browser pulls frames automatically at camera FPS
+const sceneImg = document.getElementById('scene-view');
+sceneImg.src = '/scene_stream';
+sceneImg.style.display = 'block';
+sceneImg.onerror = () => {
+  // Retry after 1s if stream drops
+  setTimeout(() => { sceneImg.src = '/scene_stream?' + Date.now(); }, 1000);
+};
 </script>
 </body>
 </html>"""
@@ -1341,6 +1333,26 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-cache")
             self.end_headers()
             self.wfile.write(jpg)
+
+        elif self.path == "/scene_stream":
+            self.send_response(200)
+            self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            try:
+                last_sent = None
+                while True:
+                    jpg = _last_scene_jpeg
+                    if jpg is not None and jpg is not last_sent:
+                        hdr = (b"--frame\r\nContent-Type: image/jpeg\r\n"
+                               b"Content-Length: " + str(len(jpg)).encode() + b"\r\n\r\n")
+                        self.wfile.write(hdr + jpg + b"\r\n")
+                        self.wfile.flush()
+                        last_sent = jpg
+                    else:
+                        time.sleep(0.01)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
 
         elif self.path == "/live":
             # Fetch current pccr_vector from receiver, predict screen position
