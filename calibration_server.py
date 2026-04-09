@@ -88,6 +88,9 @@ _last_scene_jpeg: bytes | None = None   # annotated scene frame for /scene_frame
 _last_eye_jpeg:   bytes | None = None   # analyzed eye frame from engine /frame
 _last_pccr_ts: float = 0.0
 _last_homography_debug_jpeg: bytes | None = None  # plane-overlay debug frame
+HOMOGRAPHY_DEBUG_DIR = pathlib.Path(__file__).parent / "homography_debug"
+HOMOGRAPHY_DEBUG_DIR.mkdir(exist_ok=True)
+_last_homography_debug_save_ts: float = 0.0   # throttle: save at most 1/sec
 
 # Saccade mode: directly collected fixation samples {dx, dy, X, Y, sx, sy}
 _saccade_samples: list[dict] = []
@@ -585,8 +588,13 @@ def _scene_cam_thread():
                             _homography = H
                         with _debug_lock:
                             _debug["homography_ok"] = True
-                        global _last_homography_debug_jpeg
+                        global _last_homography_debug_jpeg, _last_homography_debug_save_ts
                         _last_homography_debug_jpeg = _make_homography_debug(frame, H)
+                        now = time.time()
+                        if now - _last_homography_debug_save_ts >= 1.0:
+                            _last_homography_debug_save_ts = now
+                            fname = HOMOGRAPHY_DEBUG_DIR / f"{time.strftime('%Y%m%d_%H%M%S')}.jpg"
+                            fname.write_bytes(_last_homography_debug_jpeg)
                     else:
                         print("[scene] Waiting for marker positions from browser (resize the window or move slider)…")
                 else:
