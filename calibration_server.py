@@ -209,7 +209,7 @@ def _flush_pending_target():
     sx, sy = target["x"], target["y"]
 
     # Build per-sample synced tuples: fetch world frame at each eye timestamp
-    synced: list[tuple[float, float, float, float]] = []   # (dx, dy, X, Y)
+    synced: list[tuple] = []   # (dx, dy, X, Y, r|nan)
     aruco_miss = 0
     for e in eyes:
         frame = _fetch_world_frame_at(e["ts"])
@@ -226,7 +226,8 @@ def _flush_pending_target():
             continue
         pt = np.array([[[sx, sy]]], dtype=np.float32)
         sc = cv2.perspectiveTransform(pt, H)[0][0]
-        synced.append((e["dx"], e["dy"], float(sc[0]), float(sc[1])))
+        r  = e.get("r", float("nan"))
+        synced.append((e["dx"], e["dy"], float(sc[0]), float(sc[1]), r))
 
     n_synced = len(synced)
     print(f"[calib] Target ({sx:.0f},{sy:.0f}) n={len(eyes)} synced={n_synced} aruco_miss={aruco_miss}")
@@ -238,6 +239,26 @@ def _flush_pending_target():
     dys = _np.array([s[1] for s in synced])
     Xs  = _np.array([s[2] for s in synced])
     Ys  = _np.array([s[3] for s in synced])
+
+    # Radius pre-filter: drop blink/occlusion frames before IQR.
+    # A biological pupil cannot jump >15% instantaneously — any frame that does
+    # is an eyelid artifact (eyelid slicing the contour during a blink).
+    radii = _np.array([s[4] for s in synced], dtype=float)
+    if not _np.all(_np.isnan(radii)):
+        r_med = _np.nanmedian(radii)
+        if r_med > 0:
+            blink_mask = _np.abs(radii - r_med) <= 0.15 * r_med
+            n_blink = int((~blink_mask).sum())
+            if n_blink:
+                print(f"[calib] Blink filter: dropped {n_blink}/{len(synced)} frames "
+                      f"(r_med={r_med:.1f}, threshold=±{0.15*r_med:.1f}px)")
+            if not _np.any(blink_mask):
+                print(f"[calib] All frames failed blink filter for ({sx:.0f},{sy:.0f}) — discarding target")
+                return
+            dxs = dxs[blink_mask]
+            dys = dys[blink_mask]
+            Xs  = Xs[blink_mask]
+            Ys  = Ys[blink_mask]
 
     # Drop frozen (all identical) — tracking stuck
     if dxs.std() == 0 and dys.std() == 0:
@@ -2017,7 +2038,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if self.path == "/push_eye":
             # Receiver pushes PCCR for a single eye frame during the capture window.
-            # Body: {"ts": float_ms, "dx": float, "dy": float, "x": float, "y": float}
+            # Body: {"ts": float_ms, "dx": float, "dy": float, "x": float, "y": float, "r": float}
             # ts is the camera's own capture timestamp (synced to laptop clock).
             try:
                 d = json.loads(body)
@@ -2026,6 +2047,8 @@ class Handler(BaseHTTPRequestHandler):
                     "dx": float(d["dx"]),
                     "dy": float(d["dy"]),
                 }
+                if "r" in d:
+                    entry["r"] = float(d["r"])
                 # Also buffer for display/debug
                 with _eye_lock:
                     _eye_buf.append(entry)

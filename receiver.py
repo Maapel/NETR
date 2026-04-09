@@ -53,11 +53,14 @@ g_calib_lock   = threading.Lock()
 
 CALIB_URL = "http://localhost:8090"
 
-def _push_to_calib(ts_ms: float, dx: float, dy: float, x: float, y: float):
+def _push_to_calib(ts_ms: float, dx: float, dy: float, x: float, y: float, r: float | None = None):
     """Fire-and-forget push of a single eye frame to the calibration server."""
     import urllib.request
     try:
-        body = json.dumps({"ts": ts_ms, "dx": dx, "dy": dy, "x": x, "y": y}).encode()
+        payload: dict = {"ts": ts_ms, "dx": dx, "dy": dy, "x": x, "y": y}
+        if r is not None:
+            payload["r"] = r
+        body = json.dumps(payload).encode()
         req  = urllib.request.Request(
             CALIB_URL + "/push_eye",
             data=body,
@@ -71,7 +74,7 @@ def _push_to_calib(ts_ms: float, dx: float, dy: float, x: float, y: float):
 # ── Compute engine client ─────────────────────────────────────────────────────
 ENGINE_URL = "http://localhost:8081"
 
-def _engine_push(jpeg: bytes) -> tuple[bytes | None, tuple[float, float] | None, float]:
+def _engine_push(jpeg: bytes) -> tuple[bytes | None, tuple[float, float] | None, float, float | None]:
     """POST a JPEG frame to engine. Returns (annotated_jpeg, pccr, frame_ts_ms).
     PCCR and timestamp come from response headers — same-frame, no extra round-trip."""
     import urllib.request
@@ -87,11 +90,13 @@ def _engine_push(jpeg: bytes) -> tuple[bytes | None, tuple[float, float] | None,
             dx_h    = hdrs.get("X-Pccr-Dx")
             dy_h    = hdrs.get("X-Pccr-Dy")
             ts_h    = hdrs.get("X-Pccr-Ts")
+            rad_h   = hdrs.get("X-Pupil-Radius")
             pccr    = (float(dx_h), float(dy_h)) if dx_h and dy_h else None
             ts_ms   = float(ts_h) * 1000 if ts_h else time.time() * 1000
-            return r.read(), pccr, ts_ms
+            radius  = float(rad_h) if rad_h else None
+            return r.read(), pccr, ts_ms, radius
     except Exception:
-        return None, None, time.time() * 1000
+        return None, None, time.time() * 1000, None
 
 def _engine_get_result() -> dict | None:
     import urllib.request
@@ -185,7 +190,7 @@ def _apply_pupil_overlay(data: bytes, roi: list[float] = None,
         except Exception:
             pass
 
-    annotated, pccr, engine_ts_ms = _engine_push(data)
+    annotated, pccr, engine_ts_ms, pupil_radius = _engine_push(data)
 
     # Use camera capture timestamp when available — it's when the frame was actually
     # taken, not when the engine finished processing it.
@@ -200,7 +205,7 @@ def _apply_pupil_overlay(data: bytes, roi: list[float] = None,
         if win is not None and win["from_ms"] <= ts_ms <= win["until_ms"]:
             threading.Thread(
                 target=_push_to_calib,
-                args=(ts_ms, pccr[0], pccr[1], win["x"], win["y"]),
+                args=(ts_ms, pccr[0], pccr[1], win["x"], win["y"], pupil_radius),
                 daemon=True,
             ).start()
 

@@ -232,6 +232,8 @@ class Handler(BaseHTTPRequestHandler):
             if res and res.pccr_vector:
                 self.send_header("X-Pccr-Dx", f"{res.pccr_vector[0]:.4f}")
                 self.send_header("X-Pccr-Dy", f"{res.pccr_vector[1]:.4f}")
+            if res and res.pupil_radius is not None:
+                self.send_header("X-Pupil-Radius", f"{res.pupil_radius:.2f}")
             self.end_headers()
             self.wfile.write(annotated)
         except BrokenPipeError:
