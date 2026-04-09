@@ -580,7 +580,8 @@ button:hover { background: #222; }
 button:disabled { opacity: 0.4; cursor: default; }
 button.mode { background: #1a1a1a; }
 button.mode.active { background: #333; color: #ffcc00; border-color: #ffcc00; }
-button.live-on { background: #1a3320; color: #44ff88; border-color: #44ff88; }
+button.live-on    { background: #1a3320; color: #44ff88; border-color: #44ff88; }
+button.paused-on  { background: #2a1a0a; color: #ffaa44; border-color: #ffaa44; }
 #status {
   color: #888; font-size: 13px; min-width: 320px; text-align: center;
 }
@@ -619,6 +620,7 @@ button.live-on { background: #1a3320; color: #44ff88; border-color: #44ff88; }
   <button id="btnStart">START</button>
   <button id="btnStop" disabled>STOP</button>
   <button id="btnLive" disabled>LIVE OFF</button>
+  <button id="btnPause">⏸ Pause Streams</button>
   <span id="status">Connecting…</span>
 </div>
 <div id="debug-panel">
@@ -649,6 +651,22 @@ const btnStop   = document.getElementById('btnStop');
 const btnLive   = document.getElementById('btnLive');
 const btnSweep  = document.getElementById('btnSweep');
 const btnSaccade= document.getElementById('btnSaccade');
+const btnPause  = document.getElementById('btnPause');
+
+let streamsPaused = false;
+btnPause.onclick = () => {
+  streamsPaused = !streamsPaused;
+  fetch(`http://localhost:8080/set?pause_streams=${streamsPaused ? 1 : 0}`)
+    .then(r => r.json())
+    .catch(() => {});
+  if (streamsPaused) {
+    btnPause.textContent = '▶ Resume Streams';
+    btnPause.classList.add('paused-on');
+  } else {
+    btnPause.textContent = '⏸ Pause Streams';
+    btnPause.classList.remove('paused-on');
+  }
+};
 
 let W, H;
 function resize() {

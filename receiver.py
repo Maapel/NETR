@@ -39,6 +39,7 @@ except ImportError as e:
 
 g_analysis_enabled = False   # toggled via /set?analysis=1|0
 g_debug_view = "original"    # passed through to engine
+g_streams_paused = False     # toggled via /set?pause_streams=1|0 — stops MJPEG pushes
 
 import rig_config as _rig_cfg
 g_eye_cam = _rig_cfg.eye_cam()   # which cam runs the eye pipeline
@@ -358,6 +359,8 @@ class MJPEGHandler(BaseHTTPRequestHandler):
             "sync_offset_ms": round(sync_offset_ms, 1),
             "pccr_vector": list(g_latest_pccr) if g_latest_pccr else None,
             "eye_cam": g_eye_cam,
+            "streams_paused": g_streams_paused,
+            "analysis_enabled": g_analysis_enabled,
         }).encode()
         try:
             self.send_response(200)
@@ -649,12 +652,15 @@ class MJPEGHandler(BaseHTTPRequestHandler):
     }
 
     def _set_cmd(self, query: str):
-        global g_analysis_enabled, g_settings, g_debug_view
+        global g_analysis_enabled, g_settings, g_debug_view, g_streams_paused
         import urllib.parse
         params = dict(urllib.parse.parse_qsl(query))
         cmds = []
         if "analysis" in params:
             g_analysis_enabled = params["analysis"] != "0"
+
+        if "pause_streams" in params:
+            g_streams_paused = params["pause_streams"] != "0"
 
         if "eye_cam" in params:
             global g_eye_cam
@@ -764,6 +770,9 @@ class MJPEGHandler(BaseHTTPRequestHandler):
         self.end_headers()
         try:
             while True:
+                if g_streams_paused:
+                    time.sleep(0.1)
+                    continue
                 cam.frame_event.wait(timeout=2)
                 cam.frame_event.clear()
                 with cam.frame_lock:
