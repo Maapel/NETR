@@ -39,7 +39,9 @@ except ImportError as e:
 
 g_analysis_enabled = False   # toggled via /set?analysis=1|0
 g_debug_view = "original"    # passed through to engine
-g_eye_cam = 2                # which cam runs the eye pipeline (1 or 2)
+
+import rig_config as _rig_cfg
+g_eye_cam = _rig_cfg.eye_cam()   # which cam runs the eye pipeline
 g_latest_pccr: tuple[float, float] | None = None  # cached from engine /result
 
 # ── Compute engine client ─────────────────────────────────────────────────────
@@ -658,6 +660,7 @@ class MJPEGHandler(BaseHTTPRequestHandler):
             global g_eye_cam
             try:
                 g_eye_cam = int(params["eye_cam"])
+                _rig_cfg.save({"eye_cam": g_eye_cam, "world_cam": 3 - g_eye_cam})
             except ValueError:
                 pass
         

@@ -33,9 +33,18 @@ import numpy as np
 
 from gaze_model import GazeModel
 
+# ── Rig config ────────────────────────────────────────────────────────────────
+import sys as _sys
+_sys.path.insert(0, str(pathlib.Path(__file__).parent))
+try:
+    import rig_config as _rig_cfg
+    _WORLD_CAM = _rig_cfg.world_cam()
+except Exception:
+    _WORLD_CAM = 1
+
 # ── Config ────────────────────────────────────────────────────────────────────
 RECEIVER_URL  = "http://localhost:8080"
-SCENE_CAM_ID  = 1          # which cam to use for ArUco detection
+SCENE_CAM_ID  = _WORLD_CAM     # which cam to use for ArUco detection (world cam from rig_config)
 ARUCO_DICT    = cv2.aruco.DICT_4X4_50
 ARUCO_IDS     = [0, 1, 2, 3]   # TL, TR, BL, BR order
 SYNC_WINDOW_MS = 20         # max ms between target coord and eye vector
@@ -896,6 +905,7 @@ def main():
 
     server = ThreadedHTTPServer(("", 8090), Handler)
     print("Calibration server on http://localhost:8090")
+    print(f"Scene cam: cam{SCENE_CAM_ID} (world cam from rig_config)")
     print(f"Scene cam: cam{SCENE_CAM_ID} via {RECEIVER_URL}")
     print(f"Model path: {MODEL_PATH}")
     if _model.trained:

@@ -22,6 +22,7 @@ Debug UI calls GET/POST /settings.
 """
 
 import json
+import sys
 import time
 import threading
 import pathlib
@@ -38,6 +39,14 @@ from gaze_model import GazeModel
 _DIR = pathlib.Path(__file__).parent
 GAZE_MODEL_PATH   = _DIR.parent / "gaze_model.json"
 EYE_SETTINGS_PATH = _DIR.parent / "eye_settings.json"
+
+# ── Rig config ────────────────────────────────────────────────────────────────
+sys.path.insert(0, str(_DIR.parent))
+try:
+    import rig_config as _rig_cfg
+    EYE_CAM_ID = _rig_cfg.eye_cam()
+except Exception:
+    EYE_CAM_ID = 2
 
 # ── Pipeline ──────────────────────────────────────────────────────────────────
 _pipe = EyePipeline()
@@ -347,6 +356,7 @@ ENGINE_PORT = 8081
 def main():
     server = ThreadedHTTPServer(("", ENGINE_PORT), Handler)
     print(f"Compute engine on http://localhost:{ENGINE_PORT}")
+    print(f"Eye cam: cam{EYE_CAM_ID} (from rig_config)")
     print(f"Gaze model: {'loaded' if _gaze_model.trained else 'not trained'}")
     try:
         server.serve_forever()

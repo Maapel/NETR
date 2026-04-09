@@ -70,9 +70,10 @@ static char          g_laptop_ip[24]      = "";  // empty until beacon received
 static char          g_last_laptop_ip[24] = "";  // last known — kept for logging after drop
 
 // Live-tunable settings (read by captureTask, written by cmdTask)
-static volatile int  g_jpeg_quality = 12;
-static volatile int  g_target_fps   = 30;
-static volatile int  g_framesize    = FRAMESIZE_QVGA;  // 320×240 default
+// Defaults match cam_settings.json (pushed by receiver on connect)
+static volatile int  g_jpeg_quality = 6;
+static volatile int  g_target_fps   = 14;
+static volatile int  g_framesize    = FRAMESIZE_HD;    // 1280×720
 // Set during OTA — pauses capture+send so WiFi bandwidth goes to the upload
 static volatile bool g_ota_active   = false;
 
@@ -142,12 +143,20 @@ static bool initCamera() {
     }
 
     sensor_t *s = esp_camera_sensor_get();
-    s->set_whitebal(s, 1);
+    // ── Sensor defaults (match cam_settings.json) ─────────────────────────────
+    s->set_framesize(s, (framesize_t)g_framesize);  // HD 1280×720
+    s->set_brightness(s, 0);
+    s->set_contrast(s, 0);
+    s->set_saturation(s, 0);
+    s->set_ae_level(s, 0);
+    s->set_whitebal(s, 1);       // AWB on
     s->set_awb_gain(s, 1);
-    s->set_exposure_ctrl(s, 1);
-    s->set_gain_ctrl(s, 1);
-    // Start at default working resolution (g_framesize = QVGA)
-    s->set_framesize(s, (framesize_t)g_framesize);
+    s->set_wb_mode(s, 0);        // auto WB
+    s->set_exposure_ctrl(s, 1);  // AEC on
+    s->set_aec2(s, 1);
+    s->set_gain_ctrl(s, 1);      // AGC on
+    s->set_hmirror(s, 1);
+    s->set_vflip(s, 1);
 
     Serial.println("Camera OK");
     return true;

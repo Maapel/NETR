@@ -342,13 +342,14 @@ class RigManager(App):
         self.eye_cam = 1 if self.eye_cam == 2 else 2
         btn = self.query_one("#btn-eye-cam", Button)
         btn.label = f"Eye: cam{self.eye_cam}"
+        world = 3 - self.eye_cam
+        import sys; sys.path.insert(0, str(ROOT))
         try:
-            urllib.request.urlopen(
-                f"http://localhost:8080/set?eye_cam={self.eye_cam}", timeout=1
-            ).close()
+            import rig_config
+            rig_config.save({"eye_cam": self.eye_cam, "world_cam": world})
         except Exception:
             pass
-        self.log_msg(f"Eye cam → [bold]cam{self.eye_cam}[/]", "sys")
+        self.log_msg(f"Eye cam → [bold]cam{self.eye_cam}[/] (world: cam{world}), saved to rig_config.json", "sys")
 
     # ── Pupil overlay toggle ──────────────────────────────────────────────────
     def _toggle_analysis(self):
