@@ -479,36 +479,26 @@ def _screen_to_scene(x: float, y: float) -> tuple[float, float] | None:
     return float(res[0][0][0]), float(res[0][0][1])
 
 
-def _make_homography_debug(frame_bgr: np.ndarray, H: np.ndarray) -> bytes:
-    """
-    Render a homography verification frame:
-      • Semi-transparent green quad showing the projected screen plane
-      • Corner marker centers (cyan dots)
-      • Active calibration target projected into scene space (red crosshair)
-    Saved to _last_homography_debug_jpeg on each new homography.
-    """
+def _render_homography_debug(frame_bgr: np.ndarray, H: np.ndarray,
+                              tgt: dict | None) -> np.ndarray:
+    """Render homography verification overlay onto a copy of frame_bgr. Returns BGR."""
     out = frame_bgr.copy()
 
     with _screen_markers_lock:
         sm = dict(_screen_markers)
 
-    # Screen corners in screen space ordered TL→TR→BR→BL (IDs 0,1,3,2)
+    # Screen corners ordered TL→TR→BR→BL (IDs 0,1,3,2)
     corner_order = [0, 1, 3, 2]
     if all(i in sm for i in corner_order):
         screen_quad = np.array([[sm[i]] for i in corner_order], dtype=np.float32)
-        # Project all 4 corners through H into scene space
-        scene_quad = cv2.perspectiveTransform(screen_quad, H)
+        scene_quad  = cv2.perspectiveTransform(screen_quad, H)
         pts = scene_quad.reshape(-1, 1, 2).astype(np.int32)
 
-        # Semi-transparent fill (30% opacity green)
         overlay = out.copy()
         cv2.fillPoly(overlay, [pts], (0, 200, 60))
         cv2.addWeighted(overlay, 0.30, out, 0.70, 0, out)
-
-        # Border
         cv2.polylines(out, [pts], isClosed=True, color=(0, 255, 80), thickness=2)
 
-        # Corner dots + labels
         labels = {0: "TL", 1: "TR", 2: "BL", 3: "BR"}
         for idx, sid in enumerate(corner_order):
             px = int(scene_quad[idx, 0, 0])
@@ -517,9 +507,6 @@ def _make_homography_debug(frame_bgr: np.ndarray, H: np.ndarray) -> bytes:
             cv2.putText(out, labels[sid], (px + 9, py - 5),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
 
-    # Active calibration target
-    with _pending_lock:
-        tgt = _pending_target
     if tgt is not None:
         pt = np.array([[[tgt["x"], tgt["y"]]]], dtype=np.float32)
         sc = cv2.perspectiveTransform(pt, H)[0][0]
@@ -531,12 +518,40 @@ def _make_homography_debug(frame_bgr: np.ndarray, H: np.ndarray) -> bytes:
         cv2.putText(out, f"target ({tgt['x']:.0f},{tgt['y']:.0f})",
                     (tx + 17, ty + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1, cv2.LINE_AA)
 
-    # Timestamp watermark
     cv2.putText(out, f"homography check  {time.strftime('%H:%M:%S')}",
                 (6, out.shape[0] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1, cv2.LINE_AA)
+    return out
 
+
+def _make_homography_debug(frame_bgr: np.ndarray, H: np.ndarray,
+                            tgt: dict | None) -> bytes:
+    out = _render_homography_debug(frame_bgr, H, tgt)
     _, jpg = cv2.imencode(".jpg", out, [cv2.IMWRITE_JPEG_QUALITY, 90])
     return jpg.tobytes()
+
+
+# ── Calibration shutter video ─────────────────────────────────────────────────
+_calib_video_buf:  list[np.ndarray] = []   # BGR frames for current window
+_calib_video_tgt:  dict | None = None      # target being recorded
+_calib_video_lock  = threading.Lock()
+
+
+def _write_calib_video(frames: list[np.ndarray], tgt: dict):
+    """Write accumulated BGR frames to homography_debug/<ts>_sx<x>_sy<y>.avi."""
+    if not frames:
+        return
+    h, w = frames[0].shape[:2]
+    ts   = time.strftime("%Y%m%d_%H%M%S")
+    path = HOMOGRAPHY_DEBUG_DIR / f"{ts}_sx{tgt['x']:.0f}_sy{tgt['y']:.0f}.avi"
+    fps  = len(frames) / 0.3   # window is 300 ms — preserve real timing
+    fps  = max(1.0, min(fps, 60.0))
+    vw   = cv2.VideoWriter(str(path),
+                           cv2.VideoWriter_fourcc(*"MJPG"),
+                           fps, (w, h))
+    for f in frames:
+        vw.write(f)
+    vw.release()
+    print(f"[calib] Saved shutter video ({len(frames)} frames, {fps:.1f}fps) → {path.name}")
 
 
 # ── Scene cam poller ──────────────────────────────────────────────────────────
@@ -590,12 +605,39 @@ def _scene_cam_thread():
                         with _debug_lock:
                             _debug["homography_ok"] = True
                         global _last_homography_debug_jpeg, _last_homography_debug_save_ts
-                        _last_homography_debug_jpeg = _make_homography_debug(frame, H)
-                        now = time.time()
-                        if now - _last_homography_debug_save_ts >= 1.0:
-                            _last_homography_debug_save_ts = now
-                            fname = HOMOGRAPHY_DEBUG_DIR / f"{time.strftime('%Y%m%d_%H%M%S')}.jpg"
-                            fname.write_bytes(_last_homography_debug_jpeg)
+                        with _pending_lock:
+                            tgt = _pending_target
+                        debug_bgr = _render_homography_debug(frame, H, tgt)
+                        _, _jpg = cv2.imencode(".jpg", debug_bgr,
+                                              [cv2.IMWRITE_JPEG_QUALITY, 90])
+                        _last_homography_debug_jpeg = _jpg.tobytes()
+                        # Accumulate into per-target shutter video
+                        with _calib_video_lock:
+                            if tgt is not None:
+                                if _calib_video_tgt != tgt:
+                                    # New target window opened — flush previous if any
+                                    if _calib_video_buf and _calib_video_tgt:
+                                        _prev = (_calib_video_buf[:], _calib_video_tgt)
+                                        threading.Thread(
+                                            target=_write_calib_video,
+                                            args=_prev, daemon=True).start()
+                                    _calib_video_buf.clear()
+                                    _calib_video_tgt = tgt
+                                _calib_video_buf.append(debug_bgr)
+                            else:
+                                if _calib_video_buf and _calib_video_tgt:
+                                    _prev = (_calib_video_buf[:], _calib_video_tgt)
+                                    threading.Thread(
+                                        target=_write_calib_video,
+                                        args=_prev, daemon=True).start()
+                                    _calib_video_buf.clear()
+                                    _calib_video_tgt = None
+                                # Still save periodic stills when not calibrating
+                                now = time.time()
+                                if now - _last_homography_debug_save_ts >= 1.0:
+                                    _last_homography_debug_save_ts = now
+                                    fname = HOMOGRAPHY_DEBUG_DIR / f"{time.strftime('%Y%m%d_%H%M%S')}.jpg"
+                                    fname.write_bytes(_last_homography_debug_jpeg)
                     else:
                         print("[scene] Waiting for marker positions from browser (resize the window or move slider)…")
                 else:
