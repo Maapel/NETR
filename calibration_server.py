@@ -796,6 +796,7 @@ button.rec-on     { animation: recblink 1.2s infinite; }
   <button id="btnStart">START</button>
   <button id="btnStop" disabled>STOP</button>
   <button id="btnLive" disabled>LIVE OFF</button>
+  <button onclick="window.open('/viz','_blank')">📊 Viz</button>
   <button id="btnRecord">⏺ Record</button>
   <button id="btnPause">⏸ Pause Streams</button>
   <span id="status">Connecting…</span>
@@ -1380,6 +1381,127 @@ sceneImg.onerror = () => {
 </html>"""
 
 
+_VIZ_HTML = """<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Calibration Data Viz</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: #111; color: #ccc; font-family: monospace; padding: 16px; }
+h2 { color: #fa0; margin-bottom: 12px; font-size: 15px; }
+.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+canvas { background: #1a1a1a; border: 1px solid #333; border-radius: 4px; display: block; width: 100%; }
+.panel { }
+.label { font-size: 12px; color: #888; margin-bottom: 6px; }
+.stats { font-size: 12px; color: #aaa; margin-top: 8px; line-height: 1.7; }
+.stats span { color: #ffcc00; }
+.warn { color: #ff5050; }
+</style></head>
+<body>
+<h2>Calibration Data Visualisation &nbsp;<a href="/viz" style="font-size:11px;color:#666" onclick="location.reload();return false">↻ refresh</a>
+  &nbsp;<a href="/" style="font-size:11px;color:#666">← back</a></h2>
+<div class="grid">
+  <div class="panel">
+    <div class="label">PCCR space (dx, dy) — colour = target X position</div>
+    <canvas id="cPccr" height="400"></canvas>
+    <div class="stats" id="statsPccr"></div>
+  </div>
+  <div class="panel">
+    <div class="label">Scene space (X, Y) from homography — colour = target X</div>
+    <canvas id="cScene" height="400"></canvas>
+    <div class="stats" id="statsScene"></div>
+  </div>
+  <div class="panel">
+    <div class="label">PCCR dx distribution per screen column (should spread left→right)</div>
+    <canvas id="cDxX" height="300"></canvas>
+  </div>
+  <div class="panel">
+    <div class="label">PCCR dy distribution per screen row (should spread top→bottom)</div>
+    <canvas id="cDyY" height="300"></canvas>
+  </div>
+</div>
+<div class="stats" id="statsGlobal" style="margin-top:14px"></div>
+<script>
+fetch('/viz/data').then(r=>r.json()).then(({samples, n, model_trained}) => {
+  if (!n) { document.getElementById('statsGlobal').textContent = 'No samples found.'; return; }
+
+  const dx = samples.map(s=>s.dx), dy = samples.map(s=>s.dy);
+  const sx = samples.map(s=>s.sx ?? s.X), sy = samples.map(s=>s.sy ?? s.Y);
+  const X  = samples.map(s=>s.X),  Y  = samples.map(s=>s.Y);
+
+  function stats(arr, name) {
+    const mn = Math.min(...arr), mx = Math.max(...arr);
+    const mean = arr.reduce((a,b)=>a+b,0)/arr.length;
+    const std  = Math.sqrt(arr.map(v=>(v-mean)**2).reduce((a,b)=>a+b,0)/arr.length);
+    return {mn, mx, mean, std, range: mx-mn,
+      html: `${name}: min=<span>${mn.toFixed(2)}</span> max=<span>${mx.toFixed(2)}</span> range=<span>${(mx-mn).toFixed(2)}</span> std=<span>${std.toFixed(2)}</span>`};
+  }
+
+  const sDx = stats(dx,'dx'), sDy = stats(dy,'dy');
+  const sX  = stats(X,'X'),   sY  = stats(Y,'Y');
+
+  const warn = (v, th, msg) => v < th ? `<span class="warn"> ⚠ ${msg}</span>` : '';
+
+  document.getElementById('statsPccr').innerHTML =
+    sDx.html + warn(sDx.range, 5, 'dx barely moves — pupil/glint not tracking?') + '<br>' +
+    sDy.html + warn(sDy.range, 5, 'dy barely moves — pupil/glint not tracking?');
+  document.getElementById('statsScene').innerHTML =
+    sX.html  + warn(sX.range, 50, 'scene X barely varies — homography wrong?') + '<br>' +
+    sY.html  + warn(sY.range, 50, 'scene Y barely varies — homography wrong?');
+  document.getElementById('statsGlobal').innerHTML =
+    `n=<span>${n}</span>  model_trained=<span>${model_trained}</span>` +
+    warn(sDx.range < 5 || sDy.range < 5, 1, 'PCCR not varying — eye pipeline likely not tracking') +
+    warn(sX.range < 50 || sY.range < 50, 1, 'Scene coords not varying — check homography');
+
+  // colour by screen X position
+  function hue(v, mn, mx) {
+    const t = (v-mn)/(mx-mn||1);
+    return `hsl(${Math.round(t*260)},90%,55%)`;
+  }
+
+  function scatter(id, xs, ys, colours, xLabel='', yLabel='') {
+    const c = document.getElementById(id);
+    const W = c.offsetWidth || 480, H = parseInt(c.getAttribute('height'));
+    c.width = W; c.height = H;
+    const ctx = c.getContext('2d');
+    const pad = 36;
+    const mnX=Math.min(...xs), mxX=Math.max(...xs);
+    const mnY=Math.min(...ys), mxY=Math.max(...ys);
+    const tx = v => pad + (v-mnX)/(mxX-mnX||1)*(W-2*pad);
+    const ty = v => H-pad - (v-mnY)/(mxY-mnY||1)*(H-2*pad);
+    // axes
+    ctx.strokeStyle='#444'; ctx.lineWidth=1;
+    ctx.strokeRect(pad, pad, W-2*pad, H-2*pad);
+    // grid
+    ctx.strokeStyle='#222'; ctx.setLineDash([3,3]);
+    for(let i=1;i<4;i++){
+      const gx=pad+(W-2*pad)*i/4, gy=pad+(H-2*pad)*i/4;
+      ctx.beginPath(); ctx.moveTo(gx,pad); ctx.lineTo(gx,H-pad); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(pad,gy); ctx.lineTo(W-pad,gy); ctx.stroke();
+    }
+    ctx.setLineDash([]);
+    // points
+    xs.forEach((x,i) => {
+      ctx.fillStyle = colours[i];
+      ctx.beginPath(); ctx.arc(tx(x), ty(ys[i]), 4, 0, Math.PI*2); ctx.fill();
+    });
+    // axis labels
+    ctx.fillStyle='#666'; ctx.font='10px monospace'; ctx.textAlign='center';
+    ctx.fillText(mnX.toFixed(1), pad, H-4);
+    ctx.fillText(mxX.toFixed(1), W-pad, H-4);
+    ctx.fillText(xLabel, W/2, H-4);
+    ctx.save(); ctx.translate(10, H/2); ctx.rotate(-Math.PI/2);
+    ctx.fillText(yLabel, 0, 0); ctx.restore();
+  }
+
+  const colours = sx.map((v,i) => hue(v, Math.min(...sx), Math.max(...sx)));
+  scatter('cPccr',  dx, dy, colours, 'dx', 'dy');
+  scatter('cScene', X,  Y,  colours, 'X(scene)', 'Y(scene)');
+  scatter('cDxX',   sx, dx, colours, 'screen X', 'dx');
+  scatter('cDyY',   sy, dy, colours, 'screen Y', 'dy');
+});
+</script></body></html>"""
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_): pass
 
@@ -1540,6 +1662,35 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+
+        elif self.path == "/viz" or self.path == "/viz/data":
+            # Load samples from disk (latest calib_dataset.json)
+            try:
+                with open(DATASET_PATH) as f:
+                    samples = json.load(f)
+            except Exception:
+                samples = []
+            with _saccade_lock:
+                live = list(_saccade_samples)
+            if live:
+                samples = live  # prefer in-memory if available
+
+            if self.path == "/viz/data":
+                body = json.dumps({"samples": samples,
+                                   "n": len(samples),
+                                   "model_trained": _model.trained}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            else:
+                body = _VIZ_HTML.encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
 
         else:
             self.send_response(404); self.end_headers()
