@@ -489,13 +489,16 @@ def _annotate_scene_frame(frame_bgr: np.ndarray, detected: dict | None, all_ids:
         scene_xy = _screen_to_scene(tgt["x"], tgt["y"])
         if scene_xy:
             tx, ty = int(scene_xy[0]), int(scene_xy[1])
-            # Filled circle + crosshair in bright red
-            cv2.circle(out, (tx, ty), 14, (0, 0, 255), -1)
-            cv2.circle(out, (tx, ty), 14, (255, 255, 255), 2)
-            cv2.line(out, (tx - 20, ty), (tx + 20, ty), (255, 255, 255), 1)
-            cv2.line(out, (tx, ty - 20), (tx, ty + 20), (255, 255, 255), 1)
-            cv2.putText(out, f"target ({tgt['x']:.0f},{tgt['y']:.0f})",
-                        (tx + 17, ty + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1, cv2.LINE_AA)
+            arm = 30
+            cv2.circle(out, (tx, ty), 16, (0, 0, 0),   3)
+            cv2.circle(out, (tx, ty), 16, (0, 0, 255),  2)
+            cv2.line(out, (tx - arm, ty), (tx + arm, ty), (0, 0, 0),   2)
+            cv2.line(out, (tx, ty - arm), (tx, ty + arm), (0, 0, 0),   2)
+            cv2.line(out, (tx - arm, ty), (tx + arm, ty), (0, 0, 255), 1)
+            cv2.line(out, (tx, ty - arm), (tx, ty + arm), (0, 0, 255), 1)
+            cv2.circle(out, (tx, ty), 3, (255, 255, 255), -1)
+            cv2.putText(out, f"({tgt['x']:.0f},{tgt['y']:.0f})",
+                        (tx + 20, ty - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1, cv2.LINE_AA)
     _, jpg = cv2.imencode(".jpg", out, [cv2.IMWRITE_JPEG_QUALITY, 75])
     return jpg.tobytes()
 
@@ -559,12 +562,19 @@ def _render_homography_debug(frame_bgr: np.ndarray, H: np.ndarray,
         pt = np.array([[[tgt["x"], tgt["y"]]]], dtype=np.float32)
         sc = cv2.perspectiveTransform(pt, H)[0][0]
         tx, ty = int(sc[0]), int(sc[1])
-        cv2.circle(out, (tx, ty), 14, (0, 0, 255), -1)
-        cv2.circle(out, (tx, ty), 14, (255, 255, 255), 2)
-        cv2.line(out, (tx - 22, ty), (tx + 22, ty), (255, 255, 255), 1)
-        cv2.line(out, (tx, ty - 22), (tx, ty + 22), (255, 255, 255), 1)
-        cv2.putText(out, f"target ({tgt['x']:.0f},{tgt['y']:.0f})",
-                    (tx + 17, ty + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1, cv2.LINE_AA)
+        # Thin outer ring — centre stays visible, easy to judge precision
+        cv2.circle(out, (tx, ty), 16, (0, 0, 0),   3)   # black shadow
+        cv2.circle(out, (tx, ty), 16, (0, 0, 255),  2)   # red ring
+        # Fine crosshair extending well beyond the ring
+        arm = 30
+        cv2.line(out, (tx - arm, ty), (tx + arm, ty), (0, 0, 0),   2)
+        cv2.line(out, (tx, ty - arm), (tx, ty + arm), (0, 0, 0),   2)
+        cv2.line(out, (tx - arm, ty), (tx + arm, ty), (0, 0, 255), 1)
+        cv2.line(out, (tx, ty - arm), (tx, ty + arm), (0, 0, 255), 1)
+        # Small filled centre dot so the exact pixel is unambiguous
+        cv2.circle(out, (tx, ty), 3, (255, 255, 255), -1)
+        cv2.putText(out, f"({tgt['x']:.0f},{tgt['y']:.0f})",
+                    (tx + 20, ty - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1, cv2.LINE_AA)
 
     cv2.putText(out, f"homography check  {time.strftime('%H:%M:%S')}",
                 (6, out.shape[0] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1, cv2.LINE_AA)
