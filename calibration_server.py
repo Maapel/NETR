@@ -47,7 +47,7 @@ RECEIVER_URL  = "http://localhost:8080"
 SCENE_CAM_ID  = _WORLD_CAM     # which cam to use for ArUco detection (world cam from rig_config)
 ARUCO_DICT    = cv2.aruco.DICT_4X4_50
 ARUCO_IDS     = [0, 1, 2, 3]   # TL, TR, BL, BR order
-SYNC_WINDOW_MS = 20         # max ms between target coord and eye vector
+SYNC_WINDOW_MS = 150        # max ms between target coord and eye vector
 MODEL_PATH    = pathlib.Path(__file__).parent / "gaze_model.json"
 DATASET_PATH  = pathlib.Path(__file__).parent / "calib_dataset.json"
 
@@ -329,12 +329,12 @@ def _eye_poll_thread():
                 if prev_vec_ok is not True:
                     print(f"[eye] pccr_vector OK: {vec}")
                     prev_vec_ok = True
-                if _calibrating:
-                    with _eye_lock:
-                        _eye_buf.append({"ts": ts, "dx": vec[0], "dy": vec[1]})
-                        cutoff = ts - 10000
-                        while _eye_buf and _eye_buf[0]["ts"] < cutoff:
-                            _eye_buf.pop(0)
+                # Always buffer — so data is ready the moment calibration starts
+                with _eye_lock:
+                    _eye_buf.append({"ts": ts, "dx": vec[0], "dy": vec[1]})
+                    cutoff = ts - 10000
+                    while _eye_buf and _eye_buf[0]["ts"] < cutoff:
+                        _eye_buf.pop(0)
             else:
                 age = ts - _last_pccr_ts if _last_pccr_ts else None
                 with _debug_lock:
@@ -880,6 +880,18 @@ document.getElementById('marker-size').addEventListener('input', function() {
   updateMarkers();
 });
 
+// ── Safe zone — avoids markers, HUD, and panels ───────────────────────────────
+function getSafeZone() {
+  const S    = Math.min(W, H) * markerPct / 100;
+  const mEnd = EDGE_PX + 2 * QUIET_PX + S + 30;  // past marker edge + gap
+  return {
+    x1: mEnd,
+    y1: Math.max(70, mEnd),          // below HUD (70px) and top markers
+    x2: W - mEnd,
+    y2: H - H * 0.38,                // above bottom panels (30vh) + bottom markers
+  };
+}
+
 // ── Sweep mode (reading lines) ────────────────────────────────────────────────
 const TARGET_R = 12;
 const LINES    = 7;
@@ -887,15 +899,13 @@ const LINE_MS  = 5000;
 const TOTAL_MS = LINES * LINE_MS;
 
 function readingPos(t) {
-  const pad  = Math.min(W, H) * 0.15;
-  const xMin = pad, xMax = W - pad;
-  const yMin = pad, yMax = H - pad;
+  const z = getSafeZone();
   const cycle   = t % TOTAL_MS;
   const lineIdx = Math.floor(cycle / LINE_MS);
   const lineT   = (cycle % LINE_MS) / LINE_MS;
   return {
-    x: xMin + lineT * (xMax - xMin),
-    y: yMin + (lineIdx / (LINES - 1)) * (yMax - yMin),
+    x: z.x1 + lineT * (z.x2 - z.x1),
+    y: z.y1 + (lineIdx / (LINES - 1)) * (z.y2 - z.y1),
   };
 }
 
@@ -935,17 +945,19 @@ function buildZoneSequence() {
 }
 
 function randomInZone(zoneIdx) {
-  const pad   = Math.min(W, H) * 0.12;
-  const cellW = (W - 2*pad) / 3;
-  const cellH = (H - 2*pad) / 3;
-  const inset = Math.min(cellW, cellH) * 0.15;
+  const z     = getSafeZone();
+  const zW    = z.x2 - z.x1;
+  const zH    = z.y2 - z.y1;
+  const cellW = zW / 3;
+  const cellH = zH / 3;
+  const inset = Math.min(cellW, cellH) * 0.12;
   const col   = ZONE_POS[zoneIdx][1];
   const row   = ZONE_POS[zoneIdx][0];
-  // Center zone snaps to exact screen center for the "true zero" baseline
-  if (zoneIdx === CENTER_ZONE) return { x: W / 2, y: H / 2 };
+  // Center zone snaps to safe-zone center for the "true zero" baseline
+  if (zoneIdx === CENTER_ZONE) return { x: z.x1 + zW/2, y: z.y1 + zH/2 };
   return {
-    x: pad + col * cellW + inset + Math.random() * (cellW - 2*inset),
-    y: pad + row * cellH + inset + Math.random() * (cellH - 2*inset),
+    x: z.x1 + col * cellW + inset + Math.random() * (cellW - 2*inset),
+    y: z.y1 + row * cellH + inset + Math.random() * (cellH - 2*inset),
   };
 }
 
