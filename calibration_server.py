@@ -292,7 +292,7 @@ def _screen_to_scene(x: float, y: float) -> tuple[float, float] | None:
 # ── Scene cam poller ──────────────────────────────────────────────────────────
 def _scene_cam_thread():
     """Periodically grab a frame from the receiver MJPEG stream and update homography."""
-    global _homography, _last_scene_jpeg
+    global _homography, _last_scene_jpeg, _rec_frame_n
     snap_url = f"{RECEIVER_URL}/jpeg/{SCENE_CAM_ID}"
     prev_aruco_count = -1
     while True:
