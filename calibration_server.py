@@ -654,19 +654,21 @@ const btnSaccade= document.getElementById('btnSaccade');
 const btnPause  = document.getElementById('btnPause');
 
 let streamsPaused = false;
-btnPause.onclick = () => {
-  streamsPaused = !streamsPaused;
-  fetch(`http://localhost:8080/set?pause_streams=${streamsPaused ? 1 : 0}`)
-    .then(r => r.json())
-    .catch(() => {});
-  if (streamsPaused) {
+function setStreamsPaused(val) {
+  streamsPaused = val;
+  fetch(`http://localhost:8080/set?pause_streams=${val ? 1 : 0}`).catch(() => {});
+  if (val) {
     btnPause.textContent = '▶ Resume Streams';
     btnPause.classList.add('paused-on');
   } else {
     btnPause.textContent = '⏸ Pause Streams';
     btnPause.classList.remove('paused-on');
   }
-};
+}
+// Auto-pause receiver MJPEG when calibration opens; resume on close
+setStreamsPaused(true);
+window.addEventListener('beforeunload', () => setStreamsPaused(false));
+btnPause.onclick = () => setStreamsPaused(!streamsPaused);
 
 let W, H;
 function resize() {
