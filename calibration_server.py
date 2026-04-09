@@ -66,6 +66,26 @@ _eye_lock = threading.Lock()
 _calibrating = False
 _calib_mode  = "sweep"   # "sweep" | "saccade"
 
+# ── Debug state ───────────────────────────────────────────────────────────────
+_debug = {
+    "scene_cam_ok": False,
+    "scene_cam_error": "",
+    "aruco_detected": 0,          # number of ArUco markers found in last frame
+    "aruco_ids": [],
+    "homography_ok": False,
+    "eye_poll_ok": False,
+    "eye_poll_error": "",
+    "pccr_vector": None,
+    "pccr_age_ms": None,          # ms since last valid pccr
+    "target_buf_size": 0,
+    "eye_buf_size": 0,
+    "last_sync_tried": 0,
+    "last_sync_matched": 0,
+}
+_debug_lock = threading.Lock()
+_last_scene_jpeg: bytes | None = None   # annotated scene frame for /scene_frame
+_last_pccr_ts: float = 0.0
+
 # Saccade mode: directly collected fixation samples {dx, dy, X, Y, sx, sy}
 _saccade_samples: list[dict] = []
 _saccade_lock = threading.Lock()
@@ -102,20 +122,48 @@ _homography: np.ndarray | None = None
 _homography_lock = threading.Lock()
 
 
-def _detect_aruco_corners(frame_bgr: np.ndarray) -> dict[int, np.ndarray] | None:
-    """Detect ArUco markers, return dict id->center or None if <4 found."""
+def _detect_aruco_corners(frame_bgr: np.ndarray) -> tuple[dict[int, np.ndarray] | None, list[int]]:
+    """Detect ArUco markers. Returns (dict id->center, list of all found ids). dict is None if <4 required found."""
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
     corners, ids, _ = _aruco_detector.detectMarkers(gray)
+    all_ids = ids.flatten().tolist() if ids is not None else []
     if ids is None or len(ids) < 4:
-        return None
+        return None, all_ids
     result = {}
     for i, mid in enumerate(ids.flatten()):
         if mid in ARUCO_IDS:
             c = corners[i][0]
-            result[int(mid)] = c.mean(axis=0)  # marker center
+            result[int(mid)] = c.mean(axis=0)
     if len(result) < 4:
-        return None
-    return result
+        return None, all_ids
+    return result, all_ids
+
+
+def _annotate_scene_frame(frame_bgr: np.ndarray, detected: dict | None, all_ids: list[int]) -> bytes:
+    """Draw ArUco detection results onto frame, return JPEG bytes."""
+    out = frame_bgr.copy()
+    h, w = out.shape[:2]
+    # Draw all detected markers
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    corners, ids, _ = _aruco_detector.detectMarkers(gray)
+    if ids is not None:
+        cv2.aruco.drawDetectedMarkers(out, corners, ids)
+    # Status overlay
+    status_color = (0, 220, 0) if detected else (0, 80, 255)
+    status_text  = f"ArUco: {len(all_ids)} found  IDs={all_ids}" if all_ids else "ArUco: none detected"
+    cv2.rectangle(out, (0, 0), (w, 28), (0, 0, 0), -1)
+    cv2.putText(out, status_text, (6, 19), cv2.FONT_HERSHEY_SIMPLEX, 0.55, status_color, 1, cv2.LINE_AA)
+    if detected:
+        cv2.putText(out, "HOMOGRAPHY OK", (w - 180, 19), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 220, 0), 1, cv2.LINE_AA)
+        for mid, center in detected.items():
+            cx, cy = int(center[0]), int(center[1])
+            cv2.circle(out, (cx, cy), 8, (0, 255, 255), -1)
+            cv2.putText(out, f"ID{mid}", (cx + 10, cy - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+    else:
+        need = set(ARUCO_IDS) - set(all_ids)
+        cv2.putText(out, f"MISSING IDs: {sorted(need)}", (w - 240, 19), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 80, 255), 1, cv2.LINE_AA)
+    _, jpg = cv2.imencode(".jpg", out, [cv2.IMWRITE_JPEG_QUALITY, 75])
+    return jpg.tobytes()
 
 
 def _compute_homography(scene_corners: dict[int, np.ndarray],
@@ -156,8 +204,9 @@ def _screen_to_scene(x: float, y: float) -> tuple[float, float] | None:
 # ── Scene cam poller ──────────────────────────────────────────────────────────
 def _scene_cam_thread():
     """Periodically grab a frame from the receiver MJPEG stream and update homography."""
-    global _homography
+    global _homography, _last_scene_jpeg
     snap_url = f"{RECEIVER_URL}/jpeg/{SCENE_CAM_ID}"
+    prev_aruco_count = -1
     while True:
         try:
             with urllib.request.urlopen(snap_url, timeout=2) as resp:
@@ -165,16 +214,46 @@ def _scene_cam_thread():
             arr = np.frombuffer(data, dtype=np.uint8)
             frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
             if frame is not None:
-                detected = _detect_aruco_corners(frame)
+                detected, all_ids = _detect_aruco_corners(frame)
+                # Store annotated frame for /scene_frame endpoint
+                _last_scene_jpeg = _annotate_scene_frame(frame, detected, all_ids)
+                n = len(all_ids)
+                with _debug_lock:
+                    _debug["scene_cam_ok"] = True
+                    _debug["scene_cam_error"] = ""
+                    _debug["aruco_detected"] = n
+                    _debug["aruco_ids"] = all_ids
+                if n != prev_aruco_count:
+                    print(f"[scene] ArUco: {n} markers found, IDs={all_ids}" +
+                          (f"  MISSING={sorted(set(ARUCO_IDS)-set(all_ids))}" if n < 4 else "  → homography OK"))
+                    prev_aruco_count = n
                 if detected:
-                    # Need screen dimensions — use last known from browser
                     sw, sh = _last_screen_size
                     if sw and sh:
                         H = _compute_homography(detected, sw, sh)
                         with _homography_lock:
                             _homography = H
-        except Exception:
-            pass
+                        with _debug_lock:
+                            _debug["homography_ok"] = True
+                    else:
+                        print("[scene] Waiting for screen size from browser…")
+                else:
+                    with _homography_lock:
+                        _homography = None
+                    with _debug_lock:
+                        _debug["homography_ok"] = False
+            else:
+                print(f"[scene] Frame decode failed (empty response from {snap_url})")
+                with _debug_lock:
+                    _debug["scene_cam_ok"] = False
+                    _debug["scene_cam_error"] = "frame decode failed"
+        except Exception as e:
+            err = str(e)
+            with _debug_lock:
+                _debug["scene_cam_ok"] = False
+                _debug["scene_cam_error"] = err
+                _debug["homography_ok"] = False
+            print(f"[scene] Error fetching {snap_url}: {err}")
         time.sleep(0.5)
 
 _last_screen_size = [0, 0]   # updated by websocket messages
@@ -183,23 +262,52 @@ _last_screen_size = [0, 0]   # updated by websocket messages
 # ── Eye vector poller ─────────────────────────────────────────────────────────
 def _eye_poll_thread():
     """Poll receiver /stats for live pccr_vector and buffer it."""
+    global _last_pccr_ts
     stats_url = f"{RECEIVER_URL}/stats"
+    prev_vec_ok = None
     while True:
-        if _calibrating:
-            try:
-                with urllib.request.urlopen(stats_url, timeout=1) as resp:
-                    d = json.loads(resp.read())
-                vec = d.get("pccr_vector")
-                if vec and len(vec) == 2:
-                    ts = time.time() * 1000  # ms
+        try:
+            with urllib.request.urlopen(stats_url, timeout=1) as resp:
+                d = json.loads(resp.read())
+            vec = d.get("pccr_vector")
+            ts = time.time() * 1000  # ms
+            if vec and len(vec) == 2:
+                _last_pccr_ts = ts
+                with _debug_lock:
+                    _debug["eye_poll_ok"] = True
+                    _debug["eye_poll_error"] = ""
+                    _debug["pccr_vector"] = [round(vec[0], 3), round(vec[1], 3)]
+                    _debug["pccr_age_ms"] = 0
+                if prev_vec_ok is not True:
+                    print(f"[eye] pccr_vector OK: {vec}")
+                    prev_vec_ok = True
+                if _calibrating:
                     with _eye_lock:
                         _eye_buf.append({"ts": ts, "dx": vec[0], "dy": vec[1]})
-                        # Keep last 10 seconds
                         cutoff = ts - 10000
                         while _eye_buf and _eye_buf[0]["ts"] < cutoff:
                             _eye_buf.pop(0)
-            except Exception:
-                pass
+            else:
+                age = ts - _last_pccr_ts if _last_pccr_ts else None
+                with _debug_lock:
+                    _debug["pccr_vector"] = None
+                    _debug["pccr_age_ms"] = round(age) if age else None
+                if prev_vec_ok is not False:
+                    analysis = d.get("analysis_enabled", "?")
+                    print(f"[eye] pccr_vector is null — analysis_enabled={analysis}. "
+                          "Check: engine running? analysis toggled on? eye cam correct?")
+                    prev_vec_ok = False
+        except Exception as e:
+            err = str(e)
+            with _debug_lock:
+                _debug["eye_poll_ok"] = False
+                _debug["eye_poll_error"] = err
+            if prev_vec_ok is not False:
+                print(f"[eye] Error polling {stats_url}: {err}")
+                prev_vec_ok = False
+        with _debug_lock:
+            _debug["target_buf_size"] = len(_target_buf)
+            _debug["eye_buf_size"] = len(_eye_buf)
         time.sleep(0.033)  # ~30 Hz
 
 
@@ -218,13 +326,26 @@ def _sync_and_build_dataset(screen_w: int, screen_h: int) -> list[dict]:
     if not targets or not eyes:
         return []
 
+    print(f"[sync] targets={len(targets)}  eye_samples={len(eyes)}")
+    if targets and eyes:
+        t_range = (targets[0]["ts"], targets[-1]["ts"])
+        e_range = (eyes[0]["ts"],   eyes[-1]["ts"])
+        print(f"[sync] target ts range: {t_range[0]:.0f}–{t_range[1]:.0f}")
+        print(f"[sync] eye    ts range: {e_range[0]:.0f}–{e_range[1]:.0f}")
+        overlap_ms = min(t_range[1], e_range[1]) - max(t_range[0], e_range[0])
+        print(f"[sync] ts overlap: {overlap_ms:.0f} ms  (need > 0 for matches)")
+
+    with _homography_lock:
+        has_H = _homography is not None
+    print(f"[sync] homography={'OK' if has_H else 'MISSING'}")
+
     samples = []
+    no_eye_match = 0
+    no_homography = 0
     ei = 0
     for t in targets:
-        # Binary-search for closest eye sample
         best = None
         best_dt = float("inf")
-        # Walk forward until we pass the window
         while ei < len(eyes) and eyes[ei]["ts"] < t["ts"] - SYNC_WINDOW_MS:
             ei += 1
         j = ei
@@ -235,14 +356,20 @@ def _sync_and_build_dataset(screen_w: int, screen_h: int) -> list[dict]:
                 best = eyes[j]
             j += 1
         if best is None:
+            no_eye_match += 1
             continue
 
         scene_xy = _screen_to_scene(t["x"], t["y"])
         if scene_xy is None:
+            no_homography += 1
             continue
         X, Y = scene_xy
         samples.append({"dx": best["dx"], "dy": best["dy"], "X": X, "Y": Y})
 
+    print(f"[sync] matched={len(samples)}  no_eye_match={no_eye_match}  no_homography={no_homography}")
+    with _debug_lock:
+        _debug["last_sync_tried"]   = len(targets)
+        _debug["last_sync_matched"] = len(samples)
     return samples
 
 
@@ -454,6 +581,27 @@ button.live-on { background: #1a3320; color: #44ff88; border-color: #44ff88; }
 #status {
   color: #888; font-size: 13px; min-width: 320px; text-align: center;
 }
+#debug-panel {
+  position: fixed; bottom: 12px; left: 12px; z-index: 20;
+  background: rgba(0,0,0,0.82); border: 1px solid #333; border-radius: 6px;
+  padding: 10px 14px; font-size: 12px; color: #ccc; min-width: 280px;
+  max-width: 340px;
+}
+#debug-panel h4 { color: #888; margin-bottom: 6px; font-size: 11px; letter-spacing: 1px; }
+#debug-panel .row { display: flex; justify-content: space-between; margin: 2px 0; }
+#debug-panel .ok  { color: #44ff88; }
+#debug-panel .err { color: #ff5050; }
+#debug-panel .warn{ color: #ffcc00; }
+#scene-view {
+  position: fixed; bottom: 12px; right: 12px; z-index: 20;
+  border: 1px solid #444; border-radius: 4px;
+  width: 320px; display: block;
+}
+#scene-label {
+  position: fixed; bottom: 12px; right: 12px; z-index: 21;
+  color: #888; font-size: 10px; background: rgba(0,0,0,0.6);
+  padding: 2px 6px; border-radius: 2px;
+}
 </style>
 </head>
 <body>
@@ -465,6 +613,20 @@ button.live-on { background: #1a3320; color: #44ff88; border-color: #44ff88; }
   <button id="btnLive" disabled>LIVE OFF</button>
   <span id="status">Connecting…</span>
 </div>
+<div id="debug-panel">
+  <h4>DEBUG</h4>
+  <div class="row"><span>Scene cam</span><span id="d-scene">…</span></div>
+  <div class="row"><span>ArUco</span><span id="d-aruco">…</span></div>
+  <div class="row"><span>Homography</span><span id="d-homo">…</span></div>
+  <div class="row"><span>PCCR vector</span><span id="d-pccr">…</span></div>
+  <div class="row"><span>Eye poll</span><span id="d-eye">…</span></div>
+  <div class="row"><span>Target buf</span><span id="d-tbuf">…</span></div>
+  <div class="row"><span>Eye buf</span><span id="d-ebuf">…</span></div>
+  <div class="row"><span>Screen size</span><span id="d-screen">…</span></div>
+  <div class="row"><span>Last sync</span><span id="d-sync">…</span></div>
+  <div class="row"><span>Saccade pts</span><span id="d-sacc">…</span></div>
+</div>
+<img id="scene-view" src="/scene_frame" alt="scene cam">
 <canvas id="c"></canvas>
 <script>
 const canvas = document.getElementById('c');
@@ -816,6 +978,48 @@ btnStop.onclick = () => {
   statusEl.textContent = 'Processing…';
   ws.send(JSON.stringify({type:'stop'}));
 };
+
+// ── Debug panel ───────────────────────────────────────────────────────────────
+function cls(id, c) {
+  const el = document.getElementById(id);
+  el.className = c;
+  return el;
+}
+function dbg(id, text, ok) {
+  const el = cls(id, ok === true ? 'ok' : ok === false ? 'err' : 'warn');
+  el.textContent = text;
+}
+
+function pollDebug() {
+  fetch('/debug').then(r => r.json()).then(d => {
+    dbg('d-scene', d.scene_cam_ok ? 'OK' : ('ERR: ' + d.scene_cam_error), d.scene_cam_ok);
+    const arucoOk = d.aruco_detected >= 4;
+    dbg('d-aruco', `${d.aruco_detected} found  IDs=[${d.aruco_ids}]`, arucoOk ? true : (d.aruco_detected > 0 ? null : false));
+    dbg('d-homo', d.homography_ok ? 'OK' : 'MISSING', d.homography_ok);
+    if (d.pccr_vector) {
+      dbg('d-pccr', `[${d.pccr_vector[0]}, ${d.pccr_vector[1]}]`, true);
+    } else {
+      dbg('d-pccr', 'null — analysis on?', false);
+    }
+    dbg('d-eye', d.eye_poll_ok ? 'OK' : ('ERR: ' + d.eye_poll_error), d.eye_poll_ok);
+    dbg('d-tbuf', d.target_buf_size, d.target_buf_size > 0 ? true : null);
+    dbg('d-ebuf', d.eye_buf_size, d.eye_buf_size > 0 ? true : null);
+    const ss = d.screen_size;
+    dbg('d-screen', ss && ss[0] ? `${ss[0]}×${ss[1]}` : 'not sent', ss && ss[0]);
+    dbg('d-sync', `tried=${d.last_sync_tried} matched=${d.last_sync_matched}`,
+        d.last_sync_matched > 0 ? true : (d.last_sync_tried > 0 ? false : null));
+    dbg('d-sacc', d.saccade_samples, d.saccade_samples >= 6 ? true : (d.saccade_samples > 0 ? null : false));
+  }).catch(() => {});
+}
+pollDebug();
+setInterval(pollDebug, 800);
+
+// Refresh scene frame image
+function refreshScene() {
+  const img = document.getElementById('scene-view');
+  img.src = '/scene_frame?' + Date.now();
+}
+setInterval(refreshScene, 600);
 </script>
 </body>
 </html>"""
@@ -870,6 +1074,34 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
 
+        elif self.path == "/debug":
+            with _debug_lock:
+                d = dict(_debug)
+            with _homography_lock:
+                d["homography_ok"] = _homography is not None
+            d["calibrating"]     = _calibrating
+            d["calib_mode"]      = _calib_mode
+            d["saccade_samples"] = len(_saccade_samples)
+            d["model_trained"]   = _model.trained
+            d["screen_size"]     = _last_screen_size
+            body = json.dumps(d).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        elif self.path == "/scene_frame":
+            jpg = _last_scene_jpeg
+            if jpg is None:
+                self.send_response(503); self.end_headers(); return
+            self.send_response(200)
+            self.send_header("Content-Type", "image/jpeg")
+            self.send_header("Content-Length", str(len(jpg)))
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            self.wfile.write(jpg)
+
         elif self.path == "/live":
             # Fetch current pccr_vector from receiver, predict screen position
             try:
@@ -905,8 +1137,7 @@ def main():
 
     server = ThreadedHTTPServer(("", 8090), Handler)
     print("Calibration server on http://localhost:8090")
-    print(f"Scene cam: cam{SCENE_CAM_ID} (world cam from rig_config)")
-    print(f"Scene cam: cam{SCENE_CAM_ID} via {RECEIVER_URL}")
+    print(f"Scene cam: cam{SCENE_CAM_ID} (world cam from rig_config) via {RECEIVER_URL}")
     print(f"Model path: {MODEL_PATH}")
     if _model.trained:
         print("Existing gaze model loaded.")
