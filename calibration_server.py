@@ -576,7 +576,7 @@ def _broadcast(msg: str):
 
 
 def _handle_ws(rfile, wfile):
-    global _calibrating
+    global _calibrating, _calib_mode
     with _ws_lock:
         _ws_clients.add(wfile)
     try:
@@ -622,7 +622,6 @@ def _handle_ws(rfile, wfile):
                                                       "recording": False, "path": rec_path}))
 
             elif mtype == "start":
-                global _calib_mode
                 _calibrating = True
                 _calib_mode  = msg.get("mode", "sweep")
                 with _target_lock:
