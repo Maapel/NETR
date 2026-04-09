@@ -408,6 +408,20 @@ def _annotate_scene_frame(frame_bgr: np.ndarray, detected: dict | None, all_ids:
     else:
         need = set(ARUCO_IDS) - set(all_ids)
         cv2.putText(out, f"MISSING IDs: {sorted(need)}", (w - 240, 19), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 80, 255), 1, cv2.LINE_AA)
+    # Project active calibration target onto scene frame
+    with _pending_lock:
+        tgt = _pending_target
+    if tgt is not None:
+        scene_xy = _screen_to_scene(tgt["x"], tgt["y"])
+        if scene_xy:
+            tx, ty = int(scene_xy[0]), int(scene_xy[1])
+            # Filled circle + crosshair in bright red
+            cv2.circle(out, (tx, ty), 14, (0, 0, 255), -1)
+            cv2.circle(out, (tx, ty), 14, (255, 255, 255), 2)
+            cv2.line(out, (tx - 20, ty), (tx + 20, ty), (255, 255, 255), 1)
+            cv2.line(out, (tx, ty - 20), (tx, ty + 20), (255, 255, 255), 1)
+            cv2.putText(out, f"target ({tgt['x']:.0f},{tgt['y']:.0f})",
+                        (tx + 17, ty + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1, cv2.LINE_AA)
     _, jpg = cv2.imencode(".jpg", out, [cv2.IMWRITE_JPEG_QUALITY, 75])
     return jpg.tobytes()
 
