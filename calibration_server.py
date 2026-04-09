@@ -110,25 +110,35 @@ _screen_model.load(SCREEN_MODEL_PATH)
 
 # ── Recording ─────────────────────────────────────────────────────────────────
 RECORDINGS_DIR = pathlib.Path(__file__).parent / "recordings"
-_recording       = False
+_recording         = False
 _rec_dir: pathlib.Path | None = None
-_rec_eye_f       = None   # open file handle for eye.jsonl
-_rec_target_f    = None   # open file handle for targets.jsonl
-_rec_fixation_f  = None   # open file handle for fixations.jsonl
-_rec_frame_n     = 0      # total frames seen during recording
-_rec_lock        = threading.Lock()
+_rec_eye_f         = None   # eye.jsonl
+_rec_target_f      = None   # targets.jsonl
+_rec_fixation_f    = None   # fixations.jsonl
+_rec_frame_n       = 0
+_rec_lock          = threading.Lock()
+_rec_world_writer: "cv2.VideoWriter | None" = None   # world cam AVI
+_rec_eye_writer:   "cv2.VideoWriter | None" = None   # eye cam AVI
+_rec_world_ts_f    = None   # world_cam_ts.txt  — one epoch-ms per line
+_rec_eye_ts_f      = None   # eye_cam_ts.txt
 
 
 def _rec_start(screen_w: int, screen_h: int, mode: str):
-    global _recording, _rec_dir, _rec_eye_f, _rec_target_f, _rec_fixation_f, _rec_frame_n
+    global _recording, _rec_dir, _rec_eye_f, _rec_target_f, _rec_fixation_f
+    global _rec_frame_n, _rec_world_writer, _rec_eye_writer
+    global _rec_world_ts_f, _rec_eye_ts_f
     ts = time.strftime("%Y%m%d_%H%M%S")
     d  = RECORDINGS_DIR / ts
-    (d / "frames").mkdir(parents=True, exist_ok=True)
-    _rec_dir      = d
-    _rec_frame_n  = 0
-    _rec_eye_f    = open(d / "eye.jsonl",      "w")
-    _rec_target_f = open(d / "targets.jsonl",  "w")
+    d.mkdir(parents=True, exist_ok=True)
+    _rec_dir        = d
+    _rec_frame_n    = 0
+    _rec_world_writer = None   # lazily created on first frame (need dimensions)
+    _rec_eye_writer   = None
+    _rec_eye_f      = open(d / "eye.jsonl",      "w")
+    _rec_target_f   = open(d / "targets.jsonl",  "w")
     _rec_fixation_f = open(d / "fixations.jsonl", "w")
+    _rec_world_ts_f = open(d / "world_cam_ts.txt", "w")
+    _rec_eye_ts_f   = open(d / "eye_cam_ts.txt",   "w")
     with open(d / "meta.json", "w") as f:
         json.dump({
             "screen_w": screen_w, "screen_h": screen_h,
@@ -141,12 +151,22 @@ def _rec_start(screen_w: int, screen_h: int, mode: str):
 
 
 def _rec_stop() -> str:
-    global _recording, _rec_dir, _rec_eye_f, _rec_target_f, _rec_fixation_f
+    global _recording, _rec_dir
+    global _rec_eye_f, _rec_target_f, _rec_fixation_f
+    global _rec_world_writer, _rec_eye_writer, _rec_world_ts_f, _rec_eye_ts_f
     _recording = False
-    for f in (_rec_eye_f, _rec_target_f, _rec_fixation_f):
-        try: f.close()
+    for w in (_rec_world_writer, _rec_eye_writer):
+        try:
+            if w: w.release()
+        except Exception: pass
+    _rec_world_writer = _rec_eye_writer = None
+    for f in (_rec_eye_f, _rec_target_f, _rec_fixation_f,
+              _rec_world_ts_f, _rec_eye_ts_f):
+        try:
+            if f: f.close()
         except Exception: pass
     _rec_eye_f = _rec_target_f = _rec_fixation_f = None
+    _rec_world_ts_f = _rec_eye_ts_f = None
     path = str(_rec_dir) if _rec_dir else ""
     print(f"[rec] Recording saved → {path}")
     return path
@@ -531,9 +551,10 @@ def _make_homography_debug(frame_bgr: np.ndarray, H: np.ndarray,
 
 
 # ── Calibration shutter video ─────────────────────────────────────────────────
-_calib_video_buf:  list[np.ndarray] = []   # BGR frames for current window
-_calib_video_tgt:  dict | None = None      # target being recorded
-_calib_video_lock  = threading.Lock()
+_calib_video_buf:    list[np.ndarray] = []   # BGR frames for current window
+_calib_video_tgt:    dict | None = None      # target being recorded
+_calib_video_tgt_id: int = -1               # id() of _calib_video_tgt for change detection
+_calib_video_lock    = threading.Lock()
 
 
 def _write_calib_video(frames: list[np.ndarray], tgt: dict):
@@ -554,10 +575,25 @@ def _write_calib_video(frames: list[np.ndarray], tgt: dict):
     print(f"[calib] Saved shutter video ({len(frames)} frames, {fps:.1f}fps) → {path.name}")
 
 
+def _flush_calib_video_buf():
+    """Flush any pending shutter video to disk (call at calibration stop)."""
+    global _calib_video_buf, _calib_video_tgt, _calib_video_tgt_id
+    buf = tgt = None
+    with _calib_video_lock:
+        if _calib_video_buf and _calib_video_tgt:
+            buf = _calib_video_buf[:]
+            tgt = _calib_video_tgt
+            _calib_video_buf.clear()
+            _calib_video_tgt    = None
+            _calib_video_tgt_id = -1
+    if buf and tgt:
+        threading.Thread(target=_write_calib_video, args=(buf, tgt), daemon=True).start()
+
+
 # ── Scene cam poller ──────────────────────────────────────────────────────────
 def _scene_cam_thread():
     """Periodically grab a frame from the receiver MJPEG stream and update homography."""
-    global _homography, _last_scene_jpeg, _rec_frame_n
+    global _homography, _last_scene_jpeg
     snap_url = f"{RECEIVER_URL}/jpeg/{SCENE_CAM_ID}"
     prev_aruco_count = -1
     while True:
@@ -573,17 +609,6 @@ def _scene_cam_thread():
                 detected, all_ids = _detect_aruco_corners(frame)
                 # Store annotated frame for /scene_frame endpoint
                 _last_scene_jpeg = _annotate_scene_frame(frame, detected, all_ids)
-                # Record raw frame every ~7th poll (~3fps) to keep storage sane
-                if _recording and _rec_dir:
-                    with _rec_lock:
-                        n = _rec_frame_n
-                        _rec_frame_n += 1
-                    if n % 7 == 0:
-                        fpath = _rec_dir / "frames" / f"{n:06d}.jpg"
-                        cv2.imwrite(str(fpath), frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
-                        with open(_rec_dir / "frames_index.jsonl", "a") as fi:
-                            fi.write(json.dumps({"n": n, "ts": time.time()*1000,
-                                                 "file": f"frames/{n:06d}.jpg"}) + "\n")
                 n = len(all_ids)
                 with _debug_lock:
                     _debug["scene_cam_ok"] = True
@@ -611,33 +636,42 @@ def _scene_cam_thread():
                         _, _jpg = cv2.imencode(".jpg", debug_bgr,
                                               [cv2.IMWRITE_JPEG_QUALITY, 90])
                         _last_homography_debug_jpeg = _jpg.tobytes()
-                        # Accumulate into per-target shutter video
+                        # Accumulate into per-target shutter video.
+                        # Use id(tgt) for change detection — dict value comparison
+                        # fails when consecutive targets share coordinates.
                         with _calib_video_lock:
+                            cur_id = id(tgt) if tgt is not None else -1
                             if tgt is not None:
-                                if _calib_video_tgt != tgt:
-                                    # New target window opened — flush previous if any
+                                if cur_id != _calib_video_tgt_id:
+                                    # Target changed — flush previous buffer
                                     if _calib_video_buf and _calib_video_tgt:
                                         _prev = (_calib_video_buf[:], _calib_video_tgt)
                                         threading.Thread(
                                             target=_write_calib_video,
                                             args=_prev, daemon=True).start()
                                     _calib_video_buf.clear()
-                                    _calib_video_tgt = tgt
-                                _calib_video_buf.append(debug_bgr)
+                                    _calib_video_tgt    = tgt
+                                    _calib_video_tgt_id = cur_id
+                                _calib_video_buf.append(debug_bgr.copy())
                             else:
-                                if _calib_video_buf and _calib_video_tgt:
-                                    _prev = (_calib_video_buf[:], _calib_video_tgt)
-                                    threading.Thread(
-                                        target=_write_calib_video,
-                                        args=_prev, daemon=True).start()
-                                    _calib_video_buf.clear()
-                                    _calib_video_tgt = None
-                                # Still save periodic stills when not calibrating
+                                # tgt is None — save periodic still only
                                 now = time.time()
                                 if now - _last_homography_debug_save_ts >= 1.0:
                                     _last_homography_debug_save_ts = now
                                     fname = HOMOGRAPHY_DEBUG_DIR / f"{time.strftime('%Y%m%d_%H%M%S')}.jpg"
                                     fname.write_bytes(_last_homography_debug_jpeg)
+                        # World cam recording
+                        if _recording and _rec_dir:
+                            with _rec_lock:
+                                if _rec_world_writer is None:
+                                    _h, _w = frame.shape[:2]
+                                    _rec_world_writer = cv2.VideoWriter(
+                                        str(_rec_dir / "world_cam.avi"),
+                                        cv2.VideoWriter_fourcc(*"MJPG"),
+                                        20.0, (_w, _h))
+                                _rec_world_writer.write(frame)
+                                if _rec_world_ts_f:
+                                    _rec_world_ts_f.write(f"{time.time()*1000:.3f}\n")
                     else:
                         print("[scene] Waiting for marker positions from browser (resize the window or move slider)…")
                 else:
@@ -661,8 +695,8 @@ def _scene_cam_thread():
 
 # ── Eye cam poller (engine /frame — has pupil/glint overlay) ─────────────────
 def _eye_cam_thread():
-    """Fetch analyzed eye frame from engine at ~20fps for /eye_stream."""
-    global _last_eye_jpeg
+    """Fetch analyzed eye frame from engine at ~20fps for /eye_stream and recording."""
+    global _last_eye_jpeg, _rec_eye_writer
     frame_url = f"{ENGINE_URL}/frame"
     while True:
         try:
@@ -670,6 +704,20 @@ def _eye_cam_thread():
                 data = resp.read()
             if data:
                 _last_eye_jpeg = data
+                if _recording and _rec_dir:
+                    arr = np.frombuffer(data, np.uint8)
+                    frm = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                    if frm is not None:
+                        with _rec_lock:
+                            if _rec_eye_writer is None:
+                                _h, _w = frm.shape[:2]
+                                _rec_eye_writer = cv2.VideoWriter(
+                                    str(_rec_dir / "eye_cam.avi"),
+                                    cv2.VideoWriter_fourcc(*"MJPG"),
+                                    20.0, (_w, _h))
+                            _rec_eye_writer.write(frm)
+                            if _rec_eye_ts_f:
+                                _rec_eye_ts_f.write(f"{time.time()*1000:.3f}\n")
         except Exception:
             pass
         time.sleep(0.05)
@@ -998,6 +1046,7 @@ def _handle_ws(rfile, wfile):
                 # the *previous* target when a new one arrives, so the final
                 # point is never flushed otherwise).
                 _flush_pending_target()
+                _flush_calib_video_buf()
                 with _saccade_lock:
                     samples = list(_saccade_samples)
                 # Save samples to recording
