@@ -113,27 +113,53 @@ def _refit_models():
         return None
 
 # ── ArUco helpers ─────────────────────────────────────────────────────────────
-_aruco_dict = cv2.aruco.getPredefinedDictionary(ARUCO_DICT)
-_aruco_params = cv2.aruco.DetectorParameters()
-# Loosen detection params to help with screen glare / low-res camera captures
-_aruco_params.adaptiveThreshWinSizeMin  = 3
-_aruco_params.adaptiveThreshWinSizeMax  = 53
-_aruco_params.adaptiveThreshWinSizeStep = 4
-_aruco_params.minMarkerPerimeterRate    = 0.01   # allow markers as small as 1% of frame
-_aruco_params.polygonalApproxAccuracyRate = 0.08
-_aruco_detector = cv2.aruco.ArucoDetector(_aruco_dict, _aruco_params)
+ARUCO_DICTS = {
+    "4x4":  cv2.aruco.DICT_4X4_50,
+    "5x5":  cv2.aruco.DICT_5X5_50,
+    "6x6":  cv2.aruco.DICT_6X6_50,
+    "7x7":  cv2.aruco.DICT_7X7_50,
+}
+_aruco_dict_name = "4x4"
+_aruco_dict      = cv2.aruco.getPredefinedDictionary(ARUCO_DICTS[_aruco_dict_name])
+_aruco_lock      = threading.Lock()
+
+def _make_params():
+    p = cv2.aruco.DetectorParameters()
+    p.adaptiveThreshWinSizeMin    = 3
+    p.adaptiveThreshWinSizeMax    = 53
+    p.adaptiveThreshWinSizeStep   = 4
+    p.minMarkerPerimeterRate      = 0.01
+    p.polygonalApproxAccuracyRate = 0.08
+    return p
+
+_aruco_detector = cv2.aruco.ArucoDetector(_aruco_dict, _make_params())
 
 
 def _generate_marker_png(marker_id: int, size: int = 200) -> bytes:
-    """Generate correct ArUco marker PNG using OpenCV — guaranteed to be detectable."""
-    img = cv2.aruco.generateImageMarker(_aruco_dict, marker_id, size)
+    with _aruco_lock:
+        d = _aruco_dict
+    img = cv2.aruco.generateImageMarker(d, marker_id, size)
     _, buf = cv2.imencode(".png", img)
     return buf.tobytes()
 
 
-# Pre-generate all 4 markers at startup
 _marker_pngs: dict[int, bytes] = {i: _generate_marker_png(i) for i in ARUCO_IDS}
-print(f"[aruco] Pre-generated {len(_marker_pngs)} markers for DICT_4X4_50 IDs {ARUCO_IDS}")
+print(f"[aruco] Markers ready: DICT_{_aruco_dict_name.upper()}_50 IDs {ARUCO_IDS}")
+
+
+def _switch_aruco_dict(name: str):
+    global _aruco_dict, _aruco_dict_name, _aruco_detector, _marker_pngs, _homography
+    if name not in ARUCO_DICTS:
+        print(f"[aruco] Unknown dict '{name}', options: {list(ARUCO_DICTS)}")
+        return
+    with _aruco_lock:
+        _aruco_dict_name = name
+        _aruco_dict      = cv2.aruco.getPredefinedDictionary(ARUCO_DICTS[name])
+        _aruco_detector  = cv2.aruco.ArucoDetector(_aruco_dict, _make_params())
+    _marker_pngs = {i: _generate_marker_png(i) for i in ARUCO_IDS}
+    with _homography_lock:
+        _homography = None   # invalidate — markers changed
+    print(f"[aruco] Switched to DICT_{name.upper()}_50, regenerated markers")
 
 # Cached homography (recomputed when scene frame updates)
 _homography: np.ndarray | None = None
@@ -146,7 +172,9 @@ _screen_markers_lock = threading.Lock()
 def _detect_aruco_corners(frame_bgr: np.ndarray) -> tuple[dict[int, np.ndarray] | None, list[int]]:
     """Detect ArUco markers. Returns (dict id->center, list of all found ids). dict is None if <4 required found."""
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-    corners, ids, _ = _aruco_detector.detectMarkers(gray)
+    with _aruco_lock:
+        det = _aruco_detector
+    corners, ids, _ = det.detectMarkers(gray)
     all_ids = ids.flatten().tolist() if ids is not None else []
     if ids is None or len(ids) < 4:
         return None, all_ids
@@ -166,7 +194,9 @@ def _annotate_scene_frame(frame_bgr: np.ndarray, detected: dict | None, all_ids:
     h, w = out.shape[:2]
     # Draw all detected markers
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-    corners, ids, _ = _aruco_detector.detectMarkers(gray)
+    with _aruco_lock:
+        det = _aruco_detector
+    corners, ids, _ = det.detectMarkers(gray)
     if ids is not None:
         cv2.aruco.drawDetectedMarkers(out, corners, ids)
     # Status overlay
@@ -488,6 +518,11 @@ def _handle_ws(rfile, wfile):
                 _last_screen_size[0] = msg.get("w", 0)
                 _last_screen_size[1] = msg.get("h", 0)
 
+            elif mtype == "set_dict":
+                name = msg.get("dict", "4x4")
+                _switch_aruco_dict(name)
+                _ws_send_frame(wfile, json.dumps({"type": "dict_changed", "dict": name}))
+
             elif mtype == "marker_positions":
                 # Browser sends actual pixel centers of the 4 ArUco markers
                 positions = msg.get("positions", {})  # {id: [x, y]}
@@ -609,8 +644,14 @@ button.paused-on  { background: #2a1a0a; color: #ffaa44; border-color: #ffaa44; 
 #status {
   color: #888; font-size: 13px; min-width: 320px; text-align: center;
 }
+#reopen-debug {
+  position: fixed; bottom: 40vh; left: 12px; z-index: 25;
+  display: none;
+  padding: 4px 10px; font-size: 11px; background: rgba(0,0,0,0.7);
+  border: 1px solid #555; border-radius: 4px; color: #aaa; cursor: pointer;
+}
 #debug-panel {
-  position: fixed; bottom: 12px; left: 12px; z-index: 20;
+  position: fixed; bottom: 40vh; left: 12px; z-index: 20;
   background: rgba(0,0,0,0.82); border: 1px solid #333; border-radius: 6px;
   padding: 10px 14px; font-size: 12px; color: #ccc; min-width: 280px;
   max-width: 340px;
@@ -630,8 +671,11 @@ button.paused-on  { background: #2a1a0a; color: #ffaa44; border-color: #ffaa44; 
 #debug-panel .slider-row { margin-top: 8px; border-top: 1px solid #333; padding-top: 6px; }
 #debug-panel .slider-row label { color: #888; font-size: 11px; display: block; margin-bottom: 3px; }
 #debug-panel input[type=range] { width: 100%; accent-color: #ffcc00; }
+.dict-btn { padding: 3px 10px; font-size: 11px; background: #1a1a1a; color: #aaa;
+  border: 1px solid #444; border-radius: 3px; cursor: pointer; }
+.dict-btn.active { background: #333; color: #ffcc00; border-color: #ffcc00; }
 #scene-view {
-  position: fixed; bottom: 12px; right: 12px; z-index: 20;
+  position: fixed; bottom: 40vh; right: 12px; z-index: 20;
   border: 1px solid #444; border-radius: 4px;
   width: 320px; display: block;
 }
@@ -653,7 +697,7 @@ button.paused-on  { background: #2a1a0a; color: #ffaa44; border-color: #ffaa44; 
   <span id="status">Connecting…</span>
 </div>
 <div id="debug-panel">
-  <h4>DEBUG <button onclick="document.getElementById('debug-panel').style.display='none'">✕</button></h4>
+  <h4>DEBUG <button id="close-debug">✕</button></h4>
   <div class="row"><span>Scene cam</span><span id="d-scene">…</span></div>
   <div class="row"><span>ArUco</span><span id="d-aruco">…</span></div>
   <div class="row"><span>Homography</span><span id="d-homo">…</span></div>
@@ -670,7 +714,17 @@ button.paused-on  { background: #2a1a0a; color: #ffaa44; border-color: #ffaa44; 
     <label>ArUco marker size: <span id="marker-size-val">20</span>% of screen</label>
     <input type="range" id="marker-size" min="8" max="35" value="20" step="1">
   </div>
+  <div class="slider-row">
+    <label>ArUco dictionary: <span id="d-dict">4x4</span></label>
+    <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:4px">
+      <button class="dict-btn active" data-dict="4x4">4×4</button>
+      <button class="dict-btn" data-dict="5x5">5×5</button>
+      <button class="dict-btn" data-dict="6x6">6×6</button>
+      <button class="dict-btn" data-dict="7x7">7×7</button>
+    </div>
+  </div>
 </div>
+<button id="reopen-debug">⬛ DEBUG</button>
 <img id="scene-view" alt="scene cam" style="display:none">
 <canvas id="c"></canvas>
 <img id="m0" class="aruco-marker" src="/marker/0" alt="">
@@ -1104,11 +1158,49 @@ function pollDebug() {
     dbg('d-sync', `tried=${d.last_sync_tried} matched=${d.last_sync_matched}`,
         d.last_sync_matched > 0 ? true : (d.last_sync_tried > 0 ? false : null));
     dbg('d-sacc', d.saccade_samples, d.saccade_samples >= 6 ? true : (d.saccade_samples > 0 ? null : false));
+    if (d.aruco_dict) document.getElementById('d-dict').textContent = d.aruco_dict;
   }).catch(() => {});
 }
 pollDebug();
 setInterval(pollDebug, 800);
 
+// ── Debug panel open/close ────────────────────────────────────────────────────
+const debugPanel  = document.getElementById('debug-panel');
+const reopenBtn   = document.getElementById('reopen-debug');
+document.getElementById('close-debug').onclick = () => {
+  debugPanel.style.display = 'none';
+  reopenBtn.style.display  = 'block';
+};
+reopenBtn.onclick = () => {
+  debugPanel.style.display = 'block';
+  reopenBtn.style.display  = 'none';
+};
+
+// ── ArUco dictionary switcher ─────────────────────────────────────────────────
+function switchDict(name) {
+  fetch(`/set_dict?d=${name}`).then(r => r.json()).then(d => {
+    if (!d.ok) return;
+    document.getElementById('d-dict').textContent = name;
+    document.querySelectorAll('.dict-btn').forEach(b => {
+      b.classList.toggle('active', b.dataset.dict === name);
+    });
+    // Reload marker images with cache-busting so browser fetches regenerated PNGs
+    const t = Date.now();
+    [0,1,2,3].forEach(i => {
+      document.getElementById(`m${i}`).src = `/marker/${i}?t=${t}`;
+    });
+    // Re-send marker positions after images reload (size unchanged)
+    setTimeout(updateMarkers, 300);
+  }).catch(() => {});
+}
+document.querySelectorAll('.dict-btn').forEach(btn => {
+  btn.onclick = () => switchDict(btn.dataset.dict);
+});
+
+// Handle server-initiated dict change (via WS)
+// (already handled inline in ws.onmessage below)
+
+// ── Scene cam refresh ─────────────────────────────────────────────────────────
 // Refresh scene frame via fetch so a 503/error doesn't put img into broken state
 function refreshScene() {
   fetch('/scene_frame')
@@ -1179,6 +1271,17 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
 
+        elif self.path.startswith("/set_dict"):
+            import urllib.parse
+            name = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("d", ["4x4"])[0]
+            _switch_aruco_dict(name)
+            body = json.dumps({"ok": True, "dict": name}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
         elif self.path.startswith("/marker/"):
             try:
                 mid = int(self.path.split("/marker/")[1].split(".")[0])
@@ -1214,6 +1317,7 @@ class Handler(BaseHTTPRequestHandler):
             with _homography_lock:
                 d["homography_ok"] = _homography is not None
             d["calibrating"]     = _calibrating
+            d["aruco_dict"]      = _aruco_dict_name
             d["calib_mode"]      = _calib_mode
             d["saccade_samples"] = len(_saccade_samples)
             d["model_trained"]   = _model.trained
