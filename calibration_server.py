@@ -120,6 +120,9 @@ _aruco_detector = cv2.aruco.ArucoDetector(_aruco_dict, _aruco_params)
 # Cached homography (recomputed when scene frame updates)
 _homography: np.ndarray | None = None
 _homography_lock = threading.Lock()
+# Actual marker screen positions sent from browser {id: [x,y], ...}
+_screen_markers: dict = {}
+_screen_markers_lock = threading.Lock()
 
 
 def _detect_aruco_corners(frame_bgr: np.ndarray) -> tuple[dict[int, np.ndarray] | None, list[int]]:
@@ -166,27 +169,19 @@ def _annotate_scene_frame(frame_bgr: np.ndarray, detected: dict | None, all_ids:
     return jpg.tobytes()
 
 
-def _compute_homography(scene_corners: dict[int, np.ndarray],
-                        screen_w: int, screen_h: int) -> np.ndarray | None:
+def _compute_homography(scene_corners: dict[int, np.ndarray]) -> np.ndarray | None:
     """
     Compute homography from screen space → scene camera space.
+    Uses actual marker positions sent from browser (_screen_markers).
     ArUco IDs 0,1,2,3 = TL, TR, BL, BR.
     """
-    margin = 0.07  # ArUco markers drawn at 7% inset from screen edges
-    mx, my = screen_w * margin, screen_h * margin
-    # Screen positions of the four ArUco marker centres (same layout as webapp)
-    screen_pts = np.array([
-        [mx,             my],              # 0 TL
-        [screen_w - mx,  my],              # 1 TR
-        [mx,             screen_h - my],   # 2 BL
-        [screen_w - mx,  screen_h - my],   # 3 BR
-    ], dtype=np.float32)
-    scene_pts = np.array([
-        scene_corners[0],
-        scene_corners[1],
-        scene_corners[2],
-        scene_corners[3],
-    ], dtype=np.float32)
+    with _screen_markers_lock:
+        sm = dict(_screen_markers)
+    if len(sm) < 4 or not all(i in sm for i in ARUCO_IDS):
+        print(f"[homography] Missing screen marker positions: have {list(sm.keys())}, need {ARUCO_IDS}")
+        return None
+    screen_pts = np.array([sm[i] for i in ARUCO_IDS], dtype=np.float32)
+    scene_pts  = np.array([scene_corners[i] for i in ARUCO_IDS], dtype=np.float32)
     H, _ = cv2.findHomography(screen_pts, scene_pts)
     return H
 
@@ -228,15 +223,14 @@ def _scene_cam_thread():
                           (f"  MISSING={sorted(set(ARUCO_IDS)-set(all_ids))}" if n < 4 else "  → homography OK"))
                     prev_aruco_count = n
                 if detected:
-                    sw, sh = _last_screen_size
-                    if sw and sh:
-                        H = _compute_homography(detected, sw, sh)
+                    H = _compute_homography(detected)
+                    if H is not None:
                         with _homography_lock:
                             _homography = H
                         with _debug_lock:
                             _debug["homography_ok"] = True
                     else:
-                        print("[scene] Waiting for screen size from browser…")
+                        print("[scene] Waiting for marker positions from browser (resize the window or move slider)…")
                 else:
                     with _homography_lock:
                         _homography = None
@@ -470,6 +464,15 @@ def _handle_ws(rfile, wfile):
                 _last_screen_size[0] = msg.get("w", 0)
                 _last_screen_size[1] = msg.get("h", 0)
 
+            elif mtype == "marker_positions":
+                # Browser sends actual pixel centers of the 4 ArUco markers
+                positions = msg.get("positions", {})  # {id: [x, y]}
+                with _screen_markers_lock:
+                    _screen_markers.clear()
+                    for k, v in positions.items():
+                        _screen_markers[int(k)] = v
+                print(f"[ws] marker positions updated: { {k: [round(v[0]),round(v[1])] for k,v in _screen_markers.items()} }")
+
             elif mtype == "start":
                 global _calib_mode
                 _calibrating = True
@@ -587,20 +590,25 @@ button.live-on { background: #1a3320; color: #44ff88; border-color: #44ff88; }
   padding: 10px 14px; font-size: 12px; color: #ccc; min-width: 280px;
   max-width: 340px;
 }
-#debug-panel h4 { color: #888; margin-bottom: 6px; font-size: 11px; letter-spacing: 1px; }
+#debug-panel h4 {
+  color: #888; margin-bottom: 6px; font-size: 11px; letter-spacing: 1px;
+  display: flex; justify-content: space-between; align-items: center;
+}
+#debug-panel h4 button {
+  font-size: 11px; padding: 0 6px; line-height: 16px; border-radius: 3px;
+  border: 1px solid #555; background: #222; color: #aaa; cursor: pointer;
+}
 #debug-panel .row { display: flex; justify-content: space-between; margin: 2px 0; }
 #debug-panel .ok  { color: #44ff88; }
 #debug-panel .err { color: #ff5050; }
 #debug-panel .warn{ color: #ffcc00; }
+#debug-panel .slider-row { margin-top: 8px; border-top: 1px solid #333; padding-top: 6px; }
+#debug-panel .slider-row label { color: #888; font-size: 11px; display: block; margin-bottom: 3px; }
+#debug-panel input[type=range] { width: 100%; accent-color: #ffcc00; }
 #scene-view {
   position: fixed; bottom: 12px; right: 12px; z-index: 20;
   border: 1px solid #444; border-radius: 4px;
   width: 320px; display: block;
-}
-#scene-label {
-  position: fixed; bottom: 12px; right: 12px; z-index: 21;
-  color: #888; font-size: 10px; background: rgba(0,0,0,0.6);
-  padding: 2px 6px; border-radius: 2px;
 }
 </style>
 </head>
@@ -614,7 +622,7 @@ button.live-on { background: #1a3320; color: #44ff88; border-color: #44ff88; }
   <span id="status">Connecting…</span>
 </div>
 <div id="debug-panel">
-  <h4>DEBUG</h4>
+  <h4>DEBUG <button onclick="document.getElementById('debug-panel').style.display='none'">✕</button></h4>
   <div class="row"><span>Scene cam</span><span id="d-scene">…</span></div>
   <div class="row"><span>ArUco</span><span id="d-aruco">…</span></div>
   <div class="row"><span>Homography</span><span id="d-homo">…</span></div>
@@ -625,6 +633,10 @@ button.live-on { background: #1a3320; color: #44ff88; border-color: #44ff88; }
   <div class="row"><span>Screen size</span><span id="d-screen">…</span></div>
   <div class="row"><span>Last sync</span><span id="d-sync">…</span></div>
   <div class="row"><span>Saccade pts</span><span id="d-sacc">…</span></div>
+  <div class="slider-row">
+    <label>ArUco marker size: <span id="marker-size-val">20</span>% of screen</label>
+    <input type="range" id="marker-size" min="8" max="35" value="20" step="1">
+  </div>
 </div>
 <img id="scene-view" alt="scene cam" style="display:none">
 <canvas id="c"></canvas>
@@ -666,6 +678,8 @@ ws.onopen = () => {
   statusEl.textContent = 'Connected';
   ws.send(JSON.stringify({type:'screen_size', w:W, h:H}));
   ws.send(JSON.stringify({type:'status'}));
+  // Send marker positions (may not be built yet — buildBackground sends them too)
+  setTimeout(buildBackground, 100);
 };
 ws.onclose = () => statusEl.textContent = 'Disconnected';
 ws.onmessage = e => {
@@ -702,8 +716,9 @@ const ARUCO_BITS = {
 };
 
 
-// ── Offscreen background (ArUco corners, redrawn only on resize) ─────────────
+// ── Offscreen background (ArUco corners, redrawn on resize or slider change) ──
 let bgCanvas = null;
+let markerPct = 20;  // % of min(W,H) — controlled by slider
 
 function buildBackground() {
   bgCanvas = document.createElement('canvas');
@@ -712,35 +727,58 @@ function buildBackground() {
   const bctx = bgCanvas.getContext('2d');
   bctx.fillStyle = '#111';
   bctx.fillRect(0, 0, W, H);
-  const M = Math.min(W, H) * 0.07;
-  const S = Math.min(W, H) * 0.10;
-  // Reuse drawAruco but on bctx — swap ctx temporarily
-  const saved = ctx;
-  // Draw directly using bctx
-  function bDrawAruco(id, cx, cy, size) {
-    const cell = size / 6;
+
+  const S    = Math.min(W, H) * markerPct / 100;  // marker size
+  const cell = S / 6;
+  const pad  = cell * 1.5;   // white quiet zone around marker (OpenCV requires ~1 cell)
+  const edge = pad + 4;      // gap from screen edge to quiet zone edge
+  const M    = edge + pad + S / 2;  // marker center from screen edge
+
+  function bDrawAruco(id, cx, cy) {
+    // White quiet zone (must surround marker for detector)
     bctx.fillStyle = '#fff';
-    bctx.fillRect(cx - size/2, cy - size/2, size, size);
+    bctx.fillRect(cx - S/2 - pad, cy - S/2 - pad, S + 2*pad, S + 2*pad);
+    // Black outer border
     bctx.fillStyle = '#000';
-    bctx.fillRect(cx - size/2, cy - size/2, size, cell);
-    bctx.fillRect(cx - size/2, cy + size/2 - cell, size, cell);
-    bctx.fillRect(cx - size/2, cy - size/2, cell, size);
-    bctx.fillRect(cx + size/2 - cell, cy - size/2, cell, size);
+    bctx.fillRect(cx - S/2, cy - S/2, S, cell);          // top
+    bctx.fillRect(cx - S/2, cy + S/2 - cell, S, cell);   // bottom
+    bctx.fillRect(cx - S/2, cy - S/2, cell, S);          // left
+    bctx.fillRect(cx + S/2 - cell, cy - S/2, cell, S);   // right
+    // Data bits (inner 4×4 grid)
     const bits = ARUCO_BITS[id];
     for (let r = 0; r < 4; r++) {
       for (let c = 0; c < 4; c++) {
         bctx.fillStyle = bits[r][c] === 0 ? '#000' : '#fff';
-        bctx.fillRect(cx - size/2 + (c+1)*cell, cy - size/2 + (r+1)*cell, cell, cell);
+        bctx.fillRect(cx - S/2 + (c+1)*cell, cy - S/2 + (r+1)*cell, cell, cell);
       }
     }
   }
-  bDrawAruco(0, M,     M,     S);
-  bDrawAruco(1, W-M,   M,     S);
-  bDrawAruco(2, M,     H-M,   S);
-  bDrawAruco(3, W-M,   H-M,   S);
+
+  // Corner positions: TL=0, TR=1, BL=2, BR=3
+  const positions = {
+    0: [M,     M    ],
+    1: [W - M, M    ],
+    2: [M,     H - M],
+    3: [W - M, H - M],
+  };
+  for (const [id, [cx, cy]] of Object.entries(positions)) {
+    bDrawAruco(Number(id), cx, cy);
+  }
+
+  // Send actual marker centers to server for homography
+  if (ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'marker_positions', positions }));
+  }
 }
 buildBackground();
 window.addEventListener('resize', () => { resize(); buildBackground(); });
+
+// Marker size slider
+document.getElementById('marker-size').addEventListener('input', function() {
+  markerPct = Number(this.value);
+  document.getElementById('marker-size-val').textContent = markerPct;
+  buildBackground();
+});
 
 // ── Sweep mode (reading lines) ────────────────────────────────────────────────
 const TARGET_R = 12;
