@@ -96,6 +96,49 @@ SCREEN_MODEL_PATH = pathlib.Path(__file__).parent / "screen_model.json"
 _model.load(MODEL_PATH)
 _screen_model.load(SCREEN_MODEL_PATH)
 
+# ── Recording ─────────────────────────────────────────────────────────────────
+RECORDINGS_DIR = pathlib.Path(__file__).parent / "recordings"
+_recording       = False
+_rec_dir: pathlib.Path | None = None
+_rec_eye_f       = None   # open file handle for eye.jsonl
+_rec_target_f    = None   # open file handle for targets.jsonl
+_rec_fixation_f  = None   # open file handle for fixations.jsonl
+_rec_frame_n     = 0      # total frames seen during recording
+_rec_lock        = threading.Lock()
+
+
+def _rec_start(screen_w: int, screen_h: int, mode: str):
+    global _recording, _rec_dir, _rec_eye_f, _rec_target_f, _rec_fixation_f, _rec_frame_n
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    d  = RECORDINGS_DIR / ts
+    (d / "frames").mkdir(parents=True, exist_ok=True)
+    _rec_dir      = d
+    _rec_frame_n  = 0
+    _rec_eye_f    = open(d / "eye.jsonl",      "w")
+    _rec_target_f = open(d / "targets.jsonl",  "w")
+    _rec_fixation_f = open(d / "fixations.jsonl", "w")
+    with open(d / "meta.json", "w") as f:
+        json.dump({
+            "screen_w": screen_w, "screen_h": screen_h,
+            "mode": mode, "aruco_dict": _aruco_dict_name,
+            "scene_cam": SCENE_CAM_ID, "started": ts,
+        }, f, indent=2)
+    _recording = True
+    print(f"[rec] Recording started → {d}")
+    return str(d)
+
+
+def _rec_stop() -> str:
+    global _recording, _rec_dir, _rec_eye_f, _rec_target_f, _rec_fixation_f
+    _recording = False
+    for f in (_rec_eye_f, _rec_target_f, _rec_fixation_f):
+        try: f.close()
+        except Exception: pass
+    _rec_eye_f = _rec_target_f = _rec_fixation_f = None
+    path = str(_rec_dir) if _rec_dir else ""
+    print(f"[rec] Recording saved → {path}")
+    return path
+
 def _refit_models():
     """Refit both models from current saccade samples. Called after each fixation."""
     with _saccade_lock:
@@ -263,6 +306,17 @@ def _scene_cam_thread():
                 detected, all_ids = _detect_aruco_corners(frame)
                 # Store annotated frame for /scene_frame endpoint
                 _last_scene_jpeg = _annotate_scene_frame(frame, detected, all_ids)
+                # Record raw frame every ~7th poll (~3fps) to keep storage sane
+                if _recording and _rec_dir:
+                    with _rec_lock:
+                        n = _rec_frame_n
+                        _rec_frame_n += 1
+                    if n % 7 == 0:
+                        fpath = _rec_dir / "frames" / f"{n:06d}.jpg"
+                        cv2.imwrite(str(fpath), frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                        with open(_rec_dir / "frames_index.jsonl", "a") as fi:
+                            fi.write(json.dumps({"n": n, "ts": time.time()*1000,
+                                                 "file": f"frames/{n:06d}.jpg"}) + "\n")
                 n = len(all_ids)
                 with _debug_lock:
                     _debug["scene_cam_ok"] = True
@@ -335,6 +389,12 @@ def _eye_poll_thread():
                     cutoff = ts - 10000
                     while _eye_buf and _eye_buf[0]["ts"] < cutoff:
                         _eye_buf.pop(0)
+                # Record eye stream
+                if _recording and _rec_eye_f:
+                    try:
+                        _rec_eye_f.write(json.dumps({"ts": ts, "dx": vec[0], "dy": vec[1]}) + "\n")
+                        _rec_eye_f.flush()
+                    except Exception: pass
             else:
                 age = ts - _last_pccr_ts if _last_pccr_ts else None
                 with _debug_lock:
@@ -532,6 +592,18 @@ def _handle_ws(rfile, wfile):
                         _screen_markers[int(k)] = v
                 print(f"[ws] marker positions updated: { {k: [round(v[0]),round(v[1])] for k,v in _screen_markers.items()} }")
 
+            elif mtype == "record_toggle":
+                sw, sh = _last_screen_size[0], _last_screen_size[1]
+                mode   = msg.get("mode", _calib_mode)
+                if not _recording:
+                    rec_path = _rec_start(sw, sh, mode)
+                    _ws_send_frame(wfile, json.dumps({"type": "record_ack",
+                                                      "recording": True, "path": rec_path}))
+                else:
+                    rec_path = _rec_stop()
+                    _ws_send_frame(wfile, json.dumps({"type": "record_ack",
+                                                      "recording": False, "path": rec_path}))
+
             elif mtype == "start":
                 global _calib_mode
                 _calibrating = True
@@ -542,16 +614,26 @@ def _handle_ws(rfile, wfile):
                     _eye_buf.clear()
                 with _saccade_lock:
                     _saccade_samples.clear()
+                # Auto-start recording if not already recording
+                if _recording and _rec_target_f:
+                    try:
+                        _rec_target_f.write(json.dumps({"event": "calib_start",
+                                                         "ts": time.time()*1000,
+                                                         "mode": _calib_mode}) + "\n")
+                        _rec_target_f.flush()
+                    except Exception: pass
                 _ws_send_frame(wfile, json.dumps({"type": "ack", "msg": f"calibration started ({_calib_mode})"}))
 
             elif mtype == "target":
                 if _calibrating:
+                    entry = {"ts": msg["ts"], "x": msg["x"], "y": msg["y"]}
                     with _target_lock:
-                        _target_buf.append({
-                            "ts": msg["ts"],
-                            "x":  msg["x"],
-                            "y":  msg["y"],
-                        })
+                        _target_buf.append(entry)
+                    if _recording and _rec_target_f:
+                        try:
+                            _rec_target_f.write(json.dumps(entry) + "\n")
+                            _rec_target_f.flush()
+                        except Exception: pass
 
             elif mtype == "fixation":
                 # Saccade mode: eye has settled on this point — find closest eye vector
@@ -560,6 +642,17 @@ def _handle_ws(rfile, wfile):
                     with _eye_lock:
                         eyes = list(_eye_buf)
                     best = min(eyes, key=lambda e: abs(e["ts"] - ts), default=None)
+                    # Record raw fixation regardless of match quality
+                    if _recording and _rec_fixation_f:
+                        try:
+                            eye_snap = {"dx": best["dx"], "dy": best["dy"],
+                                        "eye_ts": best["ts"]} if best else None
+                            _rec_fixation_f.write(json.dumps({
+                                "ts": ts, "x": msg["x"], "y": msg["y"],
+                                "eye": eye_snap,
+                            }) + "\n")
+                            _rec_fixation_f.flush()
+                        except Exception: pass
                     if best and abs(best["ts"] - ts) <= SYNC_WINDOW_MS * 3:
                         scene_xy = _screen_to_scene(msg["x"], msg["y"])
                         if scene_xy:
@@ -568,7 +661,7 @@ def _handle_ws(rfile, wfile):
                                 _saccade_samples.append({
                                     "dx": best["dx"], "dy": best["dy"],
                                     "X": X, "Y": Y,
-                                    "sx": msg["x"], "sy": msg["y"],  # screen coords for live cursor
+                                    "sx": msg["x"], "sy": msg["y"],
                                 })
                             n = len(_saccade_samples)
                             diag = _refit_models()
@@ -588,7 +681,14 @@ def _handle_ws(rfile, wfile):
                 else:
                     sw, sh = _last_screen_size
                     samples = _sync_and_build_dataset(sw, sh)
-                result = {"type": "result", "n_samples": len(samples)}
+                # Save samples to recording
+                if _recording and _rec_dir:
+                    try:
+                        with open(_rec_dir / "samples.json", "w") as f:
+                            json.dump(samples, f)
+                    except Exception: pass
+                result = {"type": "result", "n_samples": len(samples),
+                          "recording": _recording}
                 if len(samples) >= 6:
                     try:
                         diag = _model.fit(samples)
@@ -641,6 +741,9 @@ button.mode { background: #1a1a1a; }
 button.mode.active { background: #333; color: #ffcc00; border-color: #ffcc00; }
 button.live-on    { background: #1a3320; color: #44ff88; border-color: #44ff88; }
 button.paused-on  { background: #2a1a0a; color: #ffaa44; border-color: #ffaa44; }
+button.rec-on     { background: #2a0a0a; color: #ff4444; border-color: #ff4444; }
+@keyframes recblink { 0%,100%{opacity:1} 50%{opacity:0.4} }
+button.rec-on     { animation: recblink 1.2s infinite; }
 #status {
   color: #888; font-size: 13px; min-width: 320px; text-align: center;
 }
@@ -693,6 +796,7 @@ button.paused-on  { background: #2a1a0a; color: #ffaa44; border-color: #ffaa44; 
   <button id="btnStart">START</button>
   <button id="btnStop" disabled>STOP</button>
   <button id="btnLive" disabled>LIVE OFF</button>
+  <button id="btnRecord">⏺ Record</button>
   <button id="btnPause">⏸ Pause Streams</button>
   <span id="status">Connecting…</span>
 </div>
@@ -741,6 +845,25 @@ const btnLive   = document.getElementById('btnLive');
 const btnSweep  = document.getElementById('btnSweep');
 const btnSaccade= document.getElementById('btnSaccade');
 const btnPause  = document.getElementById('btnPause');
+const btnRecord = document.getElementById('btnRecord');
+
+let recOn = false;
+btnRecord.onclick = () => {
+  ws.send(JSON.stringify({ type: 'record_toggle', mode }));
+};
+// Handle server response
+function handleRecordAck(m) {
+  recOn = m.recording;
+  if (recOn) {
+    btnRecord.textContent = '⏹ Stop Rec';
+    btnRecord.classList.add('rec-on');
+    statusEl.textContent = `Recording → ${m.path.split('/').pop()}`;
+  } else {
+    btnRecord.textContent = '⏺ Record';
+    btnRecord.classList.remove('rec-on');
+    statusEl.textContent = `Saved → ${m.path.split('/').pop()}`;
+  }
+}
 
 let streamsPaused = false;
 function setStreamsPaused(val) {
@@ -794,6 +917,7 @@ ws.onopen = () => {
 ws.onclose = () => statusEl.textContent = 'Disconnected';
 ws.onmessage = e => {
   const m = JSON.parse(e.data);
+  if (m.type === 'record_ack') { handleRecordAck(m); return; }
   if (m.type === 'ack')    statusEl.textContent = 'Calibrating…';
   if (m.type === 'status') {
     statusEl.textContent = `Homography: ${m.homography?'✓':'✗'}  Model: ${m.model_trained?'✓':'✗'}`;
@@ -806,10 +930,11 @@ ws.onmessage = e => {
   if (m.type === 'result') {
     btnStop.disabled  = false;
     btnStart.disabled = false;
+    const rec = m.recording ? '  💾 recorded' : '';
     if (m.ok) {
-      statusEl.textContent = `Done! n=${m.n_samples}  R²x=${m.r2_x.toFixed(3)}  R²y=${m.r2_y.toFixed(3)}`;
+      statusEl.textContent = `Done! n=${m.n_samples}  R²x=${m.r2_x.toFixed(3)}  R²y=${m.r2_y.toFixed(3)}${rec}`;
     } else {
-      statusEl.textContent = `Failed: ${m.error}`;
+      statusEl.textContent = `Failed: ${m.error}${rec}`;
     }
   }
 };
