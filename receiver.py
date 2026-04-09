@@ -44,12 +44,36 @@ g_streams_paused = False     # toggled via /set?pause_streams=1|0 — stops MJPE
 import rig_config as _rig_cfg
 g_eye_cam = _rig_cfg.eye_cam()   # which cam runs the eye pipeline
 g_latest_pccr: tuple[float, float] | None = None  # cached from engine /result
+g_latest_pccr_ts: float = 0.0                    # time.time()*1000 of last PCCR
+
+# Calibration capture window — set by calibration server via POST /calib_window
+# {x, y, from_ms, until_ms} or None when not capturing
+g_calib_window: dict | None = None
+g_calib_lock   = threading.Lock()
+
+CALIB_URL = "http://localhost:8090"
+
+def _push_to_calib(ts_ms: float, dx: float, dy: float, x: float, y: float):
+    """Fire-and-forget push of a single eye frame to the calibration server."""
+    import urllib.request
+    try:
+        body = json.dumps({"ts": ts_ms, "dx": dx, "dy": dy, "x": x, "y": y}).encode()
+        req  = urllib.request.Request(
+            CALIB_URL + "/push_eye",
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=0.15).close()
+    except Exception:
+        pass   # calibration server not running — silently ignore
 
 # ── Compute engine client ─────────────────────────────────────────────────────
 ENGINE_URL = "http://localhost:8081"
 
-def _engine_push(jpeg: bytes) -> bytes | None:
-    """POST a JPEG frame to the compute engine. Returns annotated JPEG or None."""
+def _engine_push(jpeg: bytes) -> tuple[bytes | None, tuple[float, float] | None, float]:
+    """POST a JPEG frame to engine. Returns (annotated_jpeg, pccr, frame_ts_ms).
+    PCCR and timestamp come from response headers — same-frame, no extra round-trip."""
     import urllib.request
     try:
         req = urllib.request.Request(
@@ -59,9 +83,15 @@ def _engine_push(jpeg: bytes) -> bytes | None:
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=0.5) as r:
-            return r.read()
+            hdrs    = r.headers
+            dx_h    = hdrs.get("X-Pccr-Dx")
+            dy_h    = hdrs.get("X-Pccr-Dy")
+            ts_h    = hdrs.get("X-Pccr-Ts")
+            pccr    = (float(dx_h), float(dy_h)) if dx_h and dy_h else None
+            ts_ms   = float(ts_h) * 1000 if ts_h else time.time() * 1000
+            return r.read(), pccr, ts_ms
     except Exception:
-        return None
+        return None, None, time.time() * 1000
 
 def _engine_get_result() -> dict | None:
     import urllib.request
@@ -129,10 +159,13 @@ def _save_settings(s):
 g_settings = _load_settings()
 
 
-def _apply_pupil_overlay(data: bytes, roi: list[float] = None) -> bytes:
+def _apply_pupil_overlay(data: bytes, roi: list[float] = None,
+                         cam_ts_ms: float = 0.0) -> bytes:
     """Push JPEG frame to compute engine; return annotated JPEG.
-    If engine is unreachable, falls back to returning the original frame."""
-    global g_latest_pccr
+    cam_ts_ms: camera capture timestamp (synced, ms). When provided, used as the
+    authoritative timestamp for calibration sync — more accurate than engine processing time.
+    If a calibration capture window is active, pushes PCCR to calibration server."""
+    global g_latest_pccr, g_latest_pccr_ts
     if not data:
         return data
 
@@ -152,15 +185,24 @@ def _apply_pupil_overlay(data: bytes, roi: list[float] = None) -> bytes:
         except Exception:
             pass
 
-    annotated = _engine_push(data)
+    annotated, pccr, engine_ts_ms = _engine_push(data)
 
-    # Cache latest PCCR from engine (non-blocking, best-effort)
-    def _refresh_pccr():
-        global g_latest_pccr
-        r = _engine_get_result()
-        if r and r.get("ready"):
-            g_latest_pccr = tuple(r["pccr_vector"]) if r.get("pccr_vector") else None
-    threading.Thread(target=_refresh_pccr, daemon=True).start()
+    # Use camera capture timestamp when available — it's when the frame was actually
+    # taken, not when the engine finished processing it.
+    ts_ms = cam_ts_ms if cam_ts_ms > 0 else engine_ts_ms
+
+    if pccr is not None:
+        g_latest_pccr    = pccr
+        g_latest_pccr_ts = ts_ms
+        # Push to calibration server if within the active capture window
+        with g_calib_lock:
+            win = g_calib_window
+        if win is not None and win["from_ms"] <= ts_ms <= win["until_ms"]:
+            threading.Thread(
+                target=_push_to_calib,
+                args=(ts_ms, pccr[0], pccr[1], win["x"], win["y"]),
+                daemon=True,
+            ).start()
 
     return annotated if annotated is not None else data
 
@@ -197,6 +239,8 @@ class CamState:
 
         # Latest complete frame
         self.latest_frame: bytes = b""
+        self.latest_frame_ts_ms: float = 0.0   # camera capture timestamp in ms (synced clock)
+        self.annotated_frame: bytes = b""       # engine-annotated JPEG (eye cam only)
         self.frame_lock  = threading.Lock()
         self.frame_event = threading.Event()
 
@@ -251,9 +295,10 @@ class CamState:
             jpeg = b"".join(entry["chunks"][i] for i in range(entry["total"]))
             del self._frames[frame_id]
 
-        # Update latest frame
+        # Update latest frame — store camera capture timestamp (synced clock, ms)
         with self.frame_lock:
             self.latest_frame = jpeg
+            self.latest_frame_ts_ms = ts_us / 1000.0   # µs → ms
         self.frame_event.set()
 
         # Rolling 2-min recording buffer (always recording)
@@ -345,11 +390,76 @@ class MJPEGHandler(BaseHTTPRequestHandler):
         elif path == "/recordings":  self._list_recordings()
         elif path.startswith("/recordings/info/"): self._recording_info(path)
         elif path.startswith("/playback/"): self._playback_frame(path)
+        elif path == "/closest_frame":   self._closest_frame()
         elif self.path.startswith("/set?"): self._set_cmd(self.path[5:])
         elif self.path.startswith("/reset_cam?"): self._reset_cam(self.path)
         else:
             try: self.send_error(404)
             except BrokenPipeError: pass
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        body   = self.rfile.read(length)
+        if self.path == "/calib_window":
+            # Calibration server sets the active capture window.
+            # Body: {"x": float, "y": float, "from_ms": float, "until_ms": float}
+            # or    {"clear": true}  to deactivate
+            global g_calib_window
+            try:
+                d = json.loads(body)
+                with g_calib_lock:
+                    if d.get("clear"):
+                        g_calib_window = None
+                    else:
+                        g_calib_window = {
+                            "x":        float(d["x"]),
+                            "y":        float(d["y"]),
+                            "from_ms":  float(d["from_ms"]),
+                            "until_ms": float(d["until_ms"]),
+                        }
+                self.send_response(200)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+            except Exception:
+                try: self.send_error(400)
+                except BrokenPipeError: pass
+        else:
+            try: self.send_error(404)
+            except BrokenPipeError: pass
+
+    # ── /closest_frame ────────────────────────────────────────────────────────
+    def _closest_frame(self):
+        """GET /closest_frame?cam=<1|2>&ts_ms=<float>
+        Returns the JPEG from cam's _recent buffer nearest to ts_ms, or 404."""
+        import urllib.parse
+        qs = urllib.parse.urlparse(self.path).query
+        params = dict(urllib.parse.parse_qsl(qs))
+        try:
+            cid   = int(params.get("cam", 0))
+            ts_ms = float(params["ts_ms"])
+        except (KeyError, ValueError):
+            try: self.send_error(400)
+            except BrokenPipeError: pass
+            return
+        cam = CAMS.get(cid)
+        if cam is None:
+            try: self.send_error(404)
+            except BrokenPipeError: pass
+            return
+        ts_us  = int(ts_ms * 1000)
+        jpeg   = cam.best_frame_near(ts_us)
+        if jpeg is None:
+            try: self.send_error(404)
+            except BrokenPipeError: pass
+            return
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "image/jpeg")
+            self.send_header("Content-Length", str(len(jpeg)))
+            self.end_headers()
+            self.wfile.write(jpeg)
+        except BrokenPipeError:
+            pass
 
     # ── /stats ────────────────────────────────────────────────────────────────
     def _stats(self):
@@ -745,6 +855,10 @@ class MJPEGHandler(BaseHTTPRequestHandler):
 
     # ── /jpeg/<n>  (single frame, for canvas-based sync display) ─────────────
     def _jpeg(self, cam: CamState):
+        if g_streams_paused:
+            try: self.send_error(503)
+            except BrokenPipeError: pass
+            return
         with cam.frame_lock:
             data = cam.latest_frame
         if not data:
@@ -752,7 +866,12 @@ class MJPEGHandler(BaseHTTPRequestHandler):
             except BrokenPipeError: pass
             return
         if g_analysis_enabled and cam.cam_id == g_eye_cam:
-            data = _apply_pupil_overlay(data, cam.roi)
+            # Serve the pre-computed annotated frame from the analysis thread.
+            # Fall back to raw frame if not yet annotated.
+            with cam.frame_lock:
+                annotated = cam.annotated_frame
+            if annotated:
+                data = annotated
         try:
             self.send_response(200)
             self.send_header("Content-Type", "image/jpeg")
@@ -777,10 +896,10 @@ class MJPEGHandler(BaseHTTPRequestHandler):
                 cam.frame_event.clear()
                 with cam.frame_lock:
                     data = cam.latest_frame
+                    if g_analysis_enabled and cam.cam_id == g_eye_cam and cam.annotated_frame:
+                        data = cam.annotated_frame
                 if not data:
                     continue
-                if g_analysis_enabled and cam.cam_id == g_eye_cam:
-                    data = _apply_pupil_overlay(data, cam.roi)
                 hdr = (b"--frame\r\nContent-Type: image/jpeg\r\n"
                        b"Content-Length: " + str(len(data)).encode() + b"\r\n\r\n")
                 self.wfile.write(hdr + data + b"\r\n")
@@ -2002,13 +2121,44 @@ def beacon_thread():
         time.sleep(4)
 
 
+def _eye_analysis_thread():
+    """Dedicated thread: process every eye-cam frame through the engine as it arrives.
+
+    This ensures PCCR is computed at the exact moment the frame is received,
+    using the camera's own capture timestamp (synced via Cristian's algorithm).
+    The annotated result is cached on the CamState so MJPEG/JPEG handlers serve
+    the pre-computed overlay without re-running the engine.
+    """
+    while True:
+        cam = CAMS.get(g_eye_cam)
+        if cam is None:
+            time.sleep(0.5)
+            continue
+        fired = cam.frame_event.wait(timeout=1.0)
+        if not fired:
+            continue
+        cam.frame_event.clear()
+        if not g_analysis_enabled:
+            continue
+        with cam.frame_lock:
+            jpeg    = cam.latest_frame
+            cam_ts  = cam.latest_frame_ts_ms   # camera capture time, synced ms
+        if not jpeg:
+            continue
+        annotated = _apply_pupil_overlay(jpeg, cam.roi, cam_ts_ms=cam_ts)
+        # Cache annotated frame so MJPEG/JPEG handlers can serve it without re-processing
+        with cam.frame_lock:
+            cam.annotated_frame = annotated
+
+
 if __name__ == "__main__":
     print(f"Browser → http://localhost:{HTTP_PORT}")
     threading.Thread(target=QuietHTTPServer(("0.0.0.0", HTTP_PORT), MJPEGHandler).serve_forever,
                      daemon=True).start()
-    threading.Thread(target=beacon_thread,   daemon=True).start()
-    threading.Thread(target=timesync_server, daemon=True).start()
-    threading.Thread(target=sync_tracker,    daemon=True).start()
-    threading.Thread(target=watchdog,     daemon=True).start()
+    threading.Thread(target=beacon_thread,      daemon=True).start()
+    threading.Thread(target=timesync_server,    daemon=True).start()
+    threading.Thread(target=sync_tracker,       daemon=True).start()
+    threading.Thread(target=watchdog,           daemon=True).start()
+    threading.Thread(target=_eye_analysis_thread, daemon=True).start()
     threading.Thread(target=udp_serve, args=(CAMS[1],), daemon=True).start()
     udp_serve(CAMS[2])

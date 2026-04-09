@@ -28,8 +28,8 @@ ALGORITHMS = ("threshold", "edge", "gradient", "seed")
 
 @dataclass
 class PupilResult:
-    center: tuple[int, int] | None = None       # (cx, cy)
-    radius: int | None = None                    # approximate radius
+    center: tuple[float, float] | None = None   # (cx, cy) — subpixel float
+    radius: float | None = None                 # approximate radius
     ellipse: tuple | None = None                 # cv2 RotatedRect (center, axes, angle)
     confidence: float = 0.0                      # 0..1
     debug_mask: np.ndarray | None = None         # binary threshold (for visualisation)
@@ -137,8 +137,8 @@ class PupilDetector:
             M = cv2.moments(cnt)
             if M["m00"] == 0:
                 continue
-            mx = int(M["m10"] / M["m00"])
-            my = int(M["m01"] / M["m00"])
+            mx = M["m10"] / M["m00"]
+            my = M["m01"] / M["m00"]
             dist_from_center = np.sqrt((mx - w/2)**2 + (my - h/2)**2)
             centrality = 1.0 - min(dist_from_center / (max(w, h) / 2), 1.0)
             score = area * circ * (0.5 + 0.5 * centrality)
@@ -151,12 +151,12 @@ class PupilDetector:
         cnt, score, circ, mx, my, area = best
 
         ellipse = None
-        radius = int(np.sqrt(area / np.pi))
+        radius = float(np.sqrt(area / np.pi))
         if len(cnt) >= 5:
             ellipse = cv2.fitEllipse(cnt)
-            mx = int(ellipse[0][0])
-            my = int(ellipse[0][1])
-            radius = int((ellipse[1][0] + ellipse[1][1]) / 4)
+            mx = float(ellipse[0][0])
+            my = float(ellipse[0][1])
+            radius = float((ellipse[1][0] + ellipse[1][1]) / 4)
 
         confidence = min(circ, 1.0)
 
@@ -206,7 +206,7 @@ class PupilDetector:
         if circles is None:
             return PupilResult(debug_mask=edges, intermediate_frames=intermediate)
 
-        circles = np.round(circles[0]).astype(int)
+        circles = circles[0]   # keep float — subpixel from HoughCircles
 
         # Score each circle: prefer dark interior (low mean) + central position
         best_score = -1
@@ -214,7 +214,7 @@ class PupilDetector:
         for cx, cy, r in circles:
             # Create a mask for this circle's interior
             cmask = np.zeros((h, w), dtype=np.uint8)
-            cv2.circle(cmask, (cx, cy), r, 255, -1)
+            cv2.circle(cmask, (int(cx), int(cy)), int(r), 255, -1)
             interior = blurred[cmask > 0]
             if len(interior) == 0:
                 continue
@@ -228,7 +228,7 @@ class PupilDetector:
             score = darkness_score * (0.6 + 0.4 * centrality)
             if score > best_score:
                 best_score = score
-                best_circle = (cx, cy, r)
+                best_circle = (float(cx), float(cy), float(r))
 
         if best_circle is None:
             return PupilResult(debug_mask=edges, intermediate_frames=intermediate)
@@ -238,8 +238,8 @@ class PupilDetector:
         # Build a debug visualization: edges with the winning circle
         morph_vis = cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
         for ccx, ccy, cr in circles:
-            cv2.circle(morph_vis, (ccx, ccy), cr, (80, 80, 80), 1)
-        cv2.circle(morph_vis, (cx, cy), r, (255, 255, 255), 2)
+            cv2.circle(morph_vis, (int(ccx), int(ccy)), int(cr), (80, 80, 80), 1)
+        cv2.circle(morph_vis, (int(cx), int(cy)), int(r), (255, 255, 255), 2)
         morph_gray = cv2.cvtColor(morph_vis, cv2.COLOR_BGR2GRAY)
         intermediate["p_morph"] = morph_gray
 
@@ -344,9 +344,9 @@ class PupilDetector:
         # Subpixel refinement: fit parabola around peak
         best_cx, best_cy = self._refine_peak(accum_blur, best_cx, best_cy)
 
-        # Scale back up
-        cx_full = int(best_cx * ds)
-        cy_full = int(best_cy * ds)
+        # Scale back up (keep float for subpixel precision)
+        cx_full = float(best_cx * ds)
+        cy_full = float(best_cy * ds)
 
         # Estimate radius: find the dark region around the center
         radius = self._estimate_radius_from_center(blurred, cx_full, cy_full)
@@ -376,11 +376,11 @@ class PupilDetector:
                 ry = cy + (t - b) / denom
         return rx, ry
 
-    def _estimate_radius_from_center(self, blurred: np.ndarray, cx: int, cy: int) -> int:
+    def _estimate_radius_from_center(self, blurred: np.ndarray, cx: float, cy: float) -> float:
         """Estimate pupil radius by scanning outward from center until brightness jumps."""
         h, w = blurred.shape
-        cx = max(0, min(w-1, cx))
-        cy = max(0, min(h-1, cy))
+        cx = max(0, min(w-1, int(cx)))
+        cy = max(0, min(h-1, int(cy)))
         center_val = float(blurred[cy, cx])
 
         best_r = self.min_radius
@@ -511,15 +511,15 @@ class PupilDetector:
         M = cv2.moments(best_cnt)
         if M["m00"] == 0:
             return PupilResult(debug_mask=region, intermediate_frames=intermediate)
-        cx = int(M["m10"] / M["m00"])
-        cy = int(M["m01"] / M["m00"])
-        radius = int(np.sqrt(area / np.pi))
+        cx = M["m10"] / M["m00"]
+        cy = M["m01"] / M["m00"]
+        radius = float(np.sqrt(area / np.pi))
 
         if len(best_cnt) >= 5:
             ellipse = cv2.fitEllipse(best_cnt)
-            cx = int(ellipse[0][0])
-            cy = int(ellipse[0][1])
-            radius = int((ellipse[1][0] + ellipse[1][1]) / 4)
+            cx = float(ellipse[0][0])
+            cy = float(ellipse[0][1])
+            radius = float((ellipse[1][0] + ellipse[1][1]) / 4)
 
         confidence = min(circ * 1.2, 1.0)
 

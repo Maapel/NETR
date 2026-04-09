@@ -109,8 +109,8 @@ class EyePipeline:
 
         # Pupil ellipse + crosshair
         if pr.center:
-            cx, cy = pr.center
-            r = pr.radius or 20
+            cx, cy = int(pr.center[0]), int(pr.center[1])
+            r = int(pr.radius or 20)
             if pr.ellipse:
                 cv2.ellipse(out, pr.ellipse, (0, 200, 255), 2)
             else:
@@ -122,21 +122,23 @@ class EyePipeline:
         # All glints
         for i, (gx, gy) in enumerate(gr.glints):
             color = (0, 255, 255) if i == 0 else (200, 200, 0)
-            cv2.circle(out, (gx, gy), 6, color, 2)
-            cv2.circle(out, (gx, gy), 2, color, -1)
+            igx, igy = int(gx), int(gy)
+            cv2.circle(out, (igx, igy), 6, color, 2)
+            cv2.circle(out, (igx, igy), 2, color, -1)
 
         # PCCR vector arrow
         if result.pccr_vector and result.glint_pos and result.pupil_center:
-            cv2.arrowedLine(out, result.glint_pos, result.pupil_center,
-                            (255, 0, 255), 2, tipLength=0.15)
+            gp = (int(result.glint_pos[0]), int(result.glint_pos[1]))
+            pp = (int(result.pupil_center[0]), int(result.pupil_center[1]))
+            cv2.arrowedLine(out, gp, pp, (255, 0, 255), 2, tipLength=0.15)
 
         # HUD text
         h = bgr.shape[0]
         if pr.center:
-            cv2.putText(out, f"Pupil ({pr.center[0]},{pr.center[1]}) r={pr.radius}",
+            cv2.putText(out, f"Pupil ({pr.center[0]:.1f},{pr.center[1]:.1f}) r={pr.radius:.1f}",
                         (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
         if gr.primary:
-            cv2.putText(out, f"Glint ({gr.primary[0]},{gr.primary[1]})",
+            cv2.putText(out, f"Glint ({gr.primary[0]:.1f},{gr.primary[1]:.1f})",
                         (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
         if result.pccr_vector:
             dx, dy = result.pccr_vector

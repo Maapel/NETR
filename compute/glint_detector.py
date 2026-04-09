@@ -19,8 +19,8 @@ from dataclasses import dataclass, field
 
 @dataclass
 class GlintResult:
-    glints: list[tuple[int, int]] = field(default_factory=list)   # all detected glints
-    primary: tuple[int, int] | None = None                        # best glint for PCCR
+    glints: list[tuple[float, float]] = field(default_factory=list)  # all detected glints
+    primary: tuple[float, float] | None = None                       # best glint for PCCR
     debug_mask: np.ndarray | None = None
     intermediate_frames: dict = field(default_factory=dict)
 
@@ -96,8 +96,8 @@ class GlintDetector:
             M = cv2.moments(cnt)
             if M["m00"] == 0:
                 continue
-            gx = int(M["m10"] / M["m00"])
-            gy = int(M["m01"] / M["m00"])
+            gx = M["m10"] / M["m00"]
+            gy = M["m01"] / M["m00"]
 
             # Peak brightness in the blob region
             blob_mask = np.zeros_like(gray)

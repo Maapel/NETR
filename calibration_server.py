@@ -92,6 +92,12 @@ _last_pccr_ts: float = 0.0
 _saccade_samples: list[dict] = []
 _saccade_lock = threading.Lock()
 
+# Push-based capture: frames received from receiver during the active capture window
+_pending_eye: list[dict] = []   # [{ts, dx, dy}] for the current target
+_pending_target: dict | None = None  # {x, y} of the target being captured
+_pending_lock = threading.Lock()
+FIXATE_MS = 300   # capture window duration (matches JS FIXATE_MS)
+
 _model = GazeModel()                          # scene-space model (saved to disk)
 _screen_model = GazeModel()                   # screen-space model (for live cursor)
 SCREEN_MODEL_PATH = pathlib.Path(__file__).parent / "screen_model.json"
@@ -140,6 +146,147 @@ def _rec_stop() -> str:
     path = str(_rec_dir) if _rec_dir else ""
     print(f"[rec] Recording saved → {path}")
     return path
+
+def _set_calib_window(x: float, y: float, from_ms: float, until_ms: float):
+    """Tell receiver to push eye frames for this target window. Fire-and-forget."""
+    def _send():
+        try:
+            body = json.dumps({"x": x, "y": y,
+                               "from_ms": from_ms, "until_ms": until_ms}).encode()
+            req = urllib.request.Request(
+                f"{RECEIVER_URL}/calib_window",
+                data=body,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            urllib.request.urlopen(req, timeout=0.2).close()
+        except Exception:
+            pass
+    threading.Thread(target=_send, daemon=True).start()
+
+
+def _clear_calib_window():
+    """Tell receiver to stop capturing (window expired)."""
+    def _send():
+        try:
+            req = urllib.request.Request(
+                f"{RECEIVER_URL}/calib_window",
+                data=b'{"clear":true}',
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            urllib.request.urlopen(req, timeout=0.2).close()
+        except Exception:
+            pass
+    threading.Thread(target=_send, daemon=True).start()
+
+
+def _fetch_world_frame_at(ts_ms: float) -> np.ndarray | None:
+    """Fetch the world-cam JPEG closest to ts_ms from receiver and decode it."""
+    url = f"{RECEIVER_URL}/closest_frame?cam={SCENE_CAM_ID}&ts_ms={ts_ms:.3f}"
+    try:
+        with urllib.request.urlopen(url, timeout=0.5) as r:
+            data = r.read()
+        arr = np.frombuffer(data, dtype=np.uint8)
+        return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    except Exception:
+        return None
+
+
+def _flush_pending_target():
+    """For each captured eye frame, fetch the world frame at the same timestamp,
+    run ArUco, compute scene_xy, then average all synced (dx,dy,X,Y) pairs."""
+    global _pending_eye, _pending_target
+    with _pending_lock:
+        eyes   = list(_pending_eye)
+        target = _pending_target
+        _pending_eye    = []
+        _pending_target = None
+    if not eyes or not target:
+        return
+    import numpy as _np
+
+    sx, sy = target["x"], target["y"]
+
+    # Build per-sample synced tuples: fetch world frame at each eye timestamp
+    synced: list[tuple[float, float, float, float]] = []   # (dx, dy, X, Y)
+    aruco_miss = 0
+    for e in eyes:
+        frame = _fetch_world_frame_at(e["ts"])
+        if frame is None:
+            aruco_miss += 1
+            continue
+        detected, _ = _detect_aruco_corners(frame)
+        if not detected:
+            aruco_miss += 1
+            continue
+        H = _compute_homography(detected)
+        if H is None:
+            aruco_miss += 1
+            continue
+        pt = np.array([[[sx, sy]]], dtype=np.float32)
+        sc = cv2.perspectiveTransform(pt, H)[0][0]
+        synced.append((e["dx"], e["dy"], float(sc[0]), float(sc[1])))
+
+    n_synced = len(synced)
+    print(f"[calib] Target ({sx:.0f},{sy:.0f}) n={len(eyes)} synced={n_synced} aruco_miss={aruco_miss}")
+    if n_synced == 0:
+        print(f"[calib] No synced samples for target ({sx:.0f},{sy:.0f}) — skipped")
+        return
+
+    dxs = _np.array([s[0] for s in synced])
+    dys = _np.array([s[1] for s in synced])
+    Xs  = _np.array([s[2] for s in synced])
+    Ys  = _np.array([s[3] for s in synced])
+
+    # Drop frozen (all identical) — tracking stuck
+    if dxs.std() == 0 and dys.std() == 0:
+        print(f"[calib] Skipping frozen target ({sx:.0f},{sy:.0f}) n={n_synced}")
+        return
+
+    # IQR outlier rejection on PCCR
+    def _iqr_mask(arr):
+        q1, q3 = _np.percentile(arr, [25, 75])
+        iqr = q3 - q1
+        return (arr >= q1 - 1.5*iqr) & (arr <= q3 + 1.5*iqr)
+    mask = _iqr_mask(dxs) & _iqr_mask(dys)
+    n_clean = int(mask.sum())
+    avg_dx = float(dxs[mask].mean() if n_clean >= 2 else dxs.mean())
+    avg_dy = float(dys[mask].mean() if n_clean >= 2 else dys.mean())
+    avg_X  = float(Xs[mask].mean()  if n_clean >= 2 else Xs.mean())
+    avg_Y  = float(Ys[mask].mean()  if n_clean >= 2 else Ys.mean())
+
+    print(f"[calib] Target ({sx:.0f},{sy:.0f}) clean={n_clean} "
+          f"dx={avg_dx:.2f}±{dxs.std():.2f} dy={avg_dy:.2f}±{dys.std():.2f} "
+          f"X={avg_X:.1f} Y={avg_Y:.1f}")
+
+    # Record fixation
+    if _recording and _rec_fixation_f:
+        try:
+            _rec_fixation_f.write(json.dumps({
+                "ts": eyes[-1]["ts"], "x": sx, "y": sy,
+                "eye": {"dx": avg_dx, "dy": avg_dy, "n": n_synced,
+                        "dx_std": float(dxs.std()), "dy_std": float(dys.std()),
+                        "eye_ts": eyes[-1]["ts"]},
+                "scene": {"X": avg_X, "Y": avg_Y},
+            }) + "\n")
+            _rec_fixation_f.flush()
+        except Exception: pass
+
+    # Add to calibration dataset — scene_xy is the temporally-matched average
+    with _saccade_lock:
+        _saccade_samples.append({"dx": avg_dx, "dy": avg_dy,
+                                 "X": avg_X, "Y": avg_Y, "sx": sx, "sy": sy})
+    n = len(_saccade_samples)
+    diag = _refit_models()
+    if diag:
+        _broadcast(json.dumps({
+            "type": "ready",
+            "n": n,
+            "r2_x": round(diag["r2_x"], 3),
+            "r2_y": round(diag["r2_y"], 3),
+        }))
+
 
 def _refit_models():
     """Refit both models from current saccade samples. Called after each fixation."""
@@ -214,9 +361,12 @@ _screen_markers: dict = {}
 _screen_markers_lock = threading.Lock()
 
 
+_clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+
 def _detect_aruco_corners(frame_bgr: np.ndarray) -> tuple[dict[int, np.ndarray] | None, list[int]]:
     """Detect ArUco markers. Returns (dict id->center, list of all found ids). dict is None if <4 required found."""
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    gray = _clahe.apply(gray)   # boost contrast before detection (handles dark/low-exposure frames)
     with _aruco_lock:
         det = _aruco_detector
     corners, ids, _ = det.detectMarkers(gray)
@@ -380,46 +530,61 @@ _last_screen_size = [0, 0]   # updated by websocket messages
 
 # ── Eye vector poller ─────────────────────────────────────────────────────────
 def _eye_poll_thread():
-    """Poll receiver /stats for live pccr_vector and buffer it."""
+    """Poll engine /result directly for PCCR with the engine's own processing timestamp.
+
+    Using engine timestamp instead of poll time because:
+    - Engine stamps each frame when processing finishes (time.time())
+    - Calibration server and browser both use the same laptop wall clock
+    - Poll time would add up to 33ms jitter per sample; engine ts is accurate to frame
+    - Deduplication by engine ts prevents the same frame being counted twice
+      (engine ~14fps, poll ~30Hz → each frame would otherwise appear ~2x)
+    """
     global _last_pccr_ts
-    stats_url = f"{RECEIVER_URL}/stats"
+    result_url = f"{ENGINE_URL}/result"
     prev_vec_ok = None
+    _last_engine_ts: float = 0.0   # track last seen engine frame ts for deduplication
+
     while True:
         try:
-            with urllib.request.urlopen(stats_url, timeout=1) as resp:
+            with urllib.request.urlopen(result_url, timeout=1) as resp:
                 d = json.loads(resp.read())
-            vec = d.get("pccr_vector")
-            ts = time.time() * 1000  # ms
-            if vec and len(vec) == 2:
-                _last_pccr_ts = ts
+            vec = d.get("pccr_vector") if d.get("ready") else None
+            # Engine stores ts in seconds; convert to ms for consistency with browser
+            engine_ts_ms = d.get("ts", 0.0) * 1000
+
+            if vec and len(vec) == 2 and engine_ts_ms > 0:
+                _last_pccr_ts = engine_ts_ms
                 with _debug_lock:
                     _debug["eye_poll_ok"] = True
                     _debug["eye_poll_error"] = ""
                     _debug["pccr_vector"] = [round(vec[0], 3), round(vec[1], 3)]
                     _debug["pccr_age_ms"] = 0
                 if prev_vec_ok is not True:
-                    print(f"[eye] pccr_vector OK: {vec}")
+                    print(f"[eye] pccr_vector OK (engine ts): {vec}")
                     prev_vec_ok = True
-                # Always buffer — so data is ready the moment calibration starts
-                with _eye_lock:
-                    _eye_buf.append({"ts": ts, "dx": vec[0], "dy": vec[1]})
-                    cutoff = ts - 10000
-                    while _eye_buf and _eye_buf[0]["ts"] < cutoff:
-                        _eye_buf.pop(0)
-                # Record eye stream
-                if _recording and _rec_eye_f:
-                    try:
-                        _rec_eye_f.write(json.dumps({"ts": ts, "dx": vec[0], "dy": vec[1]}) + "\n")
-                        _rec_eye_f.flush()
-                    except Exception: pass
+
+                # Only add to buffer if this is a new engine frame (dedup)
+                if engine_ts_ms > _last_engine_ts:
+                    _last_engine_ts = engine_ts_ms
+                    entry = {"ts": engine_ts_ms, "dx": vec[0], "dy": vec[1]}
+                    with _eye_lock:
+                        _eye_buf.append(entry)
+                        cutoff = engine_ts_ms - 10000
+                        while _eye_buf and _eye_buf[0]["ts"] < cutoff:
+                            _eye_buf.pop(0)
+                    if _recording and _rec_eye_f:
+                        try:
+                            _rec_eye_f.write(json.dumps(entry) + "\n")
+                            _rec_eye_f.flush()
+                        except Exception: pass
             else:
-                age = ts - _last_pccr_ts if _last_pccr_ts else None
+                poll_ts = time.time() * 1000
+                age = poll_ts - _last_pccr_ts if _last_pccr_ts else None
                 with _debug_lock:
                     _debug["pccr_vector"] = None
                     _debug["pccr_age_ms"] = round(age) if age else None
                 if prev_vec_ok is not False:
-                    analysis = d.get("analysis_enabled", "?")
-                    print(f"[eye] pccr_vector is null — analysis_enabled={analysis}. "
+                    print(f"[eye] pccr_vector is null — engine ready={d.get('ready')}. "
                           "Check: engine running? analysis toggled on? eye cam correct?")
                     prev_vec_ok = False
         except Exception as e:
@@ -428,12 +593,12 @@ def _eye_poll_thread():
                 _debug["eye_poll_ok"] = False
                 _debug["eye_poll_error"] = err
             if prev_vec_ok is not False:
-                print(f"[eye] Error polling {stats_url}: {err}")
+                print(f"[eye] Error polling {result_url}: {err}")
                 prev_vec_ok = False
         with _debug_lock:
             _debug["target_buf_size"] = len(_target_buf)
             _debug["eye_buf_size"] = len(_eye_buf)
-        time.sleep(0.033)  # ~30 Hz
+        time.sleep(0.033)  # ~30 Hz poll; dedup ensures each engine frame counted once
 
 
 # ── Temporal sync ─────────────────────────────────────────────────────────────
@@ -630,6 +795,10 @@ def _handle_ws(rfile, wfile):
                     _eye_buf.clear()
                 with _saccade_lock:
                     _saccade_samples.clear()
+                with _pending_lock:
+                    _pending_eye.clear()
+                    _pending_target = None
+                _clear_calib_window()
                 # Auto-start recording if not already recording
                 if _recording and _rec_target_f:
                     try:
@@ -652,42 +821,27 @@ def _handle_ws(rfile, wfile):
                         except Exception: pass
 
             elif mtype == "fixation":
-                # Saccade mode: eye has settled on this point — find closest eye vector
+                # Saccade mode: eye has settled — eye is now fixated for FIXATE_MS.
+                # 1. Flush pending samples from the PREVIOUS target (now complete).
+                # 2. Open a new capture window for this target on the receiver.
+                # Receiver will push eye frames during [fixation_ts, fixation_ts+FIXATE_MS].
                 if _calibrating:
-                    ts = msg["ts"]
-                    with _eye_lock:
-                        eyes = list(_eye_buf)
-                    best = min(eyes, key=lambda e: abs(e["ts"] - ts), default=None)
-                    # Record raw fixation regardless of match quality
-                    if _recording and _rec_fixation_f:
+                    ts = msg["ts"]   # ms, same clock as receiver's time.time()*1000
+                    x, y = msg["x"], msg["y"]
+                    # Flush previous target's accumulated frames → adds to dataset
+                    threading.Thread(target=_flush_pending_target, daemon=True).start()
+                    # Register new target and open capture window on receiver
+                    with _pending_lock:
+                        _pending_target = {"x": x, "y": y}
+                    _set_calib_window(x, y, from_ms=ts, until_ms=ts + FIXATE_MS)
+                    # Record fixation event
+                    if _recording and _rec_target_f:
                         try:
-                            eye_snap = {"dx": best["dx"], "dy": best["dy"],
-                                        "eye_ts": best["ts"]} if best else None
-                            _rec_fixation_f.write(json.dumps({
-                                "ts": ts, "x": msg["x"], "y": msg["y"],
-                                "eye": eye_snap,
+                            _rec_target_f.write(json.dumps({
+                                "ts": ts, "x": x, "y": y, "event": "fixation"
                             }) + "\n")
-                            _rec_fixation_f.flush()
+                            _rec_target_f.flush()
                         except Exception: pass
-                    if best and abs(best["ts"] - ts) <= SYNC_WINDOW_MS * 3:
-                        scene_xy = _screen_to_scene(msg["x"], msg["y"])
-                        if scene_xy:
-                            X, Y = scene_xy
-                            with _saccade_lock:
-                                _saccade_samples.append({
-                                    "dx": best["dx"], "dy": best["dy"],
-                                    "X": X, "Y": Y,
-                                    "sx": msg["x"], "sy": msg["y"],
-                                })
-                            n = len(_saccade_samples)
-                            diag = _refit_models()
-                            if diag:
-                                _broadcast(json.dumps({
-                                    "type": "ready",
-                                    "n": n,
-                                    "r2_x": round(diag["r2_x"], 3),
-                                    "r2_y": round(diag["r2_y"], 3),
-                                }))
 
             elif mtype == "stop":
                 _calibrating = False
@@ -1552,6 +1706,72 @@ fetch('/viz/data').then(r=>r.json()).then(({samples, n, model_trained}) => {
   scatter('cScene', X,  Y,  colours, 'X(scene)', 'Y(scene)');
   scatter('cDxX',   sx, dx, colours, 'screen X', 'dx');
   scatter('cDyY',   sy, dy, colours, 'screen Y', 'dy');
+
+  // Correlation table
+  if (data.corr && Object.keys(data.corr).length) {
+    const c = data.corr;
+    const bar = v => {
+      const pct = Math.round(Math.abs(v)*100);
+      const col = Math.abs(v) > 0.5 ? '#4c4' : Math.abs(v) > 0.25 ? '#aa4' : '#a44';
+      return `<span style="display:inline-block;width:${pct}px;height:8px;background:${col};vertical-align:middle"></span>`;
+    };
+    document.getElementById('statsGlobal').innerHTML += `
+      <table style="margin-top:10px;font-family:monospace;font-size:11px;color:#aaa;border-collapse:collapse">
+        <tr><th style="padding:2px 8px;color:#888">Correlation</th><th>screen X</th><th>screen Y</th></tr>
+        <tr><td style="padding:2px 8px">PCCR dx</td>
+            <td>${c.dx_sx.toFixed(3)} ${bar(c.dx_sx)}</td>
+            <td>${c.dx_sy.toFixed(3)} ${bar(c.dx_sy)}</td></tr>
+        <tr><td style="padding:2px 8px">PCCR dy</td>
+            <td>${c.dy_sx.toFixed(3)} ${bar(c.dy_sx)}</td>
+            <td>${c.dy_sy.toFixed(3)} ${bar(c.dy_sy)}</td></tr>
+      </table>
+      <div style="margin-top:6px;font-size:10px;color:#666">
+        Good: |r|&gt;0.6 for dx↔X and dy↔Y. If dy↔X is stronger, camera may be rotated ~90°.
+        If all correlations near 0, PCCR is not encoding gaze (check glint detection + camera angle).
+      </div>`;
+  }
+
+  // Residuals plot (predicted vs actual screen position)
+  if (data.preds && data.preds.length === n) {
+    const panel = document.createElement('div'); panel.className='panel';
+    panel.innerHTML = '<div class="label">Residuals: predicted vs actual screen position</div>' +
+                      '<canvas id="cResid" height="300"></canvas>' +
+                      '<div class="stats" id="statsResid"></div>';
+    document.querySelector('.grid').appendChild(panel);
+    setTimeout(() => {
+      const px_arr = data.preds.map(p=>p.px), py_arr = data.preds.map(p=>p.py);
+      const ex = sx.map((v,i)=>v - px_arr[i]);
+      const ey = sy.map((v,i)=>v - py_arr[i]);
+      const dist = ex.map((v,i)=>Math.sqrt(v*v+ey[i]*ey[i]));
+      const mae = dist.reduce((a,b)=>a+b,0)/dist.length;
+      const max_err = Math.max(...dist);
+      const colResid = dist.map(d => {
+        const t = Math.min(d/300,1);
+        return `hsl(${Math.round((1-t)*120)},80%,50%)`;
+      });
+      scatter('cResid', px_arr, py_arr, colResid, 'pred X', 'pred Y');
+      // Draw actual positions too
+      const c = document.getElementById('cResid');
+      const ctx = c.getContext('2d');
+      const W=c.width, H=c.height, pad=36;
+      const mnX=Math.min(...px_arr), mxX=Math.max(...px_arr);
+      const mnY=Math.min(...py_arr), mxY=Math.max(...py_arr);
+      const tx = v => pad+(v-mnX)/(mxX-mnX||1)*(W-2*pad);
+      const ty = v => H-pad-(v-mnY)/(mxY-mnY||1)*(H-2*pad);
+      ctx.strokeStyle='rgba(255,255,255,0.3)'; ctx.lineWidth=1;
+      px_arr.forEach((_,i) => {
+        ctx.beginPath();
+        ctx.moveTo(tx(px_arr[i]), ty(py_arr[i]));
+        ctx.lineTo(tx(sx[i]), ty(sy[i]));
+        ctx.stroke();
+      });
+      document.getElementById('statsResid').innerHTML =
+        `MAE=<span>${mae.toFixed(1)}px</span>  max_err=<span>${max_err.toFixed(1)}px</span>  ` +
+        (mae < 100 ? '<span style="color:#4c4">OK</span>' :
+         mae < 200 ? '<span style="color:#aa4">moderate</span>' :
+                     '<span style="color:#a44">poor — check PCCR correlations</span>');
+    }, 50);
+  }
 });
 </script></body></html>"""
 
@@ -1731,9 +1951,36 @@ class Handler(BaseHTTPRequestHandler):
                 samples = live  # prefer in-memory if available
 
             if self.path == "/viz/data":
+                # Compute correlations and model predictions server-side
+                corr = {}
+                preds = []
+                if len(samples) >= 3:
+                    import numpy as _np
+                    _dx = _np.array([s["dx"] for s in samples])
+                    _dy = _np.array([s["dy"] for s in samples])
+                    _sx = _np.array([s.get("sx", s.get("X", 0)) for s in samples])
+                    _sy = _np.array([s.get("sy", s.get("Y", 0)) for s in samples])
+                    def _corr(a, b):
+                        if a.std() == 0 or b.std() == 0: return 0.0
+                        return float(_np.corrcoef(a, b)[0, 1])
+                    corr = {
+                        "dx_sx": round(_corr(_dx, _sx), 3),
+                        "dy_sx": round(_corr(_dy, _sx), 3),
+                        "dx_sy": round(_corr(_dx, _sy), 3),
+                        "dy_sy": round(_corr(_dy, _sy), 3),
+                    }
+                    if _model.trained:
+                        try:
+                            for s in samples:
+                                px, py = _model.predict(s["dx"], s["dy"])
+                                preds.append({"px": round(px, 1), "py": round(py, 1)})
+                        except Exception:
+                            preds = []
                 body = json.dumps({"samples": samples,
                                    "n": len(samples),
-                                   "model_trained": _model.trained}).encode()
+                                   "model_trained": _model.trained,
+                                   "corr": corr,
+                                   "preds": preds}).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
@@ -1749,6 +1996,47 @@ class Handler(BaseHTTPRequestHandler):
 
         else:
             self.send_response(404); self.end_headers()
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        body   = self.rfile.read(length)
+
+        if self.path == "/push_eye":
+            # Receiver pushes PCCR for a single eye frame during the capture window.
+            # Body: {"ts": float_ms, "dx": float, "dy": float, "x": float, "y": float}
+            # ts is the camera's own capture timestamp (synced to laptop clock).
+            try:
+                d = json.loads(body)
+                entry = {
+                    "ts": float(d["ts"]),
+                    "dx": float(d["dx"]),
+                    "dy": float(d["dy"]),
+                }
+                # Also buffer for display/debug
+                with _eye_lock:
+                    _eye_buf.append(entry)
+                    cutoff = entry["ts"] - 10000
+                    while _eye_buf and _eye_buf[0]["ts"] < cutoff:
+                        _eye_buf.pop(0)
+                # Record raw eye stream
+                if _recording and _rec_eye_f:
+                    try:
+                        _rec_eye_f.write(json.dumps(entry) + "\n")
+                        _rec_eye_f.flush()
+                    except Exception: pass
+                # Add to pending accumulator for current target
+                with _pending_lock:
+                    if _pending_target is not None:
+                        _pending_eye.append(entry)
+                self.send_response(200)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+            except Exception:
+                try: self.send_error(400)
+                except BrokenPipeError: pass
+        else:
+            try: self.send_error(404)
+            except BrokenPipeError: pass
 
 
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):

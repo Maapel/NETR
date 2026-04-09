@@ -218,7 +218,24 @@ class Handler(BaseHTTPRequestHandler):
             self._send(400, b'{"error":"empty body"}')
             return
         annotated = _process(jpeg)
-        self._send(200, annotated, "image/jpeg")
+        # Include PCCR + timestamp in response headers so receiver gets them
+        # inline — no separate /result round-trip needed.
+        with _latest_lock:
+            res = _latest_result
+            ts  = _latest_ts
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "image/jpeg")
+            self.send_header("Content-Length", str(len(annotated)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("X-Pccr-Ts", f"{ts:.6f}")
+            if res and res.pccr_vector:
+                self.send_header("X-Pccr-Dx", f"{res.pccr_vector[0]:.4f}")
+                self.send_header("X-Pccr-Dy", f"{res.pccr_vector[1]:.4f}")
+            self.end_headers()
+            self.wfile.write(annotated)
+        except BrokenPipeError:
+            pass
 
     # ── GET /result ───────────────────────────────────────────────────────────
     def _handle_result(self):
