@@ -880,16 +880,42 @@ document.getElementById('marker-size').addEventListener('input', function() {
   updateMarkers();
 });
 
-// ── Safe zone — avoids markers, HUD, and panels ───────────────────────────────
-function getSafeZone() {
+// ── Collision detection — list of rects to avoid ─────────────────────────────
+function getBlockedRects() {
   const S    = Math.min(W, H) * markerPct / 100;
-  const mEnd = EDGE_PX + 2 * QUIET_PX + S + 30;  // past marker edge + gap
-  return {
-    x1: mEnd,
-    y1: Math.max(70, mEnd),          // below HUD (70px) and top markers
-    x2: W - mEnd,
-    y2: H - H * 0.38,                // above bottom panels (30vh) + bottom markers
-  };
+  const mEnd = EDGE_PX + 2 * QUIET_PX + S;  // outer edge of marker+quietzone
+  const R    = TARGET_R + 6;                 // dot radius + margin
+  const rects = [
+    // HUD bar at top
+    { x: 0, y: 0, w: W, h: 70 },
+    // ArUco markers (TL, TR, BL, BR)
+    { x: 0,       y: 0,       w: mEnd, h: mEnd },
+    { x: W - mEnd,y: 0,       w: mEnd, h: mEnd },
+    { x: 0,       y: H - mEnd,w: mEnd, h: mEnd },
+    { x: W - mEnd,y: H - mEnd,w: mEnd, h: mEnd },
+    // Debug panel — bottom:30vh, left:12px, ~340px wide, ~300px tall
+    { x: 0, y: H - H*0.30 - 300, w: 360, h: 300 + H*0.30 },
+    // Scene view  — bottom:40vh, right:12px, 320px wide, ~240px tall
+    { x: W - 336, y: H - H*0.40 - 240, w: 336, h: 240 + H*0.40 },
+  ];
+  return rects;
+}
+
+function isBlocked(x, y) {
+  const R = TARGET_R + 6;
+  for (const r of getBlockedRects()) {
+    if (x + R > r.x && x - R < r.x + r.w &&
+        y + R > r.y && y - R < r.y + r.h) return true;
+  }
+  return false;
+}
+
+function safeRandom(genFn, maxTries = 30) {
+  for (let i = 0; i < maxTries; i++) {
+    const p = genFn();
+    if (!isBlocked(p.x, p.y)) return p;
+  }
+  return genFn(); // fallback: return last attempt unchecked
 }
 
 // ── Sweep mode (reading lines) ────────────────────────────────────────────────
@@ -899,13 +925,13 @@ const LINE_MS  = 5000;
 const TOTAL_MS = LINES * LINE_MS;
 
 function readingPos(t) {
-  const z = getSafeZone();
+  const pad = 40;
   const cycle   = t % TOTAL_MS;
   const lineIdx = Math.floor(cycle / LINE_MS);
   const lineT   = (cycle % LINE_MS) / LINE_MS;
   return {
-    x: z.x1 + lineT * (z.x2 - z.x1),
-    y: z.y1 + (lineIdx / (LINES - 1)) * (z.y2 - z.y1),
+    x: pad + lineT * (W - 2*pad),
+    y: pad + (lineIdx / (LINES - 1)) * (H - 2*pad),
   };
 }
 
@@ -945,20 +971,23 @@ function buildZoneSequence() {
 }
 
 function randomInZone(zoneIdx) {
-  const z     = getSafeZone();
-  const zW    = z.x2 - z.x1;
-  const zH    = z.y2 - z.y1;
-  const cellW = zW / 3;
-  const cellH = zH / 3;
+  const pad   = 40;
+  const cellW = (W - 2*pad) / 3;
+  const cellH = (H - 2*pad) / 3;
   const inset = Math.min(cellW, cellH) * 0.12;
   const col   = ZONE_POS[zoneIdx][1];
   const row   = ZONE_POS[zoneIdx][0];
-  // Center zone snaps to safe-zone center for the "true zero" baseline
-  if (zoneIdx === CENTER_ZONE) return { x: z.x1 + zW/2, y: z.y1 + zH/2 };
-  return {
-    x: z.x1 + col * cellW + inset + Math.random() * (cellW - 2*inset),
-    y: z.y1 + row * cellH + inset + Math.random() * (cellH - 2*inset),
-  };
+  if (zoneIdx === CENTER_ZONE) {
+    const p = { x: W/2, y: H/2 };
+    return isBlocked(p.x, p.y) ? safeRandom(() => ({
+      x: pad + col*cellW + inset + Math.random()*(cellW - 2*inset),
+      y: pad + row*cellH + inset + Math.random()*(cellH - 2*inset),
+    })) : p;
+  }
+  return safeRandom(() => ({
+    x: pad + col*cellW + inset + Math.random()*(cellW - 2*inset),
+    y: pad + row*cellH + inset + Math.random()*(cellH - 2*inset),
+  }));
 }
 
 let zoneSeq      = [];
