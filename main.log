@@ -1,0 +1,127 @@
+[calib_trace] WS start mode=saccade screen=[1462, 872]
+[calib_trace] calib_window POST clear ok
+[eye] pccr_vector OK (engine ts): [-64.75440050967848, -90.16882947814833]
+[calib_trace] WS fixation ts=1775782395275.3 server_now=1775782395276.3 delta_ms=-1.1 xy=(731.0,436.0) prev_eyes=0 prev_target=no will_async_flush=False capture=[1775782395275.3,1775782395575.3]
+[calib_trace] calib_window POST ok xy=(731.0,436.0) from_ms=1775782395275.3 until_ms=1775782395575.3 span=300ms
+[calib_trace] push_eye summary appended=0 dropped_no_pending_target=1 pending_buf=0
+[calib_trace] WS fixation ts=1775782396277.3 server_now=1775782396278.6 delta_ms=-1.3 xy=(1006.2,669.4) prev_eyes=0 prev_target=no will_async_flush=False capture=[1775782396277.3,1775782396577.3]
+[calib_trace] calib_window POST ok xy=(1006.2,669.4) from_ms=1775782396277.3 until_ms=1775782396577.3 span=300ms
+[calib_trace] push_eye summary appended=0 dropped_no_pending_target=1 pending_buf=0
+[calib_trace] WS fixation ts=1775782397280.3 server_now=1775782397281.1 delta_ms=-0.8 xy=(417.5,148.3) prev_eyes=0 prev_target=no will_async_flush=False capture=[1775782397280.3,1775782397580.3]
+[calib_trace] calib_window POST ok xy=(417.5,148.3) from_ms=1775782397280.3 until_ms=1775782397580.3 span=300ms
+[calib_trace] WS fixation ts=1775782398298.3 server_now=1775782398299.7 delta_ms=-1.5 xy=(728.0,633.8) prev_eyes=0 prev_target=no will_async_flush=False capture=[1775782398298.3,1775782398598.3]
+[calib_trace] calib_window POST ok xy=(728.0,633.8) from_ms=1775782398298.3 until_ms=1775782398598.3 span=300ms
+[calib_trace] WS fixation ts=1775782399301.3 server_now=1775782399303.9 delta_ms=-2.7 xy=(1116.7,239.6) prev_eyes=0 prev_target=no will_async_flush=False capture=[1775782399301.3,1775782399601.3]
+[calib_trace] calib_window POST ok xy=(1116.7,239.6) from_ms=1775782399301.3 until_ms=1775782399601.3 span=300ms
+[calib_trace] push_eye summary appended=0 dropped_no_pending_target=1 pending_buf=0
+[calib_trace] WS fixation ts=1775782400308.3 server_now=1775782400315.0 delta_ms=-6.8 xy=(382.7,632.4) prev_eyes=0 prev_target=no will_async_flush=False capture=[1775782400308.3,1775782400608.3]
+[calib_trace] calib_window POST ok xy=(382.7,632.4) from_ms=1775782400308.3 until_ms=1775782400608.3 span=300ms
+[calib_trace] push_eye summary appended=0 dropped_no_pending_target=1 pending_buf=0
+[calib_trace] WS fixation ts=1775782401322.3 server_now=1775782401323.0 delta_ms=-0.7 xy=(673.5,111.5) prev_eyes=0 prev_target=no will_async_flush=False capture=[1775782401322.3,1775782401622.3]
+[calib_trace] calib_window POST ok xy=(673.5,111.5) from_ms=1775782401322.3 until_ms=1775782401622.3 span=300ms
+[calib_trace] push_eye summary appended=0 dropped_no_pending_target=1 pending_buf=0
+[calib_trace] WS fixation ts=1775782402330.3 server_now=1775782402331.5 delta_ms=-1.3 xy=(432.3,345.8) prev_eyes=0 prev_target=no will_async_flush=False capture=[1775782402330.3,1775782402630.3]
+[calib_trace] calib_window POST ok xy=(432.3,345.8) from_ms=1775782402330.3 until_ms=1775782402630.3 span=300ms
+[calib_trace] push_eye summary appended=0 dropped_no_pending_target=1 pending_buf=0
+[calib_trace] WS fixation ts=1775782403343.3 server_now=1775782403344.6 delta_ms=-1.4 xy=(1074.5,457.5) prev_eyes=0 prev_target=no will_async_flush=False capture=[1775782403343.3,1775782403643.3]
+[calib_trace] calib_window POST ok xy=(1074.5,457.5) from_ms=1775782403343.3 until_ms=1775782403643.3 span=300ms
+[calib_trace] WS fixation ts=1775782404362.3 server_now=1775782404364.1 delta_ms=-1.9 xy=(1020.4,676.1) prev_eyes=0 prev_target=no will_async_flush=False capture=[1775782404362.3,1775782404662.3]
+[calib_trace] calib_window POST ok xy=(1020.4,676.1) from_ms=1775782404362.3 until_ms=1775782404662.3 span=300ms
+[calib_trace] push_eye summary appended=0 dropped_no_pending_target=1 pending_buf=0
+[calib_trace] WS fixation ts=1775782405364.3 server_now=1775782405365.4 delta_ms=-1.1 xy=(303.2,203.7) prev_eyes=0 prev_target=no will_async_flush=False capture=[1775782405364.3,1775782405664.3]
+[calib_trace] calib_window POST ok xy=(303.2,203.7) from_ms=1775782405364.3 until_ms=1775782405664.3 span=300ms
+[calib_trace] push_eye summary appended=0 dropped_no_pending_target=1 pending_buf=0
+[calib_trace] WS fixation ts=1775782406368.3 server_now=1775782406369.3 delta_ms=-1.0 xy=(1054.2,396.8) prev_eyes=0 prev_target=no will_async_flush=False capture=[1775782406368.3,1775782406668.3]
+[calib_trace] calib_window POST ok xy=(1054.2,396.8) from_ms=1775782406368.3 until_ms=1775782406668.3 span=300ms
+[calib_trace] push_eye summary appended=0 dropped_no_pending_target=1 pending_buf=0
+[calib_trace] WS fixation ts=1775782407386.3 server_now=1775782407387.3 delta_ms=-1.0 xy=(397.5,778.3) prev_eyes=0 prev_target=no will_async_flush=False capture=[1775782407386.3,1775782407686.3]
+[calib_trace] calib_window POST ok xy=(397.5,778.3) from_ms=1775782407386.3 until_ms=1775782407686.3 span=300ms
+[calib_trace] WS fixation ts=1775782408388.3 server_now=1775782408389.4 delta_ms=-1.2 xy=(1177.2,193.4) prev_eyes=0 prev_target=no will_async_flush=False capture=[1775782408388.3,1775782408688.3]
+[calib_trace] calib_window POST ok xy=(1177.2,193.4) from_ms=1775782408388.3 until_ms=1775782408688.3 span=300ms
+[calib_trace] push_eye summary appended=0 dropped_no_pending_target=1 pending_buf=0
+[calib_trace] WS fixation ts=1775782409390.3 server_now=1775782409391.4 delta_ms=-1.2 xy=(591.3,796.9) prev_eyes=0 prev_target=no will_async_flush=False capture=[1775782409390.3,1775782409690.3]
+[calib_trace] calib_window POST ok xy=(591.3,796.9) from_ms=1775782409390.3 until_ms=1775782409690.3 span=300ms
+[calib_trace] push_eye summary appended=0 dropped_no_pending_target=1 pending_buf=0
+[calib_trace] WS fixation ts=1775782410393.3 server_now=1775782410394.5 delta_ms=-1.2 xy=(740.4,185.0) prev_eyes=0 prev_target=no will_async_flush=False capture=[1775782410393.3,1775782410693.3]
+[calib_trace] calib_window POST ok xy=(740.4,185.0) from_ms=1775782410393.3 until_ms=1775782410693.3 span=300ms
+[calib_trace] push_eye summary appended=0 dropped_no_pending_target=1 pending_buf=0
+[calib_trace] WS fixation ts=1775782411395.3 server_now=1775782411396.6 delta_ms=-1.4 xy=(437.3,362.4) prev_eyes=0 prev_target=no will_async_flush=False capture=[1775782411395.3,1775782411695.3]
+[calib_trace] calib_window POST ok xy=(437.3,362.4) from_ms=1775782411395.3 until_ms=1775782411695.3 span=300ms
+[calib_trace] WS fixation ts=1775782412397.3 server_now=1775782412398.4 delta_ms=-1.1 xy=(437.5,744.7) prev_eyes=0 prev_target=no will_async_flush=False capture=[1775782412397.3,1775782412697.3]
+[calib_trace] calib_window POST ok xy=(437.5,744.7) from_ms=1775782412397.3 until_ms=1775782412697.3 span=300ms
+[calib_trace] WS fixation ts=1775782413399.3 server_now=1775782413400.6 delta_ms=-1.3 xy=(1058.0,117.7) prev_eyes=0 prev_target=no will_async_flush=False capture=[1775782413399.3,1775782413699.3]
+[calib_trace] calib_window POST ok xy=(1058.0,117.7) from_ms=1775782413399.3 until_ms=1775782413699.3 span=300ms
+[calib_trace] push_eye summary appended=0 dropped_no_pending_target=1 pending_buf=0
+[calib_trace] WS fixation ts=1775782414435.3 server_now=1775782414439.1 delta_ms=-3.9 xy=(445.6,478.2) prev_eyes=0 prev_target=no will_async_flush=False capture=[1775782414435.3,1775782414735.3]
+[calib_trace] calib_window POST ok xy=(445.6,478.2) from_ms=1775782414435.3 until_ms=1775782414735.3 span=300ms
+[calib_trace] push_eye summary appended=0 dropped_no_pending_target=1 pending_buf=0
+[calib_trace] WS fixation ts=1775782415437.3 server_now=1775782415438.4 delta_ms=-1.1 xy=(1039.5,609.7) prev_eyes=0 prev_target=no will_async_flush=False capture=[1775782415437.3,1775782415737.3]
+[calib_trace] calib_window POST ok xy=(1039.5,609.7) from_ms=1775782415437.3 until_ms=1775782415737.3 span=300ms
+[calib_trace] WS fixation ts=1775782416439.3 server_now=1775782416440.4 delta_ms=-1.1 xy=(298.1,226.2) prev_eyes=0 prev_target=no will_async_flush=False capture=[1775782416439.3,1775782416739.3]
+[calib_trace] calib_window POST ok xy=(298.1,226.2) from_ms=1775782416439.3 until_ms=1775782416739.3 span=300ms
+[calib_trace] push_eye summary appended=0 dropped_no_pending_target=1 pending_buf=0
+[calib_trace] WS fixation ts=1775782417441.3 server_now=1775782417442.8 delta_ms=-1.6 xy=(1069.1,392.4) prev_eyes=0 prev_target=no will_async_flush=False capture=[1775782417441.3,1775782417741.3]
+[calib_trace] calib_window POST ok xy=(1069.1,392.4) from_ms=1775782417441.3 until_ms=1775782417741.3 span=300ms
+[calib_trace] WS fixation ts=1775782418444.3 server_now=1775782418451.2 delta_ms=-7.0 xy=(764.5,689.7) prev_eyes=0 prev_target=no will_async_flush=False capture=[1775782418444.3,1775782418744.3]
+[calib_trace] calib_window POST ok xy=(764.5,689.7) from_ms=1775782418444.3 until_ms=1775782418744.3 span=300ms
+[calib_trace] WS fixation ts=1775782419446.3 server_now=1775782419447.1 delta_ms=-0.9 xy=(648.5,231.5) prev_eyes=0 prev_target=no will_async_flush=False capture=[1775782419446.3,1775782419746.3]
+[calib_trace] calib_window POST ok xy=(648.5,231.5) from_ms=1775782419446.3 until_ms=1775782419746.3 span=300ms
+[calib_trace] push_eye summary appended=0 dropped_no_pending_target=1 pending_buf=0
+[calib_trace] WS fixation ts=1775782420448.3 server_now=1775782420449.8 delta_ms=-1.5 xy=(340.4,269.2) prev_eyes=0 prev_target=no will_async_flush=False capture=[1775782420448.3,1775782420748.3]
+[calib_trace] calib_window POST ok xy=(340.4,269.2) from_ms=1775782420448.3 until_ms=1775782420748.3 span=300ms
+[calib_trace] push_eye summary appended=0 dropped_no_pending_target=1 pending_buf=0
+[calib_trace] WS fixation ts=1775782421452.3 server_now=1775782421464.0 delta_ms=-11.8 xy=(1018.8,689.0) prev_eyes=0 prev_target=no will_async_flush=False capture=[1775782421452.3,1775782421752.3]
+[calib_trace] calib_window POST ok xy=(1018.8,689.0) from_ms=1775782421452.3 until_ms=1775782421752.3 span=300ms
+[calib_trace] push_eye summary appended=0 dropped_no_pending_target=1 pending_buf=0
+[calib_trace] WS fixation ts=1775782422458.3 server_now=1775782422459.9 delta_ms=-1.7 xy=(692.7,239.8) prev_eyes=0 prev_target=no will_async_flush=False capture=[1775782422458.3,1775782422758.3]
+[calib_trace] calib_window POST ok xy=(692.7,239.8) from_ms=1775782422458.3 until_ms=1775782422758.3 span=300ms
+[calib_trace] push_eye summary appended=0 dropped_no_pending_target=1 pending_buf=0
+[calib_trace] WS fixation ts=1775782423477.3 server_now=1775782423480.2 delta_ms=-3.0 xy=(421.4,770.6) prev_eyes=0 prev_target=no will_async_flush=False capture=[1775782423477.3,1775782423777.3]
+[calib_trace] calib_window POST ok xy=(421.4,770.6) from_ms=1775782423477.3 until_ms=1775782423777.3 span=300ms
+[calib_trace] push_eye summary appended=0 dropped_no_pending_target=1 pending_buf=0
+[calib_trace] WS fixation ts=1775782424492.3 server_now=1775782424495.3 delta_ms=-3.1 xy=(1007.3,226.8) prev_eyes=0 prev_target=no will_async_flush=False capture=[1775782424492.3,1775782424792.3]
+[calib_trace] calib_window POST ok xy=(1007.3,226.8) from_ms=1775782424492.3 until_ms=1775782424792.3 span=300ms
+[calib_trace] push_eye summary appended=0 dropped_no_pending_target=1 pending_buf=0
+[calib_trace] WS fixation ts=1775782425510.3 server_now=1775782425511.1 delta_ms=-0.8 xy=(427.8,351.1) prev_eyes=0 prev_target=no will_async_flush=False capture=[1775782425510.3,1775782425810.3]
+[calib_trace] calib_window POST ok xy=(427.8,351.1) from_ms=1775782425510.3 until_ms=1775782425810.3 span=300ms
+[calib_trace] push_eye summary appended=0 dropped_no_pending_target=1 pending_buf=0
+[calib_trace] WS fixation ts=1775782426512.3 server_now=1775782426514.0 delta_ms=-1.8 xy=(1026.0,367.2) prev_eyes=0 prev_target=no will_async_flush=False capture=[1775782426512.3,1775782426812.3]
+[calib_trace] calib_window POST ok xy=(1026.0,367.2) from_ms=1775782426512.3 until_ms=1775782426812.3 span=300ms
+[calib_trace] push_eye summary appended=0 dropped_no_pending_target=1 pending_buf=0
+[calib_trace] WS fixation ts=1775782427514.3 server_now=1775782427516.1 delta_ms=-1.8 xy=(825.8,727.6) prev_eyes=0 prev_target=no will_async_flush=False capture=[1775782427514.3,1775782427814.3]
+[calib_trace] calib_window POST ok xy=(825.8,727.6) from_ms=1775782427514.3 until_ms=1775782427814.3 span=300ms
+[calib_trace] push_eye summary appended=0 dropped_no_pending_target=1 pending_buf=0
+[calib_trace] WS fixation ts=1775782428517.3 server_now=1775782428518.4 delta_ms=-1.1 xy=(393.2,768.8) prev_eyes=0 prev_target=no will_async_flush=False capture=[1775782428517.3,1775782428817.3]
+[calib_trace] calib_window POST ok xy=(393.2,768.8) from_ms=1775782428517.3 until_ms=1775782428817.3 span=300ms
+[calib_trace] push_eye summary appended=0 dropped_no_pending_target=1 pending_buf=0
+[calib_trace] WS fixation ts=1775782429519.3 server_now=1775782429521.0 delta_ms=-1.7 xy=(1182.9,98.7) prev_eyes=0 prev_target=no will_async_flush=False capture=[1775782429519.3,1775782429819.3]
+[calib_trace] calib_window POST ok xy=(1182.9,98.7) from_ms=1775782429519.3 until_ms=1775782429819.3 span=300ms
+[calib_trace] push_eye summary appended=0 dropped_no_pending_target=1 pending_buf=0
+[calib_trace] WS fixation ts=1775782430521.3 server_now=1775782430523.3 delta_ms=-2.0 xy=(384.7,485.8) prev_eyes=0 prev_target=no will_async_flush=False capture=[1775782430521.3,1775782430821.3]
+[calib_trace] calib_window POST ok xy=(384.7,485.8) from_ms=1775782430521.3 until_ms=1775782430821.3 span=300ms
+[calib_trace] push_eye summary appended=0 dropped_no_pending_target=1 pending_buf=0
+[calib_trace] WS fixation ts=1775782431541.3 server_now=1775782431542.1 delta_ms=-0.8 xy=(1090.1,712.5) prev_eyes=0 prev_target=no will_async_flush=False capture=[1775782431541.3,1775782431841.3]
+[calib_trace] calib_window POST ok xy=(1090.1,712.5) from_ms=1775782431541.3 until_ms=1775782431841.3 span=300ms
+[calib_trace] push_eye summary appended=0 dropped_no_pending_target=1 pending_buf=0
+[calib_trace] WS fixation ts=1775782432542.3 server_now=1775782432543.7 delta_ms=-1.4 xy=(437.3,186.8) prev_eyes=0 prev_target=no will_async_flush=False capture=[1775782432542.3,1775782432842.3]
+[calib_trace] calib_window POST ok xy=(437.3,186.8) from_ms=1775782432542.3 until_ms=1775782432842.3 span=300ms
+[calib_trace] push_eye summary appended=0 dropped_no_pending_target=1 pending_buf=0
+[calib_trace] WS fixation ts=1775782433545.3 server_now=1775782433546.5 delta_ms=-1.3 xy=(1015.6,418.0) prev_eyes=0 prev_target=no will_async_flush=False capture=[1775782433545.3,1775782433845.3]
+[calib_trace] calib_window POST ok xy=(1015.6,418.0) from_ms=1775782433545.3 until_ms=1775782433845.3 span=300ms
+[calib_trace] push_eye summary appended=0 dropped_no_pending_target=1 pending_buf=0
+[calib_trace] WS fixation ts=1775782434548.3 server_now=1775782434549.2 delta_ms=-0.9 xy=(791.6,122.4) prev_eyes=0 prev_target=no will_async_flush=False capture=[1775782434548.3,1775782434848.3]
+[calib_trace] calib_window POST ok xy=(791.6,122.4) from_ms=1775782434548.3 until_ms=1775782434848.3 span=300ms
+[scene] frame=1280×720  brightness=45/255  ArUco: 3 found IDs=[0, 1, 2]  MISSING=[3]
+[scene] frame=1280×720  brightness=44/255  ArUco: 4 found IDs=[0, 1, 3, 2]  → homography OK
+[calib_trace] push_eye summary appended=0 dropped_no_pending_target=1 pending_buf=0
+[calib_trace] WS fixation ts=1775782435566.3 server_now=1775782435567.9 delta_ms=-1.6 xy=(748.4,696.9) prev_eyes=0 prev_target=no will_async_flush=False capture=[1775782435566.3,1775782435866.3]
+[calib_trace] calib_window POST ok xy=(748.4,696.9) from_ms=1775782435566.3 until_ms=1775782435866.3 span=300ms
+[calib_trace] push_eye summary appended=0 dropped_no_pending_target=1 pending_buf=0
+[calib_trace] WS fixation ts=1775782436568.3 server_now=1775782436569.9 delta_ms=-1.6 xy=(453.1,780.9) prev_eyes=0 prev_target=no will_async_flush=False capture=[1775782436568.3,1775782436868.3]
+[calib_trace] calib_window POST ok xy=(453.1,780.9) from_ms=1775782436568.3 until_ms=1775782436868.3 span=300ms
+[calib_trace] push_eye summary appended=0 dropped_no_pending_target=1 pending_buf=0
+[calib_trace] WS stop: sync flush last pending + wait async flushes
+[calib_trace] flush_pending SKIP: eyes=0 target=None (empty snapshot or stop race)
+[calib_trace] wait_async_flushes: entering inflight=0
+[calib_trace] wait_async_flushes: done inflight=0
+[calib_trace] WS stop: n_saccade_samples=0 will_train=False
