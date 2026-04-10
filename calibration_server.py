@@ -32,6 +32,7 @@ import cv2
 import numpy as np
 
 from gaze_model import GazeModel
+from netr import calib_geom as _calib_geom
 
 # ── Rig config ────────────────────────────────────────────────────────────────
 import sys as _sys
@@ -49,8 +50,7 @@ RECEIVER_URL  = "http://localhost:8080"
 ENGINE_URL    = "http://localhost:8081"
 SCENE_CAM_ID  = _WORLD_CAM     # which cam to use for ArUco detection (world cam from rig_config)
 EYE_CAM_ID    = _EYE_CAM      # eye stream cam id (rig_config)
-ARUCO_DICT    = cv2.aruco.DICT_4X4_50
-ARUCO_IDS     = [0, 1, 2, 3]   # TL, TR, BL, BR order
+from netr.calib_geom import ARUCO_IDS  # TL, TR, BL, BR order
 SYNC_WINDOW_MS = 150        # max ms between target coord and eye vector
 MODEL_PATH    = pathlib.Path(__file__).parent / "gaze_model.json"
 DATASET_PATH  = pathlib.Path(__file__).parent / "calib_dataset.json"
@@ -266,6 +266,24 @@ def _append_screen_event(obj: dict):
         pass
 
 
+def _persist_marker_screen_positions():
+    """Write ArUco marker centers in calibration browser pixels for offline homography."""
+    global _rec_dir, _recording
+    if not (_recording and _rec_dir):
+        return
+    with _screen_markers_lock:
+        sm = {str(int(k)): [float(v[0]), float(v[1])] for k, v in _screen_markers.items()}
+    try:
+        with open(_rec_dir / "marker_screen_positions.json", "w") as f:
+            json.dump({
+                "aruco_dict": _aruco_dict_name,
+                "positions": sm,
+                "updated_server_ms": time.time() * 1000.0,
+            }, f, indent=2)
+    except Exception:
+        pass
+
+
 def _rec_start(screen_w: int, screen_h: int, mode: str):
     global _recording, _rec_dir, _rec_eye_f, _rec_target_f, _rec_fixation_f, _rec_screen_f
     global _rec_frame_n, _rec_world_writer, _rec_eye_writer, _rec_homo_writer
@@ -299,6 +317,7 @@ def _rec_start(screen_w: int, screen_h: int, mode: str):
             "homography_debug_timestamps": "homography_debug_capture_ts_ms.txt",
             "aggregated_fixations": "fixations.jsonl",
             "training_samples": "samples.json",
+            "marker_screen_positions": "marker_screen_positions.json",
         },
         "started_wall": ts,
         "status": "in_progress",
@@ -586,26 +605,10 @@ def _refit_models():
         return None
 
 # ── ArUco helpers ─────────────────────────────────────────────────────────────
-ARUCO_DICTS = {
-    "4x4":  cv2.aruco.DICT_4X4_50,
-    "5x5":  cv2.aruco.DICT_5X5_50,
-    "6x6":  cv2.aruco.DICT_6X6_50,
-    "7x7":  cv2.aruco.DICT_7X7_50,
-}
 _aruco_dict_name = "4x4"
-_aruco_dict      = cv2.aruco.getPredefinedDictionary(ARUCO_DICTS[_aruco_dict_name])
 _aruco_lock      = threading.Lock()
-
-def _make_params():
-    p = cv2.aruco.DetectorParameters()
-    p.adaptiveThreshWinSizeMin    = 3
-    p.adaptiveThreshWinSizeMax    = 53
-    p.adaptiveThreshWinSizeStep   = 4
-    p.minMarkerPerimeterRate      = 0.01
-    p.polygonalApproxAccuracyRate = 0.08
-    return p
-
-_aruco_detector = cv2.aruco.ArucoDetector(_aruco_dict, _make_params())
+_aruco_dict      = cv2.aruco.getPredefinedDictionary(_calib_geom.ARUCO_DICTS[_aruco_dict_name])
+_aruco_detector  = _calib_geom.create_aruco_detector(_aruco_dict_name)
 
 
 def _generate_marker_png(marker_id: int, size: int = 200) -> bytes:
@@ -622,13 +625,13 @@ print(f"[aruco] Markers ready: DICT_{_aruco_dict_name.upper()}_50 IDs {ARUCO_IDS
 
 def _switch_aruco_dict(name: str):
     global _aruco_dict, _aruco_dict_name, _aruco_detector, _marker_pngs, _homography
-    if name not in ARUCO_DICTS:
-        print(f"[aruco] Unknown dict '{name}', options: {list(ARUCO_DICTS)}")
+    if name not in _calib_geom.ARUCO_DICTS:
+        print(f"[aruco] Unknown dict '{name}', options: {list(_calib_geom.ARUCO_DICTS)}")
         return
     with _aruco_lock:
         _aruco_dict_name = name
-        _aruco_dict      = cv2.aruco.getPredefinedDictionary(ARUCO_DICTS[name])
-        _aruco_detector  = cv2.aruco.ArucoDetector(_aruco_dict, _make_params())
+        _aruco_dict      = cv2.aruco.getPredefinedDictionary(_calib_geom.ARUCO_DICTS[name])
+        _aruco_detector  = _calib_geom.create_aruco_detector(name)
     _marker_pngs = {i: _generate_marker_png(i) for i in ARUCO_IDS}
     with _homography_lock:
         _homography = None   # invalidate — markers changed
@@ -642,26 +645,11 @@ _screen_markers: dict = {}
 _screen_markers_lock = threading.Lock()
 
 
-_clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-
 def _detect_aruco_corners(frame_bgr: np.ndarray) -> tuple[dict[int, np.ndarray] | None, list[int]]:
     """Detect ArUco markers. Returns (dict id->center, list of all found ids). dict is None if <4 required found."""
-    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-    gray = _clahe.apply(gray)   # boost contrast before detection (handles dark/low-exposure frames)
     with _aruco_lock:
         det = _aruco_detector
-    corners, ids, _ = det.detectMarkers(gray)
-    all_ids = ids.flatten().tolist() if ids is not None else []
-    if ids is None or len(ids) < 4:
-        return None, all_ids
-    result = {}
-    for i, mid in enumerate(ids.flatten()):
-        if mid in ARUCO_IDS:
-            c = corners[i][0]
-            result[int(mid)] = c.mean(axis=0)
-    if len(result) < 4:
-        return None, all_ids
-    return result, all_ids
+    return _calib_geom.detect_aruco_corners(frame_bgr, det)
 
 
 def _annotate_scene_frame(frame_bgr: np.ndarray, detected: dict | None, all_ids: list[int]) -> bytes:
@@ -718,12 +706,9 @@ def _compute_homography(scene_corners: dict[int, np.ndarray]) -> np.ndarray | No
     """
     with _screen_markers_lock:
         sm = dict(_screen_markers)
-    if len(sm) < 4 or not all(i in sm for i in ARUCO_IDS):
+    H = _calib_geom.compute_homography_screen_to_scene(scene_corners, sm)
+    if H is None:
         print(f"[homography] Missing screen marker positions: have {list(sm.keys())}, need {ARUCO_IDS}")
-        return None
-    screen_pts = np.array([sm[i] for i in ARUCO_IDS], dtype=np.float32)
-    scene_pts  = np.array([scene_corners[i] for i in ARUCO_IDS], dtype=np.float32)
-    H, _ = cv2.findHomography(screen_pts, scene_pts)
     return H
 
 
@@ -1237,6 +1222,7 @@ def _handle_ws(rfile, wfile):
                     for k, v in positions.items():
                         _screen_markers[int(k)] = v
                 print(f"[ws] marker positions updated: { {k: [round(v[0]),round(v[1])] for k,v in _screen_markers.items()} }")
+                _persist_marker_screen_positions()
 
             elif mtype == "record_toggle":
                 sw, sh = _last_screen_size[0], _last_screen_size[1]
@@ -1286,6 +1272,7 @@ def _handle_ws(rfile, wfile):
                         _rec_target_f.flush()
                 except Exception:
                     pass
+                _persist_marker_screen_positions()
                 _ws_send_frame(wfile, json.dumps({
                     "type": "ack",
                     "msg": f"calibration started ({_calib_mode})",
@@ -1394,6 +1381,7 @@ def _handle_ws(rfile, wfile):
                             _rec_target_f.flush()
                     except Exception:
                         pass
+                    _persist_marker_screen_positions()
                 session_path = str(_rec_dir) if _rec_dir else ""
                 was_recording = _recording
                 result = {"type": "result", "n_samples": len(samples),

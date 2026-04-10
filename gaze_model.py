@@ -73,10 +73,20 @@ class GazeModel:
         return float(row @ self.A), float(row @ self.B)
 
     # ── Persistence ──────────────────────────────────────────────────────────
-    def save(self, path: str | pathlib.Path):
+    def save(
+        self,
+        path: str | pathlib.Path,
+        *,
+        scene_width: int | None = None,
+        scene_height: int | None = None,
+    ):
         if not self.trained:
             raise RuntimeError("Nothing to save — model not trained")
-        data = {"A": self.A.tolist(), "B": self.B.tolist()}
+        data: dict = {"A": self.A.tolist(), "B": self.B.tolist()}
+        if scene_width is not None:
+            data["scene_width"] = int(scene_width)
+        if scene_height is not None:
+            data["scene_height"] = int(scene_height)
         with open(path, "w") as f:
             json.dump(data, f, indent=2)
 
