@@ -40,6 +40,7 @@ except ImportError as e:
 g_analysis_enabled = False   # toggled via /set?analysis=1|0
 g_debug_view = "original"    # passed through to engine
 g_streams_paused = False     # toggled via /set?pause_streams=1|0 — stops MJPEG pushes
+g_calib_trace = False        # toggled via /set?calib_trace=1|0 — verbose calibration pipeline logs
 
 import rig_config as _rig_cfg
 g_eye_cam = _rig_cfg.eye_cam()   # which cam runs the eye pipeline
@@ -52,6 +53,18 @@ g_calib_window: dict | None = None
 g_calib_lock   = threading.Lock()
 
 CALIB_URL = "http://localhost:8090"
+
+def _rcv_calib_trace(fmt: str, *args):
+    if not g_calib_trace:
+        return
+    msg = fmt % args if args else fmt
+    print(f"[calib_trace] {msg}", flush=True)
+
+
+# Rate-limit window miss logs (hot path)
+_calib_win_miss_ctr = 0
+_calib_win_hit_ctr = 0
+
 
 def _push_to_calib(ts_ms: float, dx: float, dy: float, x: float, y: float, r: float | None = None):
     """Fire-and-forget push of a single eye frame to the calibration server."""
@@ -68,8 +81,9 @@ def _push_to_calib(ts_ms: float, dx: float, dy: float, x: float, y: float, r: fl
             method="POST",
         )
         urllib.request.urlopen(req, timeout=0.15).close()
-    except Exception:
-        pass   # calibration server not running — silently ignore
+    except Exception as e:
+        if g_calib_trace:
+            print(f"[calib_trace] push_eye HTTP failed ts_ms={ts_ms:.1f} err={e!r}", flush=True)
 
 # ── Compute engine client ─────────────────────────────────────────────────────
 ENGINE_URL = "http://localhost:8081"
@@ -197,17 +211,36 @@ def _apply_pupil_overlay(data: bytes, roi: list[float] = None,
     ts_ms = cam_ts_ms if cam_ts_ms > 0 else engine_ts_ms
 
     if pccr is not None:
+        global _calib_win_miss_ctr, _calib_win_hit_ctr
         g_latest_pccr    = pccr
         g_latest_pccr_ts = ts_ms
         # Push to calibration server if within the active capture window
         with g_calib_lock:
             win = g_calib_window
-        if win is not None and win["from_ms"] <= ts_ms <= win["until_ms"]:
-            threading.Thread(
-                target=_push_to_calib,
-                args=(ts_ms, pccr[0], pccr[1], win["x"], win["y"], pupil_radius),
-                daemon=True,
-            ).start()
+        if win is not None:
+            lo, hi = win["from_ms"], win["until_ms"]
+            if lo <= ts_ms <= hi:
+                if g_calib_trace:
+                    _calib_win_hit_ctr += 1
+                    if _calib_win_hit_ctr == 1 or _calib_win_hit_ctr % 40 == 0:
+                        _rcv_calib_trace(
+                            "window HIT #%d ts_ms=%.1f in [%.1f, %.1f] pccr=(%.4f,%.4f)",
+                            _calib_win_hit_ctr, ts_ms, lo, hi, pccr[0], pccr[1],
+                        )
+                threading.Thread(
+                    target=_push_to_calib,
+                    args=(ts_ms, pccr[0], pccr[1], win["x"], win["y"], pupil_radius),
+                    daemon=True,
+                ).start()
+            elif g_calib_trace:
+                _calib_win_miss_ctr += 1
+                if _calib_win_miss_ctr == 1 or _calib_win_miss_ctr % 120 == 0:
+                    _rcv_calib_trace(
+                        "window MISS #%d ts_ms=%.1f win=[%.1f, %.1f] "
+                        "delta_lo=%.1f delta_hi=%.1f pccr=(%.4f,%.4f)",
+                        _calib_win_miss_ctr, ts_ms, lo, hi, ts_ms - lo, ts_ms - hi,
+                        pccr[0], pccr[1],
+                    )
 
     return annotated if annotated is not None else data
 
@@ -415,6 +448,8 @@ class MJPEGHandler(BaseHTTPRequestHandler):
                 with g_calib_lock:
                     if d.get("clear"):
                         g_calib_window = None
+                        if g_calib_trace:
+                            _rcv_calib_trace("POST /calib_window CLEAR (receiver)")
                     else:
                         g_calib_window = {
                             "x":        float(d["x"]),
@@ -422,6 +457,19 @@ class MJPEGHandler(BaseHTTPRequestHandler):
                             "from_ms":  float(d["from_ms"]),
                             "until_ms": float(d["until_ms"]),
                         }
+                        global _calib_win_miss_ctr, _calib_win_hit_ctr
+                        _calib_win_miss_ctr = 0
+                        _calib_win_hit_ctr = 0
+                        if g_calib_trace:
+                            now_ms = time.time() * 1000
+                            w = g_calib_window
+                            _rcv_calib_trace(
+                                "POST /calib_window SET xy=(%.1f,%.1f) from=%.1f until=%.1f "
+                                "span=%.1fms receiver_now=%.1f (inside=%s)",
+                                w["x"], w["y"], w["from_ms"], w["until_ms"],
+                                w["until_ms"] - w["from_ms"], now_ms,
+                                str(w["from_ms"] <= now_ms <= w["until_ms"]),
+                            )
                 self.send_response(200)
                 self.send_header("Content-Length", "0")
                 self.end_headers()
@@ -767,7 +815,7 @@ class MJPEGHandler(BaseHTTPRequestHandler):
     }
 
     def _set_cmd(self, query: str):
-        global g_analysis_enabled, g_settings, g_debug_view, g_streams_paused
+        global g_analysis_enabled, g_settings, g_debug_view, g_streams_paused, g_calib_trace
         import urllib.parse
         params = dict(urllib.parse.parse_qsl(query))
         cmds = []
@@ -776,6 +824,11 @@ class MJPEGHandler(BaseHTTPRequestHandler):
 
         if "pause_streams" in params:
             g_streams_paused = params["pause_streams"] != "0"
+
+        if "calib_trace" in params:
+            raw = str(params.get("calib_trace") or "0").lower()
+            g_calib_trace = raw not in ("0", "false", "")
+            print(f"[calib] receiver pipeline trace -> {'ON' if g_calib_trace else 'OFF'}", flush=True)
 
         if "eye_cam" in params:
             global g_eye_cam

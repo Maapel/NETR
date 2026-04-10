@@ -67,6 +67,68 @@ _eye_lock = threading.Lock()
 _calibrating = False
 _calib_mode  = "sweep"   # "sweep" | "saccade"
 
+# Verbose pipeline trace (toggle via web "Trace" button → /set_calib_trace)
+_calib_trace_enabled = False
+_trace_push_lock = threading.Lock()
+_trace_push_appended = 0
+_trace_push_dropped = 0
+_trace_push_last_log = 0.0
+
+
+def _calib_trace(fmt: str, *args):
+    if not _calib_trace_enabled:
+        return
+    msg = fmt % args if args else fmt
+    print(f"[calib_trace] {msg}", flush=True)
+
+
+def _forward_receiver_calib_trace(on: bool):
+    v = "1" if on else "0"
+    try:
+        urllib.request.urlopen(f"{RECEIVER_URL}/set?calib_trace={v}", timeout=1).close()
+    except Exception as e:
+        print(f"[calib] sync calib_trace to receiver failed: {e}", flush=True)
+
+
+def _trace_reset_push_counters():
+    global _trace_push_appended, _trace_push_dropped, _trace_push_last_log
+    with _trace_push_lock:
+        _trace_push_appended = 0
+        _trace_push_dropped = 0
+        _trace_push_last_log = 0.0
+
+
+def _trace_record_push_eye(did_append: bool):
+    """Aggregated /push_eye logging (hot path)."""
+    global _trace_push_appended, _trace_push_dropped, _trace_push_last_log
+    if not _calib_trace_enabled:
+        return
+    now = time.time()
+    emit = False
+    ap = dr = 0
+    with _trace_push_lock:
+        if did_append:
+            _trace_push_appended += 1
+        else:
+            _trace_push_dropped += 1
+        ap, dr = _trace_push_appended, _trace_push_dropped
+        if not did_append and dr == 1 and ap == 0:
+            emit = True
+        elif ap > 0 and ap % 45 == 0:
+            emit = True
+        elif now - _trace_push_last_log >= 1.0 and (ap + dr) > 0:
+            emit = True
+        if emit:
+            _trace_push_last_log = now
+    if emit:
+        with _pending_lock:
+            pb = len(_pending_eye)
+        _calib_trace(
+            "push_eye summary appended=%d dropped_no_pending_target=%d pending_buf=%d",
+            ap, dr, pb,
+        )
+
+
 # ── Debug state ───────────────────────────────────────────────────────────────
 _debug = {
     "scene_cam_ok": False,
@@ -121,10 +183,20 @@ def _start_async_flush_pending(eyes: list, target: dict):
             with _flush_inflight_cv:
                 _flush_inflight -= 1
                 _flush_inflight_cv.notify_all()
+            _calib_trace(
+                "async flush done thread=%s target=(%.1f,%.1f) had_n_eyes=%d",
+                threading.current_thread().name,
+                target.get("x", 0), target.get("y", 0), len(eyes),
+            )
 
     global _flush_inflight
     with _flush_inflight_cv:
         _flush_inflight += 1
+        inf = _flush_inflight
+    _calib_trace(
+        "async flush START inflight=%d n_eyes=%d target=(%.1f,%.1f)",
+        inf, len(eyes), target.get("x", 0), target.get("y", 0),
+    )
     threading.Thread(target=_run, daemon=True).start()
 
 
@@ -132,6 +204,7 @@ def _wait_async_flushes(timeout_s: float = 120.0):
     """Block until all async fixation flushes finish (or timeout)."""
     deadline = time.time() + timeout_s
     with _flush_inflight_cv:
+        _calib_trace("wait_async_flushes: entering inflight=%d", _flush_inflight)
         while _flush_inflight > 0:
             remaining = deadline - time.time()
             if remaining <= 0:
@@ -139,6 +212,7 @@ def _wait_async_flushes(timeout_s: float = 120.0):
                       f"{_flush_inflight} pending flush thread(s) — sample count may be low")
                 break
             _flush_inflight_cv.wait(timeout=remaining)
+        _calib_trace("wait_async_flushes: done inflight=%d", _flush_inflight)
 
 _model = GazeModel()                          # scene-space model (saved to disk)
 _screen_model = GazeModel()                   # screen-space model (for live cursor)
@@ -227,8 +301,12 @@ def _set_calib_window(x: float, y: float, from_ms: float, until_ms: float):
                 method="POST",
             )
             urllib.request.urlopen(req, timeout=0.2).close()
-        except Exception:
-            pass
+            _calib_trace(
+                "calib_window POST ok xy=(%.1f,%.1f) from_ms=%.1f until_ms=%.1f span=%.0fms",
+                x, y, from_ms, until_ms, until_ms - from_ms,
+            )
+        except Exception as e:
+            _calib_trace("calib_window POST FAILED: %r", e)
     threading.Thread(target=_send, daemon=True).start()
 
 
@@ -243,8 +321,9 @@ def _clear_calib_window():
                 method="POST",
             )
             urllib.request.urlopen(req, timeout=0.2).close()
-        except Exception:
-            pass
+            _calib_trace("calib_window POST clear ok")
+        except Exception as e:
+            _calib_trace("calib_window POST clear FAILED: %r", e)
     threading.Thread(target=_send, daemon=True).start()
 
 
@@ -281,10 +360,19 @@ def _flush_pending_target(eyes: list | None = None, target: dict | None = None):
     if eyes is None or target is None:
         eyes, target = _snapshot_pending()
     if not eyes or not target:
+        _calib_trace(
+            "flush_pending SKIP: eyes=%d target=%s (empty snapshot or stop race)",
+            len(eyes) if eyes else 0, "ok" if target else "None",
+        )
         return
     import numpy as _np
 
     sx, sy = target["x"], target["y"]
+    tss = [e["ts"] for e in eyes]
+    _calib_trace(
+        "flush_pending START target=(%.1f,%.1f) n_eyes=%d ts_eye[min..max]=[%.1f..%.1f]",
+        sx, sy, len(eyes), min(tss), max(tss),
+    )
 
     # Build per-sample synced tuples: fetch world frame at each eye timestamp
     synced: list[tuple] = []   # (dx, dy, X, Y, r|nan)
@@ -293,6 +381,7 @@ def _flush_pending_target(eyes: list | None = None, target: dict | None = None):
     # session never had a valid homography — samples will still be 0.
     with _homography_lock:
         cached_H = _homography
+    _calib_trace("flush_pending cached_H=%s", "None" if cached_H is None else "present")
 
     miss_no_frame = miss_no_aruco = miss_no_homo = miss_no_cached = 0
     for e in eyes:
@@ -324,6 +413,11 @@ def _flush_pending_target(eyes: list | None = None, target: dict | None = None):
           f"no_homo={miss_no_homo} no_cached={miss_no_cached})")
     if n_synced == 0:
         print(f"[calib] No synced samples for target ({sx:.0f},{sy:.0f}) — skipped")
+        _calib_trace(
+            "flush_pending n_synced=0 all_H_none=%s miss nf=%d na=%d nh=%d nc=%d",
+            str(miss_no_cached == len(eyes)),
+            miss_no_frame, miss_no_aruco, miss_no_homo, miss_no_cached,
+        )
         return
 
     dxs = _np.array([s[0] for s in synced])
@@ -345,6 +439,7 @@ def _flush_pending_target(eyes: list | None = None, target: dict | None = None):
                       f"(r_med={r_med:.1f}, threshold=±{0.15*r_med:.1f}px)")
             if not _np.any(blink_mask):
                 print(f"[calib] All frames failed blink filter for ({sx:.0f},{sy:.0f}) — discarding target")
+                _calib_trace("flush_pending DISCARD all blink filter fail n=%d", len(synced))
                 return
             dxs = dxs[blink_mask]
             dys = dys[blink_mask]
@@ -354,6 +449,7 @@ def _flush_pending_target(eyes: list | None = None, target: dict | None = None):
     # Drop frozen (all identical) — tracking stuck
     if dxs.std() == 0 and dys.std() == 0:
         print(f"[calib] Skipping frozen target ({sx:.0f},{sy:.0f}) n={n_synced}")
+        _calib_trace("flush_pending DISCARD frozen PCCR n=%d", n_synced)
         return
 
     # IQR outlier rejection on PCCR
@@ -389,7 +485,11 @@ def _flush_pending_target(eyes: list | None = None, target: dict | None = None):
     with _saccade_lock:
         _saccade_samples.append({"dx": avg_dx, "dy": avg_dy,
                                  "X": avg_X, "Y": avg_Y, "sx": sx, "sy": sy})
-    n = len(_saccade_samples)
+        n = len(_saccade_samples)
+    _calib_trace(
+        "flush_pending APPEND sample #%d clean=%d avg dx=%.3f dy=%.3f scene X=%.1f Y=%.1f",
+        n, n_clean, avg_dx, avg_dy, avg_X, avg_Y,
+    )
     diag = _refit_models()
     if diag:
         _broadcast(json.dumps({
@@ -1087,6 +1187,7 @@ def _handle_ws(rfile, wfile):
                     _pending_eye.clear()
                     _pending_target = None
                 _clear_calib_window()
+                _calib_trace("WS start mode=%s screen=%s", _calib_mode, _last_screen_size)
                 # Auto-start recording if not already recording
                 if _recording and _rec_target_f:
                     try:
@@ -1121,7 +1222,17 @@ def _handle_ws(rfile, wfile):
                     # the thread first and set the new target after, the thread could
                     # race ahead, read _pending_target as the NEW target, and clear it —
                     # dropping all subsequent eye frames for that point.
+                    _trace_reset_push_counters()
                     prev_eyes, prev_target = _snapshot_pending()
+                    srv_now = time.time() * 1000
+                    _calib_trace(
+                        "WS fixation ts=%.1f server_now=%.1f delta_ms=%.1f xy=(%.1f,%.1f) "
+                        "prev_eyes=%d prev_target=%s will_async_flush=%s capture=[%.1f,%.1f]",
+                        ts, srv_now, ts - srv_now, x, y,
+                        len(prev_eyes), "yes" if prev_target else "no",
+                        str(bool(prev_eyes and prev_target)),
+                        ts, ts + FIXATE_MS,
+                    )
                     with _pending_lock:
                         _pending_target = {"x": x, "y": y}
                     _set_calib_window(x, y, from_ms=ts, until_ms=ts + FIXATE_MS)
@@ -1138,6 +1249,7 @@ def _handle_ws(rfile, wfile):
 
             elif mtype == "stop":
                 _calibrating = False
+                _calib_trace("WS stop: sync flush last pending + wait async flushes")
                 # Flush the last pending target (fixation handler only flushes
                 # the *previous* target when a new one arrives, so the final
                 # point is never flushed otherwise).
@@ -1148,6 +1260,8 @@ def _handle_ws(rfile, wfile):
                 _flush_calib_video_buf()
                 with _saccade_lock:
                     samples = list(_saccade_samples)
+                _calib_trace("WS stop: n_saccade_samples=%d will_train=%s",
+                             len(samples), str(len(samples) >= 6))
                 # Save samples to recording
                 if _recording and _rec_dir:
                     try:
@@ -1211,6 +1325,7 @@ button.paused-on  { background: #2a1a0a; color: #ffaa44; border-color: #ffaa44; 
 button.rec-on     { background: #2a0a0a; color: #ff4444; border-color: #ff4444; }
 @keyframes recblink { 0%,100%{opacity:1} 50%{opacity:0.4} }
 button.rec-on     { animation: recblink 1.2s infinite; }
+button.trace-on   { background: #1a1a33; color: #88ccff; border-color: #6699cc; }
 #status {
   color: #888; font-size: 13px; min-width: 320px; text-align: center;
 }
@@ -1281,6 +1396,7 @@ button.rec-on     { animation: recblink 1.2s infinite; }
   <button onclick="window.open('/viz','_blank')">📊 Viz</button>
   <button id="btnRecord">⏺ Record</button>
   <button id="btnPause">⏸ Pause Streams</button>
+  <button id="btnTrace" type="button">Trace OFF</button>
   <span id="status">Connecting…</span>
 </div>
 <div id="debug-panel">
@@ -1297,6 +1413,7 @@ button.rec-on     { animation: recblink 1.2s infinite; }
   <div class="row"><span>Screen size</span><span id="d-screen">…</span></div>
   <div class="row"><span>Last sync</span><span id="d-sync">…</span></div>
   <div class="row"><span>Saccade pts</span><span id="d-sacc">…</span></div>
+  <div class="row"><span>Pipeline trace</span><span id="d-trace">…</span></div>
   <div class="slider-row">
     <label>ArUco marker size: <span id="marker-size-val">20</span>% of screen</label>
     <input type="range" id="marker-size" min="8" max="35" value="20" step="1">
@@ -1335,6 +1452,26 @@ const btnSweep  = document.getElementById('btnSweep');
 const btnSaccade= document.getElementById('btnSaccade');
 const btnPause  = document.getElementById('btnPause');
 const btnRecord = document.getElementById('btnRecord');
+const btnTrace  = document.getElementById('btnTrace');
+
+let traceOn = false;
+function syncTraceUi() {
+  fetch('/set_calib_trace').then(r => r.json()).then(d => {
+    traceOn = !!d.on;
+    btnTrace.textContent = traceOn ? 'Trace ON' : 'Trace OFF';
+    btnTrace.classList.toggle('trace-on', traceOn);
+  }).catch(() => {});
+}
+btnTrace.onclick = () => {
+  const v = traceOn ? 0 : 1;
+  fetch(`/set_calib_trace?v=${v}`).then(r => r.json()).then(d => {
+    if (d.ok) {
+      traceOn = !!d.on;
+      btnTrace.textContent = traceOn ? 'Trace ON' : 'Trace OFF';
+      btnTrace.classList.toggle('trace-on', traceOn);
+    }
+  }).catch(() => {});
+};
 
 let recOn = false;
 btnRecord.onclick = () => {
@@ -1400,6 +1537,7 @@ ws.onopen = () => {
   statusEl.textContent = 'Connected';
   ws.send(JSON.stringify({type:'screen_size', w:W, h:H}));
   ws.send(JSON.stringify({type:'status'}));
+  syncTraceUi();
   // Send marker positions after WS is open
   setTimeout(updateMarkers, 100);
 };
@@ -1842,6 +1980,7 @@ function pollDebug() {
     dbg('d-sync', `tried=${d.last_sync_tried} matched=${d.last_sync_matched}`,
         d.last_sync_matched > 0 ? true : (d.last_sync_tried > 0 ? false : null));
     dbg('d-sacc', d.saccade_samples, d.saccade_samples >= 6 ? true : (d.saccade_samples > 0 ? null : false));
+    dbg('d-trace', d.calib_trace ? 'ON (terminal)' : 'OFF', d.calib_trace ? true : null);
     if (d.aruco_dict) document.getElementById('d-dict').textContent = d.aruco_dict;
   }).catch(() => {});
 }
@@ -2177,6 +2316,24 @@ class Handler(BaseHTTPRequestHandler):
             except (KeyError, ValueError):
                 self.send_response(404); self.end_headers()
 
+        elif self.path.startswith("/set_calib_trace"):
+            import urllib.parse
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            global _calib_trace_enabled
+            if "v" in q and len(q["v"]) > 0 and q["v"][0] != "":
+                on = q["v"][0] not in ("0", "false", "False")
+                _calib_trace_enabled = on
+                _forward_receiver_calib_trace(on)
+                print(f"[calib] pipeline trace logging -> {'ON' if on else 'OFF'}", flush=True)
+                body = json.dumps({"ok": True, "on": on}).encode()
+            else:
+                body = json.dumps({"on": _calib_trace_enabled}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
         elif self.path.startswith("/pause_receiver"):
             import urllib.parse
             val = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("v", ["1"])[0]
@@ -2206,6 +2363,7 @@ class Handler(BaseHTTPRequestHandler):
             d["saccade_samples"] = len(_saccade_samples)
             d["model_trained"]   = _model.trained
             d["screen_size"]     = _last_screen_size
+            d["calib_trace"]     = _calib_trace_enabled
             body = json.dumps(d).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -2366,13 +2524,17 @@ class Handler(BaseHTTPRequestHandler):
                         _rec_eye_f.flush()
                     except Exception: pass
                 # Add to pending accumulator for current target
+                appended = False
                 with _pending_lock:
                     if _pending_target is not None:
                         _pending_eye.append(entry)
+                        appended = True
+                _trace_record_push_eye(appended)
                 self.send_response(200)
                 self.send_header("Content-Length", "0")
                 self.end_headers()
-            except Exception:
+            except Exception as e:
+                _calib_trace("POST /push_eye bad JSON or field: %r", e)
                 try: self.send_error(400)
                 except BrokenPipeError: pass
         else:
