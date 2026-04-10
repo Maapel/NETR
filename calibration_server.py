@@ -25,6 +25,7 @@ import pathlib
 import struct
 import urllib.request
 import urllib.error
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 
@@ -68,7 +69,7 @@ _eye_buf: list[dict] = []
 _eye_lock = threading.Lock()
 
 _calibrating = False
-_calib_mode  = "sweep"   # "sweep" | "saccade"
+_calib_mode  = "saccade"   # "saccade" (sweep deprecated)
 
 # Verbose pipeline trace (toggle via web "Trace" button → /set_calib_trace)
 _calib_trace_enabled = False
@@ -220,8 +221,11 @@ def _wait_async_flushes(timeout_s: float = 120.0):
 _model = GazeModel()                          # scene-space model (saved to disk)
 _screen_model = GazeModel()                   # screen-space model (for live cursor)
 SCREEN_MODEL_PATH = pathlib.Path(__file__).parent / "screen_model.json"
-_model.load(MODEL_PATH)
-_screen_model.load(SCREEN_MODEL_PATH)
+_model_ok = _model.load(MODEL_PATH)
+_screen_ok = _screen_model.load(SCREEN_MODEL_PATH)
+print(f"[calib] gaze_model loaded={_model_ok} trained={_model.trained}  "
+      f"screen_model loaded={_screen_ok} trained={_screen_model.trained}")
+print(f"[calib] screen_model A={_screen_model.A}  B={_screen_model.B}" if _screen_ok else "")
 
 # ── Recording ─────────────────────────────────────────────────────────────────
 # Per calibration session (START → STOP): raw sensor videos + aligned timestamps.
@@ -1518,7 +1522,7 @@ button.trace-on   { background: #1a1a33; color: #88ccff; border-color: #6699cc; 
 </head>
 <body>
 <div id="hud">
-  <button id="btnSweep" class="mode active">SWEEP</button>
+  <button id="btnSweep" class="mode" disabled style="display:none">SWEEP</button>
   <button id="btnSaccade" class="mode">SACCADE</button>
   <button id="btnStart">START</button>
   <button id="btnStop" disabled>STOP</button>
@@ -1647,18 +1651,11 @@ function resize() {
 resize();
 window.addEventListener('resize', resize);
 
-let mode = 'sweep';  // 'sweep' | 'saccade'
-btnSweep.onclick = () => {
-  if (running) return;
-  mode = 'sweep';
-  btnSweep.classList.add('active');
-  btnSaccade.classList.remove('active');
-};
+let mode = 'saccade';  // sweep deprecated
+btnSaccade.classList.add('active');
 btnSaccade.onclick = () => {
   if (running) return;
   mode = 'saccade';
-  btnSaccade.classList.add('active');
-  btnSweep.classList.remove('active');
 };
 
 // ── WebSocket ────────────────────────────────────────────────────────────────
@@ -1683,10 +1680,10 @@ ws.onmessage = e => {
   }
   if (m.type === 'status') {
     statusEl.textContent = `Homography: ${m.homography?'✓':'✗'}  Model: ${m.model_trained?'✓':'✗'}`;
-    if (m.model_trained) btnLive.disabled = false;
+    if (m.model_trained && m.homography) btnLive.disabled = false;
   }
   if (m.type === 'ready') {
-    btnLive.disabled = false;
+    btnLive.disabled = false;  // model just refitted, enable live
     statusEl.textContent = `${m.n} pts — R²x=${m.r2_x}  R²y=${m.r2_y}`;
   }
   if (m.type === 'result') {
@@ -1979,8 +1976,10 @@ let liveTimer   = null;
 function startLive() {
   liveTimer = setInterval(() => {
     fetch('/live').then(r => r.json()).then(d => {
+      console.log('[live]', JSON.stringify(d));
       gazeCursor = d.ok ? {x: d.x, y: d.y} : null;
-    }).catch(() => { gazeCursor = null; });
+      if (!d.ok) statusEl.textContent = 'Live: ' + d.reason;
+    }).catch(e => { gazeCursor = null; console.error('[live] fetch fail', e); });
   }, 80);  // ~12 Hz — fast enough to feel live, not spammy
 }
 
@@ -2029,7 +2028,11 @@ function render(now) {
   ctx.drawImage(bgCanvas, 0, 0);
 
   // Live gaze cursor — drawn regardless of running state
-  if (liveOn && gazeCursor) drawGazeCursor(gazeCursor);
+  if (liveOn && gazeCursor) {
+    console.log('[render] drawing gaze cursor at', gazeCursor.x.toFixed(0), gazeCursor.y.toFixed(0),
+                'canvas:', canvas.width, 'x', canvas.height);
+    drawGazeCursor(gazeCursor);
+  }
 
   if (!running) return;
 
@@ -2410,7 +2413,6 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
 
         elif self.path.startswith("/predict"):
-            import urllib.parse
             params = dict(urllib.parse.parse_qsl(urllib.parse.urlparse(self.path).query))
             try:
                 dx, dy = float(params["dx"]), float(params["dy"])
@@ -2427,7 +2429,6 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
 
         elif self.path.startswith("/set_dict"):
-            import urllib.parse
             name = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("d", ["4x4"])[0]
             _switch_aruco_dict(name)
             body = json.dumps({"ok": True, "dict": name}).encode()
@@ -2453,7 +2454,6 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_response(404); self.end_headers()
 
         elif self.path.startswith("/set_calib_trace"):
-            import urllib.parse
             q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             global _calib_trace_enabled
             if "v" in q and len(q["v"]) > 0 and q["v"][0] != "":
@@ -2471,7 +2471,6 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
 
         elif self.path.startswith("/pause_receiver"):
-            import urllib.parse
             val = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("v", ["1"])[0]
             try:
                 urllib.request.urlopen(f"{RECEIVER_URL}/set?pause_streams={val}", timeout=1).close()
@@ -2551,19 +2550,32 @@ class Handler(BaseHTTPRequestHandler):
                 pass
 
         elif self.path == "/live":
-            # Fetch current pccr_vector from receiver, predict screen position
+            # Fetch current pccr_vector from receiver, predict scene position
+            # via _model (gaze_model), then inverse-homography scene → screen.
             try:
                 with urllib.request.urlopen(f"{RECEIVER_URL}/stats", timeout=1) as r:
                     d = json.loads(r.read())
                 vec = d.get("pccr_vector")
-                if vec and _screen_model.trained:
-                    sx, sy = _screen_model.predict(vec[0], vec[1])
-                    body = json.dumps({"ok": True, "x": sx, "y": sy,
-                                       "dx": vec[0], "dy": vec[1]}).encode()
+                if not vec:
+                    body = json.dumps({"ok": False, "reason": "no pccr vector"}).encode()
+                elif not _model.trained:
+                    body = json.dumps({"ok": False, "reason": "gaze model not trained"}).encode()
                 else:
-                    body = json.dumps({"ok": False,
-                                       "reason": "no vector" if not vec else "model not ready"}).encode()
+                    scene_x, scene_y = _model.predict(vec[0], vec[1])
+                    with _homography_lock:
+                        H = _homography
+                    if H is None:
+                        body = json.dumps({"ok": False, "reason": "no homography"}).encode()
+                    else:
+                        H_inv = np.linalg.inv(H)
+                        pt = np.array([[[scene_x, scene_y]]], dtype=np.float32)
+                        scr = cv2.perspectiveTransform(pt, H_inv)[0][0]
+                        sx, sy = float(scr[0]), float(scr[1])
+                        print(f"[live] pccr=({vec[0]:.3f},{vec[1]:.3f}) → scene=({scene_x:.1f},{scene_y:.1f}) → screen=({sx:.0f},{sy:.0f})")
+                        body = json.dumps({"ok": True, "x": sx, "y": sy,
+                                           "dx": vec[0], "dy": vec[1]}).encode()
             except Exception as e:
+                print(f"[live] EXCEPTION: {e}")
                 body = json.dumps({"ok": False, "reason": str(e)}).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")

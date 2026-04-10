@@ -127,12 +127,6 @@ def _process(jpeg: bytes) -> bytes:
     else:
         out = EyePipeline.draw(bgr, result)
 
-    # Draw gaze crosshair on frame if available
-    if gaze:
-        gx, gy = int(gaze[0]), int(gaze[1])
-        cv2.drawMarker(out, (gx, gy), (0, 0, 255),
-                       cv2.MARKER_CROSS, 20, 2)
-
     _, enc = cv2.imencode(".jpg", out, [cv2.IMWRITE_JPEG_QUALITY, 85])
     annotated = enc.tobytes()
 
