@@ -103,6 +103,43 @@ _pending_target: dict | None = None  # {x, y} of the target being captured
 _pending_lock = threading.Lock()
 FIXATE_MS = 300   # capture window duration (matches JS FIXATE_MS)
 
+# Saccade: each fixation flushes the *previous* target in a background thread
+# (_flush_pending_target does many HTTP fetches). STOP must wait for them or
+# _saccade_samples will be undercounted ("only 0–few synced samples").
+_flush_inflight = 0
+_flush_inflight_cv = threading.Condition(threading.Lock())
+
+
+def _start_async_flush_pending(eyes: list, target: dict):
+    """Run _flush_pending_target in a thread; pair with _wait_async_flushes on stop."""
+
+    def _run():
+        global _flush_inflight
+        try:
+            _flush_pending_target(eyes, target)
+        finally:
+            with _flush_inflight_cv:
+                _flush_inflight -= 1
+                _flush_inflight_cv.notify_all()
+
+    global _flush_inflight
+    with _flush_inflight_cv:
+        _flush_inflight += 1
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def _wait_async_flushes(timeout_s: float = 120.0):
+    """Block until all async fixation flushes finish (or timeout)."""
+    deadline = time.time() + timeout_s
+    with _flush_inflight_cv:
+        while _flush_inflight > 0:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                print(f"[calib] WARNING: timed out after {timeout_s:.0f}s waiting for "
+                      f"{_flush_inflight} pending flush thread(s) — sample count may be low")
+                break
+            _flush_inflight_cv.wait(timeout=remaining)
+
 _model = GazeModel()                          # scene-space model (saved to disk)
 _screen_model = GazeModel()                   # screen-space model (for live cursor)
 SCREEN_MODEL_PATH = pathlib.Path(__file__).parent / "screen_model.json"
@@ -1089,11 +1126,7 @@ def _handle_ws(rfile, wfile):
                         _pending_target = {"x": x, "y": y}
                     _set_calib_window(x, y, from_ms=ts, until_ms=ts + FIXATE_MS)
                     if prev_eyes and prev_target:
-                        threading.Thread(
-                            target=_flush_pending_target,
-                            args=(prev_eyes, prev_target),
-                            daemon=True,
-                        ).start()
+                        _start_async_flush_pending(prev_eyes, prev_target)
                     # Record fixation event
                     if _recording and _rec_target_f:
                         try:
@@ -1109,6 +1142,9 @@ def _handle_ws(rfile, wfile):
                 # the *previous* target when a new one arrives, so the final
                 # point is never flushed otherwise).
                 _flush_pending_target()
+                # Wait for background flushes from earlier fixations (each can
+                # take seconds); otherwise STOP reports far too few samples.
+                _wait_async_flushes()
                 _flush_calib_video_buf()
                 with _saccade_lock:
                     samples = list(_saccade_samples)
