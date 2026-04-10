@@ -6,13 +6,13 @@ WebSocket at ws://localhost:8090/ws
 
 Workflow:
   1. Open http://localhost:8090 in browser (fullscreen recommended).
-  2. Press START — Lissajous target begins moving over ArUco corners.
-  3. The eye camera should already be running (receiver.py on port 8080).
-  4. Press STOP — dataset is collected & gaze model is trained.
-  5. Model saved to gaze_model.json in the project directory.
+  2. Press START — a session folder under recordings/ opens; Lissajous or saccade runs.
+  3. Eye + world streams should be running (receiver.py on port 8080, analysis on).
+  4. Press STOP — session is finalized, dataset is collected & gaze model is trained.
+  5. Model saved to gaze_model.json; raw videos + screen_events.jsonl in recordings/<ts>/.
 
 Scene camera: reads from the receiver's MJPEG stream (cam1 or cam2)
-Eye vectors:  polled from receiver's /stats endpoint (live pccr_vector)
+Eye vectors: polled from receiver `/stats` (`pccr_vector`, `pccr_ts_ms`).
 
 Ports: HTTP/WS 8090
 """
@@ -39,13 +39,16 @@ _sys.path.insert(0, str(pathlib.Path(__file__).parent))
 try:
     import rig_config as _rig_cfg
     _WORLD_CAM = _rig_cfg.world_cam()
+    _EYE_CAM = _rig_cfg.eye_cam()
 except Exception:
     _WORLD_CAM = 1
+    _EYE_CAM = 2
 
 # ── Config ────────────────────────────────────────────────────────────────────
 RECEIVER_URL  = "http://localhost:8080"
 ENGINE_URL    = "http://localhost:8081"
 SCENE_CAM_ID  = _WORLD_CAM     # which cam to use for ArUco detection (world cam from rig_config)
+EYE_CAM_ID    = _EYE_CAM      # eye stream cam id (rig_config)
 ARUCO_DICT    = cv2.aruco.DICT_4X4_50
 ARUCO_IDS     = [0, 1, 2, 3]   # TL, TR, BL, BR order
 SYNC_WINDOW_MS = 150        # max ms between target coord and eye vector
@@ -221,46 +224,99 @@ _model.load(MODEL_PATH)
 _screen_model.load(SCREEN_MODEL_PATH)
 
 # ── Recording ─────────────────────────────────────────────────────────────────
+# Per calibration session (START → STOP): raw sensor videos + aligned timestamps.
+#   world_cam_raw.avi + world_raw_capture_ts_ms.txt — ESP32 capture time (ms)
+#   eye_cam_raw.avi   + eye_raw_capture_ts_ms.txt
+#   screen_events.jsonl — stimulus; ts_browser_ms; fixations include capture_window_ms
+#   eye.jsonl — PCCR keyed by ts = pccr_ts_ms (same camera timebase as eye video)
 RECORDINGS_DIR = pathlib.Path(__file__).parent / "recordings"
 _recording         = False
 _rec_dir: pathlib.Path | None = None
 _rec_eye_f         = None   # eye.jsonl
-_rec_target_f      = None   # targets.jsonl
+_rec_target_f      = None   # targets.jsonl (legacy mirror of stimulus rows)
 _rec_fixation_f    = None   # fixations.jsonl
+_rec_screen_f      = None   # screen_events.jsonl (canonical stimulus log)
 _rec_frame_n       = 0
 _rec_lock          = threading.Lock()
-_rec_world_writer: "cv2.VideoWriter | None" = None   # world cam AVI
-_rec_eye_writer:   "cv2.VideoWriter | None" = None   # eye cam AVI
-_rec_homo_writer:  "cv2.VideoWriter | None" = None   # homography debug AVI
-_rec_world_ts_f    = None   # world_cam_ts.txt  — one epoch-ms per line
-_rec_eye_ts_f      = None   # eye_cam_ts.txt
-_rec_homo_ts_f     = None   # homography_debug_ts.txt
+_rec_world_writer: "cv2.VideoWriter | None" = None   # world_cam_raw.avi
+_rec_eye_writer:   "cv2.VideoWriter | None" = None   # eye_cam_raw.avi
+_rec_homo_writer:  "cv2.VideoWriter | None" = None   # homography_debug.avi
+_rec_world_ts_f    = None   # world_raw_capture_ts_ms.txt
+_rec_eye_ts_f      = None   # eye_raw_capture_ts_ms.txt
+_rec_homo_ts_f     = None   # homography_debug_capture_ts_ms.txt
+
+
+def _receiver_stats_snapshot() -> dict:
+    try:
+        with urllib.request.urlopen(f"{RECEIVER_URL}/stats", timeout=0.5) as r:
+            return json.loads(r.read().decode())
+    except Exception:
+        return {}
+
+
+def _append_screen_event(obj: dict):
+    """Append one JSON line to screen_events.jsonl during an active session."""
+    global _rec_screen_f
+    if not (_recording and _rec_screen_f):
+        return
+    try:
+        _rec_screen_f.write(json.dumps(obj) + "\n")
+        _rec_screen_f.flush()
+    except Exception:
+        pass
 
 
 def _rec_start(screen_w: int, screen_h: int, mode: str):
-    global _recording, _rec_dir, _rec_eye_f, _rec_target_f, _rec_fixation_f
+    global _recording, _rec_dir, _rec_eye_f, _rec_target_f, _rec_fixation_f, _rec_screen_f
     global _rec_frame_n, _rec_world_writer, _rec_eye_writer, _rec_homo_writer
     global _rec_world_ts_f, _rec_eye_ts_f, _rec_homo_ts_f
     ts = time.strftime("%Y%m%d_%H%M%S")
     d  = RECORDINGS_DIR / ts
     d.mkdir(parents=True, exist_ok=True)
+    stats = _receiver_stats_snapshot()
+    meta = {
+        "session_id": ts,
+        "screen_w": screen_w,
+        "screen_h": screen_h,
+        "mode": mode,
+        "aruco_dict": _aruco_dict_name,
+        "scene_cam": SCENE_CAM_ID,
+        "eye_cam": EYE_CAM_ID,
+        "sync_offset_ms": stats.get("sync_offset_ms"),
+        "timebases": {
+            "stimulus": "browser_epoch_ms",
+            "cameras_and_pccr": "camera_epoch_ms",
+        },
+        "outputs": {
+            "world_video": "world_cam_raw.avi",
+            "world_timestamps": "world_raw_capture_ts_ms.txt",
+            "eye_video": "eye_cam_raw.avi",
+            "eye_timestamps": "eye_raw_capture_ts_ms.txt",
+            "eye_vectors": "eye.jsonl",
+            "stimulus": "screen_events.jsonl",
+            "stimulus_legacy": "targets.jsonl",
+            "homography_debug_video": "homography_debug.avi",
+            "homography_debug_timestamps": "homography_debug_capture_ts_ms.txt",
+            "aggregated_fixations": "fixations.jsonl",
+            "training_samples": "samples.json",
+        },
+        "started_wall": ts,
+        "status": "in_progress",
+    }
     _rec_dir        = d
     _rec_frame_n    = 0
-    _rec_world_writer = None   # lazily created on first frame (need dimensions)
+    _rec_world_writer = None
     _rec_eye_writer   = None
     _rec_homo_writer  = None
     _rec_eye_f      = open(d / "eye.jsonl",      "w")
     _rec_target_f   = open(d / "targets.jsonl",  "w")
     _rec_fixation_f = open(d / "fixations.jsonl", "w")
-    _rec_world_ts_f = open(d / "world_cam_ts.txt",          "w")
-    _rec_eye_ts_f   = open(d / "eye_cam_ts.txt",            "w")
-    _rec_homo_ts_f  = open(d / "homography_debug_ts.txt",   "w")
+    _rec_screen_f   = open(d / "screen_events.jsonl", "w")
+    _rec_world_ts_f = open(d / "world_raw_capture_ts_ms.txt", "w")
+    _rec_eye_ts_f   = open(d / "eye_raw_capture_ts_ms.txt",   "w")
+    _rec_homo_ts_f  = open(d / "homography_debug_capture_ts_ms.txt", "w")
     with open(d / "meta.json", "w") as f:
-        json.dump({
-            "screen_w": screen_w, "screen_h": screen_h,
-            "mode": mode, "aruco_dict": _aruco_dict_name,
-            "scene_cam": SCENE_CAM_ID, "started": ts,
-        }, f, indent=2)
+        json.dump(meta, f, indent=2)
     _recording = True
     print(f"[rec] Recording started → {d}")
     return str(d)
@@ -268,7 +324,7 @@ def _rec_start(screen_w: int, screen_h: int, mode: str):
 
 def _rec_stop() -> str:
     global _recording, _rec_dir
-    global _rec_eye_f, _rec_target_f, _rec_fixation_f
+    global _rec_eye_f, _rec_target_f, _rec_fixation_f, _rec_screen_f
     global _rec_world_writer, _rec_eye_writer, _rec_homo_writer
     global _rec_world_ts_f, _rec_eye_ts_f, _rec_homo_ts_f
     _recording = False
@@ -277,14 +333,27 @@ def _rec_stop() -> str:
             if w: w.release()
         except Exception: pass
     _rec_world_writer = _rec_eye_writer = _rec_homo_writer = None
-    for f in (_rec_eye_f, _rec_target_f, _rec_fixation_f,
+    for f in (_rec_eye_f, _rec_target_f, _rec_fixation_f, _rec_screen_f,
               _rec_world_ts_f, _rec_eye_ts_f, _rec_homo_ts_f):
         try:
             if f: f.close()
         except Exception: pass
-    _rec_eye_f = _rec_target_f = _rec_fixation_f = None
+    _rec_eye_f = _rec_target_f = _rec_fixation_f = _rec_screen_f = None
     _rec_world_ts_f = _rec_eye_ts_f = _rec_homo_ts_f = None
-    path = str(_rec_dir) if _rec_dir else ""
+    d = _rec_dir
+    path = str(d) if d else ""
+    if d and (d / "meta.json").exists():
+        try:
+            stats = _receiver_stats_snapshot()
+            with open(d / "meta.json") as f:
+                meta = json.load(f)
+            meta["status"] = "complete"
+            meta["ended_wall"] = time.strftime("%Y%m%d_%H%M%S")
+            meta["sync_offset_ms_end"] = stats.get("sync_offset_ms")
+            with open(d / "meta.json", "w") as f:
+                json.dump(meta, f, indent=2)
+        except Exception:
+            pass
     print(f"[rec] Recording saved → {path}")
     return path
 
@@ -772,11 +841,18 @@ def _scene_cam_thread():
     global _homography, _last_scene_jpeg
     global _rec_world_writer, _rec_homo_writer
     global _calib_video_tgt, _calib_video_tgt_id
-    snap_url = f"{RECEIVER_URL}/jpeg/{SCENE_CAM_ID}"
+    snap_url = f"{RECEIVER_URL}/jpeg/{SCENE_CAM_ID}?raw=1"
     prev_aruco_count = -1
     while True:
         try:
+            capture_ms = time.time() * 1000.0
             with urllib.request.urlopen(snap_url, timeout=2) as resp:
+                h = resp.headers.get("X-Capture-Ts-Ms")
+                if h is not None:
+                    try:
+                        capture_ms = float(h)
+                    except ValueError:
+                        pass
                 data = resp.read()
             arr = np.frombuffer(data, dtype=np.uint8)
             frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
@@ -801,19 +877,18 @@ def _scene_cam_thread():
                           f"  ArUco: {n} found IDs={all_ids}" +
                           (f"  MISSING={sorted(set(ARUCO_IDS)-set(all_ids))}" if n < 4 else "  → homography OK"))
                     prev_aruco_count = n
-                # World cam recording — every frame, regardless of ArUco
+                # World cam recording — raw frames + ESP32 capture timestamps
                 if _recording and _rec_dir:
-                    now_ms = time.time() * 1000
                     with _rec_lock:
                         if _rec_world_writer is None:
                             _h, _w = frame.shape[:2]
                             _rec_world_writer = cv2.VideoWriter(
-                                str(_rec_dir / "world_cam.avi"),
+                                str(_rec_dir / "world_cam_raw.avi"),
                                 cv2.VideoWriter_fourcc(*"MJPG"),
                                 20.0, (_w, _h))
                         _rec_world_writer.write(frame)
                         if _rec_world_ts_f:
-                            _rec_world_ts_f.write(f"{now_ms:.3f}\n")
+                            _rec_world_ts_f.write(f"{capture_ms:.3f}\n")
 
                 if detected:
                     H = _compute_homography(detected)
@@ -849,9 +924,8 @@ def _scene_cam_thread():
                                     _last_homography_debug_save_ts = now
                                     fname = HOMOGRAPHY_DEBUG_DIR / f"{time.strftime('%Y%m%d_%H%M%S')}.jpg"
                                     fname.write_bytes(_last_homography_debug_jpeg)
-                        # Homography debug recording — overlay frames alongside world cam
+                        # Homography debug recording — same capture time as world frame
                         if _recording and _rec_dir:
-                            now_ms = time.time() * 1000
                             with _rec_lock:
                                 if _rec_homo_writer is None:
                                     _h, _w = debug_bgr.shape[:2]
@@ -861,7 +935,7 @@ def _scene_cam_thread():
                                         20.0, (_w, _h))
                                 _rec_homo_writer.write(debug_bgr)
                                 if _rec_homo_ts_f:
-                                    _rec_homo_ts_f.write(f"{now_ms:.3f}\n")
+                                    _rec_homo_ts_f.write(f"{capture_ms:.3f}\n")
                     else:
                         print("[scene] Waiting for marker positions from browser (resize the window or move slider)…")
                 else:
@@ -885,31 +959,41 @@ def _scene_cam_thread():
             print(f"[scene] Error fetching {snap_url}: {err}")
         time.sleep(0.05)  # ~20 fps
 
-# ── Eye cam poller (engine /frame — has pupil/glint overlay) ─────────────────
+# ── Eye cam poller (receiver /jpeg — annotated preview + raw session video) ─
 def _eye_cam_thread():
-    """Fetch analyzed eye frame from engine at ~20fps for /eye_stream and recording."""
+    """Serve annotated eye preview; during recording, also append raw eye AVI + ts."""
     global _last_eye_jpeg, _rec_eye_writer
-    frame_url = f"{ENGINE_URL}/frame"
+    preview_url = f"{RECEIVER_URL}/jpeg/{EYE_CAM_ID}"
+    raw_url = f"{RECEIVER_URL}/jpeg/{EYE_CAM_ID}?raw=1"
     while True:
         try:
-            with urllib.request.urlopen(frame_url, timeout=1) as resp:
+            with urllib.request.urlopen(preview_url, timeout=1) as resp:
                 data = resp.read()
             if data:
                 _last_eye_jpeg = data
-                if _recording and _rec_dir:
-                    arr = np.frombuffer(data, np.uint8)
-                    frm = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-                    if frm is not None:
-                        with _rec_lock:
-                            if _rec_eye_writer is None:
-                                _h, _w = frm.shape[:2]
-                                _rec_eye_writer = cv2.VideoWriter(
-                                    str(_rec_dir / "eye_cam.avi"),
-                                    cv2.VideoWriter_fourcc(*"MJPG"),
-                                    20.0, (_w, _h))
-                            _rec_eye_writer.write(frm)
-                            if _rec_eye_ts_f:
-                                _rec_eye_ts_f.write(f"{time.time()*1000:.3f}\n")
+            if _recording and _rec_dir:
+                cap_ms = time.time() * 1000.0
+                with urllib.request.urlopen(raw_url, timeout=1) as resp2:
+                    h2 = resp2.headers.get("X-Capture-Ts-Ms")
+                    if h2 is not None:
+                        try:
+                            cap_ms = float(h2)
+                        except ValueError:
+                            pass
+                    raw_data = resp2.read()
+                arr = np.frombuffer(raw_data, np.uint8)
+                frm = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                if frm is not None:
+                    with _rec_lock:
+                        if _rec_eye_writer is None:
+                            _h, _w = frm.shape[:2]
+                            _rec_eye_writer = cv2.VideoWriter(
+                                str(_rec_dir / "eye_cam_raw.avi"),
+                                cv2.VideoWriter_fourcc(*"MJPG"),
+                                20.0, (_w, _h))
+                        _rec_eye_writer.write(frm)
+                        if _rec_eye_ts_f:
+                            _rec_eye_ts_f.write(f"{cap_ms:.3f}\n")
         except Exception:
             pass
         time.sleep(0.05)
@@ -919,53 +1003,45 @@ _last_screen_size = [0, 0]   # updated by websocket messages
 
 # ── Eye vector poller ─────────────────────────────────────────────────────────
 def _eye_poll_thread():
-    """Poll engine /result directly for PCCR with the engine's own processing timestamp.
-
-    Using engine timestamp instead of poll time because:
-    - Engine stamps each frame when processing finishes (time.time())
-    - Calibration server and browser both use the same laptop wall clock
-    - Poll time would add up to 33ms jitter per sample; engine ts is accurate to frame
-    - Deduplication by engine ts prevents the same frame being counted twice
-      (engine ~14fps, poll ~30Hz → each frame would otherwise appear ~2x)
-    """
+    """Poll receiver /stats for PCCR + pccr_ts_ms (camera capture time, same as eye video)."""
     global _last_pccr_ts
-    result_url = f"{ENGINE_URL}/result"
+    stats_url = f"{RECEIVER_URL}/stats"
     prev_vec_ok = None
-    _last_engine_ts: float = 0.0   # track last seen engine frame ts for deduplication
+    _last_pccr_ts_seen: float = 0.0   # dedupe: same camera frame must not append twice
 
     while True:
         try:
-            with urllib.request.urlopen(result_url, timeout=1) as resp:
-                d = json.loads(resp.read())
-            vec = d.get("pccr_vector") if d.get("ready") else None
-            # Engine stores ts in seconds; convert to ms for consistency with browser
-            engine_ts_ms = d.get("ts", 0.0) * 1000
+            with urllib.request.urlopen(stats_url, timeout=1) as resp:
+                d = json.loads(resp.read().decode())
+            vec = d.get("pccr_vector")
+            pccr_ts_ms = d.get("pccr_ts_ms")
 
-            if vec and len(vec) == 2 and engine_ts_ms > 0:
-                _last_pccr_ts = engine_ts_ms
+            if vec and len(vec) == 2 and pccr_ts_ms is not None:
+                pccr_ts_ms = float(pccr_ts_ms)
+                _last_pccr_ts = pccr_ts_ms
                 with _debug_lock:
                     _debug["eye_poll_ok"] = True
                     _debug["eye_poll_error"] = ""
                     _debug["pccr_vector"] = [round(vec[0], 3), round(vec[1], 3)]
                     _debug["pccr_age_ms"] = 0
                 if prev_vec_ok is not True:
-                    print(f"[eye] pccr_vector OK (engine ts): {vec}")
+                    print(f"[eye] pccr_vector OK (camera ts_ms): {vec}")
                     prev_vec_ok = True
 
-                # Only add to buffer if this is a new engine frame (dedup)
-                if engine_ts_ms > _last_engine_ts:
-                    _last_engine_ts = engine_ts_ms
-                    entry = {"ts": engine_ts_ms, "dx": vec[0], "dy": vec[1]}
+                if pccr_ts_ms > _last_pccr_ts_seen:
+                    _last_pccr_ts_seen = pccr_ts_ms
+                    entry = {"ts": pccr_ts_ms, "dx": vec[0], "dy": vec[1]}
                     with _eye_lock:
                         _eye_buf.append(entry)
-                        cutoff = engine_ts_ms - 10000
+                        cutoff = pccr_ts_ms - 10000
                         while _eye_buf and _eye_buf[0]["ts"] < cutoff:
                             _eye_buf.pop(0)
                     if _recording and _rec_eye_f:
                         try:
                             _rec_eye_f.write(json.dumps(entry) + "\n")
                             _rec_eye_f.flush()
-                        except Exception: pass
+                        except Exception:
+                            pass
             else:
                 poll_ts = time.time() * 1000
                 age = poll_ts - _last_pccr_ts if _last_pccr_ts else None
@@ -973,8 +1049,7 @@ def _eye_poll_thread():
                     _debug["pccr_vector"] = None
                     _debug["pccr_age_ms"] = round(age) if age else None
                 if prev_vec_ok is not False:
-                    print(f"[eye] pccr_vector is null — engine ready={d.get('ready')}. "
-                          "Check: engine running? analysis toggled on? eye cam correct?")
+                    print("[eye] pccr_vector is null — check receiver analysis=1 and eye cam.")
                     prev_vec_ok = False
         except Exception as e:
             err = str(e)
@@ -982,12 +1057,12 @@ def _eye_poll_thread():
                 _debug["eye_poll_ok"] = False
                 _debug["eye_poll_error"] = err
             if prev_vec_ok is not False:
-                print(f"[eye] Error polling {result_url}: {err}")
+                print(f"[eye] Error polling {stats_url}: {err}")
                 prev_vec_ok = False
         with _debug_lock:
             _debug["target_buf_size"] = len(_target_buf)
             _debug["eye_buf_size"] = len(_eye_buf)
-        time.sleep(0.033)  # ~30 Hz poll; dedup ensures each engine frame counted once
+        time.sleep(0.033)  # ~30 Hz poll; dedupe on pccr_ts_ms
 
 
 # ── Temporal sync ─────────────────────────────────────────────────────────────
@@ -1189,26 +1264,52 @@ def _handle_ws(rfile, wfile):
                     _pending_target = None
                 _clear_calib_window()
                 _calib_trace("WS start mode=%s screen=%s", _calib_mode, _last_screen_size)
-                # Auto-start recording if not already recording
-                if _recording and _rec_target_f:
-                    try:
-                        _rec_target_f.write(json.dumps({"event": "calib_start",
-                                                         "ts": time.time()*1000,
-                                                         "mode": _calib_mode}) + "\n")
+                # Fresh session folder for each calibration run
+                if _recording:
+                    _rec_stop()
+                sw, sh = _last_screen_size[0], _last_screen_size[1]
+                if sw <= 0 or sh <= 0:
+                    sw, sh = 1920, 1080
+                rec_path = _rec_start(sw, sh, _calib_mode)
+                t0 = time.time() * 1000.0
+                start_row = {
+                    "event": "calib_start", "mode": _calib_mode,
+                    "ts_browser_ms": t0, "ts_source": "server_wall_ms",
+                    "screen_w": sw, "screen_h": sh,
+                }
+                _append_screen_event(start_row)
+                try:
+                    if _rec_target_f:
+                        _rec_target_f.write(json.dumps({
+                            "event": "calib_start", "ts": t0, "mode": _calib_mode,
+                        }) + "\n")
                         _rec_target_f.flush()
-                    except Exception: pass
-                _ws_send_frame(wfile, json.dumps({"type": "ack", "msg": f"calibration started ({_calib_mode})"}))
+                except Exception:
+                    pass
+                _ws_send_frame(wfile, json.dumps({
+                    "type": "ack",
+                    "msg": f"calibration started ({_calib_mode})",
+                    "session_path": rec_path,
+                    "recording": True,
+                }))
 
             elif mtype == "target":
                 if _calibrating:
                     entry = {"ts": msg["ts"], "x": msg["x"], "y": msg["y"]}
                     with _target_lock:
                         _target_buf.append(entry)
+                    if _recording:
+                        _append_screen_event({
+                            "event": "target", "mode": _calib_mode,
+                            "ts_browser_ms": float(msg["ts"]),
+                            "x": float(msg["x"]), "y": float(msg["y"]),
+                        })
                     if _recording and _rec_target_f:
                         try:
                             _rec_target_f.write(json.dumps(entry) + "\n")
                             _rec_target_f.flush()
-                        except Exception: pass
+                        except Exception:
+                            pass
 
             elif mtype == "fixation":
                 # Saccade mode: eye has settled — eye is now fixated for FIXATE_MS.
@@ -1241,14 +1342,21 @@ def _handle_ws(rfile, wfile):
                     _set_calib_window(x, y, from_ms=ts, until_ms=ts + FIXATE_MS)
                     if prev_eyes and prev_target:
                         _start_async_flush_pending(prev_eyes, prev_target)
-                    # Record fixation event
+                    if _recording:
+                        _append_screen_event({
+                            "event": "fixation", "mode": _calib_mode,
+                            "ts_browser_ms": float(ts),
+                            "x": float(x), "y": float(y),
+                            "capture_window_ms": [float(ts), float(ts + FIXATE_MS)],
+                        })
                     if _recording and _rec_target_f:
                         try:
                             _rec_target_f.write(json.dumps({
                                 "ts": ts, "x": x, "y": y, "event": "fixation"
                             }) + "\n")
                             _rec_target_f.flush()
-                        except Exception: pass
+                        except Exception:
+                            pass
 
             elif mtype == "stop":
                 _calibrating = False
@@ -1270,9 +1378,26 @@ def _handle_ws(rfile, wfile):
                     try:
                         with open(_rec_dir / "samples.json", "w") as f:
                             json.dump(samples, f)
-                    except Exception: pass
+                    except Exception:
+                        pass
+                if _recording:
+                    t1 = time.time() * 1000.0
+                    _append_screen_event({
+                        "event": "calib_stop", "mode": _calib_mode,
+                        "ts_browser_ms": t1, "ts_source": "server_wall_ms",
+                    })
+                    try:
+                        if _rec_target_f:
+                            _rec_target_f.write(json.dumps({
+                                "event": "calib_stop", "ts": t1, "mode": _calib_mode,
+                            }) + "\n")
+                            _rec_target_f.flush()
+                    except Exception:
+                        pass
+                session_path = str(_rec_dir) if _rec_dir else ""
+                was_recording = _recording
                 result = {"type": "result", "n_samples": len(samples),
-                          "recording": _recording}
+                          "recording": was_recording, "session_path": session_path}
                 if len(samples) >= 6:
                     try:
                         diag = _model.fit(samples)
@@ -1285,6 +1410,8 @@ def _handle_ws(rfile, wfile):
                 else:
                     result.update({"ok": False, "error": f"Only {len(samples)} synced samples (need 6+). Check eye pipeline is running and homography is valid."})
                 _ws_send_frame(wfile, json.dumps(result))
+                if _recording:
+                    _rec_stop()
 
             elif mtype == "status":
                 with _homography_lock:
@@ -1397,7 +1524,7 @@ button.trace-on   { background: #1a1a33; color: #88ccff; border-color: #6699cc; 
   <button id="btnStop" disabled>STOP</button>
   <button id="btnLive" disabled>LIVE OFF</button>
   <button onclick="window.open('/viz','_blank')">📊 Viz</button>
-  <button id="btnRecord">⏺ Record</button>
+  <button id="btnRecord" style="display:none" title="Manual session (optional)">⏺ Record</button>
   <button id="btnPause">⏸ Pause Streams</button>
   <button id="btnTrace" type="button">Trace OFF</button>
   <span id="status">Connecting…</span>
@@ -1548,7 +1675,12 @@ ws.onclose = () => statusEl.textContent = 'Disconnected';
 ws.onmessage = e => {
   const m = JSON.parse(e.data);
   if (m.type === 'record_ack') { handleRecordAck(m); return; }
-  if (m.type === 'ack')    statusEl.textContent = 'Calibrating…';
+  if (m.type === 'ack') {
+    statusEl.textContent = m.session_path
+      ? `Calibrating…  session: ${m.session_path.split('/').pop()}`
+      : 'Calibrating…';
+    return;
+  }
   if (m.type === 'status') {
     statusEl.textContent = `Homography: ${m.homography?'✓':'✗'}  Model: ${m.model_trained?'✓':'✗'}`;
     if (m.model_trained) btnLive.disabled = false;
@@ -1560,7 +1692,8 @@ ws.onmessage = e => {
   if (m.type === 'result') {
     btnStop.disabled  = false;
     btnStart.disabled = false;
-    const rec = m.recording ? '  💾 recorded' : '';
+    const folder = m.session_path ? m.session_path.split('/').pop() : '';
+    const rec = m.recording && folder ? `  💾 ${folder}` : '';
     if (m.ok) {
       statusEl.textContent = `Done! n=${m.n_samples}  R²x=${m.r2_x.toFixed(3)}  R²y=${m.r2_y.toFixed(3)}${rec}`;
     } else {
@@ -2520,12 +2653,7 @@ class Handler(BaseHTTPRequestHandler):
                     cutoff = entry["ts"] - 10000
                     while _eye_buf and _eye_buf[0]["ts"] < cutoff:
                         _eye_buf.pop(0)
-                # Record raw eye stream
-                if _recording and _rec_eye_f:
-                    try:
-                        _rec_eye_f.write(json.dumps(entry) + "\n")
-                        _rec_eye_f.flush()
-                    except Exception: pass
+                # eye.jsonl is written only from _eye_poll_thread (/stats) to avoid duplicate clocks.
                 # Add to pending accumulator for current target
                 appended = False
                 with _pending_lock:

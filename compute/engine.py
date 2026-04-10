@@ -17,7 +17,7 @@ GET  /gaze_model       Current gaze model coefficients
 POST /gaze_model/load  Reload gaze_model.json from disk
 
 Receiver calls POST /process for every frame when analysis is ON.
-Calibration server polls GET /result for pccr_vector.
+Calibration server polls the receiver GET /stats for pccr_vector and pccr_ts_ms.
 Debug UI calls GET/POST /settings.
 """
 

@@ -18,6 +18,7 @@ import sys
 import time
 import threading
 import json
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 
@@ -521,6 +522,7 @@ class MJPEGHandler(BaseHTTPRequestHandler):
             "cam2": CAMS[2].stats,
             "sync_offset_ms": round(sync_offset_ms, 1),
             "pccr_vector": list(g_latest_pccr) if g_latest_pccr else None,
+            "pccr_ts_ms": round(g_latest_pccr_ts, 3) if g_latest_pccr else None,
             "eye_cam": g_eye_cam,
             "streams_paused": g_streams_paused,
             "analysis_enabled": g_analysis_enabled,
@@ -912,18 +914,23 @@ class MJPEGHandler(BaseHTTPRequestHandler):
             pass
 
     # ── /jpeg/<n>  (single frame, for canvas-based sync display) ─────────────
+    # Query: raw=1 → always sensor JPEG (no pupil overlay); default eye cam serves annotated.
     def _jpeg(self, cam: CamState):
         if g_streams_paused:
             try: self.send_error(503)
             except BrokenPipeError: pass
             return
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        raw = (qs.get("raw", [""])[0] or "").lower() in ("1", "true", "yes")
+
         with cam.frame_lock:
+            ts_ms = cam.latest_frame_ts_ms
             data = cam.latest_frame
         if not data:
             try: self.send_error(503)
             except BrokenPipeError: pass
             return
-        if g_analysis_enabled and cam.cam_id == g_eye_cam:
+        if not raw and g_analysis_enabled and cam.cam_id == g_eye_cam:
             # Serve the pre-computed annotated frame from the analysis thread.
             # Fall back to raw frame if not yet annotated.
             with cam.frame_lock:
@@ -935,6 +942,7 @@ class MJPEGHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "image/jpeg")
             self.send_header("Content-Length", str(len(data)))
             self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Capture-Ts-Ms", f"{ts_ms:.3f}")
             self.end_headers()
             self.wfile.write(data)
         except BrokenPipeError:
