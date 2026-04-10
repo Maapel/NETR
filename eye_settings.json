@@ -1,12 +1,12 @@
 {
-  "p_algorithm": "seed",
+  "p_algorithm": "threshold",
   "p_glint_thresh": 92,
   "p_blur_ksize": 7,
-  "p_thresh_offset": 0,
-  "p_dark_percentile": 0.9,
+  "p_thresh_offset": 7,
+  "p_dark_percentile": 0.2,
   "p_morph_ksize": 5,
   "p_min_radius": 15,
-  "p_max_radius": 151,
+  "p_max_radius": 150,
   "p_circularity_min": 0.4,
   "p_canny_low": 30,
   "p_canny_high": 100,
@@ -14,10 +14,10 @@
   "p_hough_param1": 100,
   "p_hough_param2": 30,
   "p_gradient_downscale": 2,
-  "p_seed_flood_tolerance": 10,
-  "g_brightness_thresh": 221,
+  "p_seed_flood_tolerance": 40,
+  "g_brightness_thresh": 230,
   "g_min_area": 5,
   "g_max_area": 800,
-  "g_search_radius_factor": 3.9,
-  "g_circularity_min": 0.12
+  "g_search_radius_factor": 2.5,
+  "g_circularity_min": 0.3
 }

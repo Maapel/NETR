@@ -771,6 +771,7 @@ def _scene_cam_thread():
     """Periodically grab a frame from the receiver MJPEG stream and update homography."""
     global _homography, _last_scene_jpeg
     global _rec_world_writer, _rec_homo_writer
+    global _calib_video_tgt, _calib_video_tgt_id
     snap_url = f"{RECEIVER_URL}/jpeg/{SCENE_CAM_ID}"
     prev_aruco_count = -1
     while True:
@@ -1129,7 +1130,7 @@ def _broadcast(msg: str):
 
 
 def _handle_ws(rfile, wfile):
-    global _calibrating, _calib_mode
+    global _calibrating, _calib_mode, _pending_eye, _pending_target
     with _ws_lock:
         _ws_clients.add(wfile)
     try:
@@ -1217,13 +1218,17 @@ def _handle_ws(rfile, wfile):
                 if _calibrating:
                     ts = msg["ts"]   # ms, same clock as receiver's time.time()*1000
                     x, y = msg["x"], msg["y"]
-                    # Snapshot previous target's data BEFORE setting the new target,
-                    # then start the flush thread with captured data.  If we started
-                    # the thread first and set the new target after, the thread could
-                    # race ahead, read _pending_target as the NEW target, and clear it —
-                    # dropping all subsequent eye frames for that point.
+                    # Atomically swap: drain previous target+eyes AND install the new
+                    # target in a single locked critical section.  Earlier code released
+                    # the lock between snapshot (which set _pending_target=None) and
+                    # re-assignment, letting /push_eye observe a None target and drop
+                    # every sample — see `dropped_no_pending_target` in calib_trace.
                     _trace_reset_push_counters()
-                    prev_eyes, prev_target = _snapshot_pending()
+                    with _pending_lock:
+                        prev_eyes = _pending_eye
+                        prev_target = _pending_target
+                        _pending_eye = []
+                        _pending_target = {"x": x, "y": y}
                     srv_now = time.time() * 1000
                     _calib_trace(
                         "WS fixation ts=%.1f server_now=%.1f delta_ms=%.1f xy=(%.1f,%.1f) "
@@ -1233,8 +1238,6 @@ def _handle_ws(rfile, wfile):
                         str(bool(prev_eyes and prev_target)),
                         ts, ts + FIXATE_MS,
                     )
-                    with _pending_lock:
-                        _pending_target = {"x": x, "y": y}
                     _set_calib_window(x, y, from_ms=ts, until_ms=ts + FIXATE_MS)
                     if prev_eyes and prev_target:
                         _start_async_flush_pending(prev_eyes, prev_target)
