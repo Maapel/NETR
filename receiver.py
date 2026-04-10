@@ -301,7 +301,7 @@ import collections
 import os
 from datetime import datetime
 
-RECORD_BUF_SECS = 30  # 30-seconds rolling buffer
+RECORD_BUF_SECS = 40  # 40-second rolling buffer
 RECORD_MAX_FRAMES = 30 * RECORD_BUF_SECS  # ~3600 frames at 30fps
 
 HTTP_PORT      = 8080
@@ -339,8 +339,10 @@ class CamState:
         self._recent: list[tuple[int, bytes]] = []
         self._recent_lock = threading.Lock()
 
-        # Rolling 2-minute recording buffer: deque of (ts_us, jpeg_bytes)
+        # Rolling 2-minute recording buffer: deque of (ts_us, raw_jpeg, annotated_jpeg_or_None)
         self.rec_buf: collections.deque = collections.deque(maxlen=RECORD_MAX_FRAMES)
+        # Parallel gaze buffer for world cam: deque of (ts_us, gaze_xy_or_None, scene_wh_or_None)
+        self.gaze_buf: collections.deque = collections.deque(maxlen=RECORD_MAX_FRAMES)
 
         self.stats = {
             "fps": 0.0, "latency_ms": 0.0,
@@ -393,7 +395,8 @@ class CamState:
         self.frame_event.set()
 
         # Rolling 2-min recording buffer (always recording)
-        self.rec_buf.append((ts_us, jpeg))
+        # Annotated frame is initially None; eye analysis thread patches it later
+        self.rec_buf.append((ts_us, jpeg, None))
 
         # Store in recent buffer for pairing
         now_us = int(time.time() * 1e6)
@@ -686,9 +689,29 @@ class MJPEGHandler(BaseHTTPRequestHandler):
         except BrokenPipeError:
             pass
 
+    @staticmethod
+    def _find_nearest_gaze(gaze_list, ts_us):
+        """Find gaze entry nearest to ts_us from sorted gaze_list. Returns (gaze_xy, scene_wh)."""
+        import bisect
+        timestamps = [g[0] for g in gaze_list]
+        idx = bisect.bisect_left(timestamps, ts_us)
+        best = None
+        for i in (idx - 1, idx):
+            if 0 <= i < len(gaze_list):
+                if best is None or abs(gaze_list[i][0] - ts_us) < abs(gaze_list[best][0] - ts_us):
+                    best = i
+        if best is not None and abs(gaze_list[best][0] - ts_us) < 200_000:  # within 200ms
+            return gaze_list[best][1], gaze_list[best][2]
+        return None, None
+
     # ── /record/save — dump rolling 2-min buffer to disk ────────────────────
     def _record_save(self):
-        threading.Thread(target=self._do_save, daemon=True).start()
+        from urllib.parse import parse_qs, urlparse
+        qs = parse_qs(urlparse(self.path).query)
+        annotate_eye = qs.get("annotate_eye", ["0"])[0] == "1"
+        annotate_world = qs.get("annotate_world", ["0"])[0] == "1"
+        threading.Thread(target=self._do_save, args=(annotate_eye, annotate_world),
+                         daemon=True).start()
         body = json.dumps({"ok": True, "msg": "Saving..."}).encode()
         try:
             self.send_response(200)
@@ -700,39 +723,92 @@ class MJPEGHandler(BaseHTTPRequestHandler):
             pass
 
     @staticmethod
-    def _do_save():
+    def _do_save(annotate_eye=False, annotate_world=False):
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         out_dir = _pathlib.Path(__file__).parent / "recordings" / ts
         out_dir.mkdir(parents=True, exist_ok=True)
+
+        eye_cid = g_eye_cam
+        world_cid = 3 - eye_cid
+
+        # Snapshot gaze buffer for world cam annotation (sorted by timestamp)
+        world_gaze_list = []
+        if annotate_world:
+            world_cam = CAMS.get(world_cid)
+            if world_cam:
+                world_gaze_list = sorted(list(world_cam.gaze_buf), key=lambda x: x[0])
+
         for cid, cam in CAMS.items():
             frames = list(cam.rec_buf)
             if not frames:
                 print(f"cam{cid}: no frames to save")
                 continue
             cam_dir = out_dir / f"cam{cid}"
+
+            # Decide which JPEG to use per frame
+            use_annotated = (annotate_eye and cid == eye_cid)
+            is_world = (annotate_world and cid == world_cid)
+
             if _PUPIL_OK:
-                # Save as MJPEG AVI
-                first_jpg = frames[0][1]
+                # Pick the right jpeg for the first frame to get dimensions
+                first_jpg = frames[0][2] if (use_annotated and frames[0][2]) else frames[0][1]
                 arr = np.frombuffer(first_jpg, np.uint8)
                 img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
                 h, w = img.shape[:2]
-                # Estimate FPS from timestamps
+                # Estimate FPS from timestamps (N frames = N-1 intervals)
                 dt = (frames[-1][0] - frames[0][0]) / 1e6
-                fps = len(frames) / dt if dt > 0 else 30.0
-                path = str(out_dir / f"cam{cid}.avi")
+                fps = (len(frames) - 1) / dt if dt > 0 and len(frames) > 1 else 30.0
+                suffix = ""
+                if use_annotated:
+                    suffix = "_annotated"
+                elif is_world:
+                    suffix = "_annotated"
+                path = str(out_dir / f"cam{cid}{suffix}.avi")
                 writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"MJPG"),
                                          fps, (w, h))
-                for _, jpeg in frames:
+                for ts_us, raw_jpeg, ann_jpeg in frames:
+                    # Select frame source
+                    if use_annotated and ann_jpeg:
+                        jpeg = ann_jpeg
+                    else:
+                        jpeg = raw_jpeg
                     a = np.frombuffer(jpeg, np.uint8)
                     f = cv2.imdecode(a, cv2.IMREAD_COLOR)
-                    if f is not None:
-                        writer.write(f)
+                    if f is None:
+                        continue
+                    # Draw gaze overlay on world cam if requested
+                    if is_world and world_gaze_list:
+                        gaze_xy, scene_wh = MJPEGHandler._find_nearest_gaze(world_gaze_list, ts_us)
+                        if gaze_xy is not None:
+                            gx, gy = gaze_xy
+                            fh, fw = f.shape[:2]
+                            if scene_wh and scene_wh[0] and scene_wh[1]:
+                                gx = gx / scene_wh[0] * fw
+                                gy = gy / scene_wh[1] * fh
+                            gx, gy = int(gx), int(gy)
+                            r = 14
+                            cv2.line(f, (gx - r, gy), (gx + r, gy), (255, 255, 0), 2)
+                            cv2.line(f, (gx, gy - r), (gx, gy + r), (255, 255, 0), 2)
+                    writer.write(f)
                 writer.release()
                 print(f"cam{cid}: saved {len(frames)} frames → {path}  ({fps:.1f} fps)")
+
+                # Also save raw (unannotated) AVI alongside if annotation was used
+                if use_annotated or is_world:
+                    raw_path = str(out_dir / f"cam{cid}.avi")
+                    raw_writer = cv2.VideoWriter(raw_path, cv2.VideoWriter_fourcc(*"MJPG"),
+                                                 fps, (w, h))
+                    for ts_us, raw_jpeg, _ in frames:
+                        a = np.frombuffer(raw_jpeg, np.uint8)
+                        f = cv2.imdecode(a, cv2.IMREAD_COLOR)
+                        if f is not None:
+                            raw_writer.write(f)
+                    raw_writer.release()
+                    print(f"cam{cid}: saved raw → {raw_path}")
             else:
                 # Fallback: save individual JPEGs
                 cam_dir.mkdir(parents=True, exist_ok=True)
-                for i, (ts_us, jpeg) in enumerate(frames):
+                for i, (ts_us, jpeg, _) in enumerate(frames):
                     (cam_dir / f"{i:05d}_{ts_us}.jpg").write_bytes(jpeg)
                 print(f"cam{cid}: saved {len(frames)} frames → {cam_dir}/")
 
@@ -1148,7 +1224,9 @@ class MJPEGHandler(BaseHTTPRequestHandler):
         <option value="2">Cam 2</option>
       </select>
     </div>
-    <button onclick="saveRecording()" style="background:#c33">Save 2min Buffer</button>
+    <label style="cursor:pointer; user-select:none; font-size:12px"><input type="checkbox" id="annotate_eye"> Annotate Eye</label>
+    <label style="cursor:pointer; user-select:none; font-size:12px"><input type="checkbox" id="annotate_world"> Annotate World</label>
+    <button onclick="saveRecording()" style="background:#c33">Save 40s Buffer</button>
     <button onclick="window.open('/player','_blank')" style="background:#669">Player</button>
   </div>
   <div id="feedback"></div>
@@ -1666,8 +1744,10 @@ fetch('/settings').then(r => r.json()).then(s => {
 
 function saveRecording() {
   const fb = document.getElementById('feedback');
-  fb.textContent = 'Saving 2-min buffer...';
-  fetch('/record/save').then(r => r.json()).then(d => {
+  const ae = document.getElementById('annotate_eye').checked ? '1' : '0';
+  const aw = document.getElementById('annotate_world').checked ? '1' : '0';
+  fb.textContent = 'Saving 40s buffer...';
+  fetch('/record/save?annotate_eye=' + ae + '&annotate_world=' + aw).then(r => r.json()).then(d => {
     fb.textContent = d.ok ? 'Saved to recordings/' : 'Save failed';
   }).catch(e => { fb.textContent = 'Error: ' + e; });
 }
@@ -2406,6 +2486,28 @@ def _eye_analysis_thread():
         # Cache annotated frame so MJPEG/JPEG handlers can serve it without re-processing
         with cam.frame_lock:
             cam.annotated_frame = annotated
+
+        # Patch the most recent rec_buf entry with the annotated eye frame
+        cam_ts_us = int(cam_ts * 1000)
+        if annotated and cam.rec_buf:
+            last = cam.rec_buf[-1]
+            if last[0] == cam_ts_us or abs(last[0] - cam_ts_us) < 50_000:
+                cam.rec_buf[-1] = (last[0], last[1], annotated)
+
+        # Store gaze data on the world cam's gaze_buf for annotation at save time
+        world_cam = CAMS.get(3 - g_eye_cam)
+        if world_cam is not None:
+            eng = _engine_get_result()
+            gaze_xy = None
+            scene_wh = None
+            if eng and eng.get("gaze_model_trained"):
+                g = eng.get("gaze")
+                if isinstance(g, list) and len(g) == 2:
+                    gaze_xy = (float(g[0]), float(g[1]))
+                    scene_wh = (eng.get("gaze_scene_width"), eng.get("gaze_scene_height"))
+            if world_cam.rec_buf:
+                last_w = world_cam.rec_buf[-1]
+                world_cam.gaze_buf.append((last_w[0], gaze_xy, scene_wh))
 
 
 if __name__ == "__main__":
