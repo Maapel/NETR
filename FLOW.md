@@ -75,6 +75,3 @@ The Browser doesn't use standard `<img src="...">` for both cameras because they
     *   Estimates the real FPS from the frame timestamps.
     *   Uses `cv2.VideoWriter` to encode an `.avi` file.
     *   Saves the file to the `recordings/` directory for the Player to access.
-
-## 5. Calibration session replay (offline)
-After a calibration run, `python scripts/replay_calib_session.py recordings/<timestamp>/` rebuilds `offline_samples.json` and `gaze_model_fitted.json` from raw world video, `eye.jsonl`, fixations in `screen_events.jsonl`, and `marker_screen_positions.json` (saccade mode).
