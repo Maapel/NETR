@@ -14,7 +14,7 @@ GET  /frame            Latest annotated JPEG (for debug display)
 GET  /settings         All pipeline params as JSON
 POST /settings         Update params (JSON body or query string)
 GET  /gaze_model       Current gaze model coefficients
-POST /gaze_model/load  Reload gaze_model.json from disk
+POST /gaze_model/load  Reload model from disk (optional JSON body {"path": "relative/or/abs under project"})
 
 Receiver calls POST /process for every frame when analysis is ON.
 Calibration server polls the receiver GET /stats for pccr_vector and pccr_ts_ms.
@@ -39,6 +39,20 @@ from gaze_model import GazeModel
 _DIR = pathlib.Path(__file__).parent
 GAZE_MODEL_PATH   = _DIR.parent / "gaze_model.json"
 EYE_SETTINGS_PATH = _DIR.parent / "eye_settings.json"
+_PROJECT_ROOT     = GAZE_MODEL_PATH.parent.resolve()
+
+
+def _resolve_gaze_model_load_path(path_s: str | None) -> pathlib.Path | None:
+    """Return path to load, or None if path escapes project root."""
+    if path_s is None or not str(path_s).strip():
+        return GAZE_MODEL_PATH.resolve()
+    raw = pathlib.Path(str(path_s).strip())
+    cand = raw.resolve() if raw.is_absolute() else (_PROJECT_ROOT / raw).resolve()
+    try:
+        cand.relative_to(_PROJECT_ROOT)
+    except ValueError:
+        return None
+    return cand
 
 # ── Rig config ────────────────────────────────────────────────────────────────
 sys.path.insert(0, str(_DIR.parent))
@@ -247,12 +261,25 @@ class Handler(BaseHTTPRequestHandler):
             gaze  = _latest_gaze
 
         if res is None:
-            self._send(200, json.dumps({"ready": False}).encode())
+            self._send(
+                200,
+                json.dumps(
+                    {
+                        "ready": False,
+                        "gaze_model_trained": _gaze_model.trained,
+                        "gaze_scene_width": getattr(_gaze_model, "scene_width", None),
+                        "gaze_scene_height": getattr(_gaze_model, "scene_height", None),
+                    }
+                ).encode(),
+            )
             return
 
         out = {
             "ready":       True,
             "ts":          ts,
+            "gaze_model_trained": _gaze_model.trained,
+            "gaze_scene_width": getattr(_gaze_model, "scene_width", None),
+            "gaze_scene_height": getattr(_gaze_model, "scene_height", None),
             "pccr_vector": list(res.pccr_vector) if res.pccr_vector else None,
             "pupil": {
                 "center":     res.pupil_center,
@@ -316,9 +343,20 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, body)
 
     # ── POST /gaze_model/load ─────────────────────────────────────────────────
-    def _handle_gaze_model_load(self):
-        ok = _gaze_model.load(GAZE_MODEL_PATH)
-        self._send(200, json.dumps({"ok": ok}).encode())
+    def _handle_gaze_model_load(self, body: bytes):
+        path_s = None
+        if body:
+            try:
+                path_s = json.loads(body.decode()).get("path")
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                self._send(400, b'{"error":"invalid JSON body"}')
+                return
+        target = _resolve_gaze_model_load_path(path_s)
+        if target is None:
+            self._send(400, json.dumps({"ok": False, "error": "path outside project root"}).encode())
+            return
+        ok = _gaze_model.load(target)
+        self._send(200, json.dumps({"ok": ok, "path": str(target)}).encode())
 
     # ── Router ────────────────────────────────────────────────────────────────
     def do_POST(self):
@@ -327,7 +365,9 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/settings":
             self._handle_post_settings()
         elif self.path == "/gaze_model/load":
-            self._handle_gaze_model_load()
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length) if length > 0 else b""
+            self._handle_gaze_model_load(body)
         else:
             self._send(404, b'{"error":"not found"}')
 

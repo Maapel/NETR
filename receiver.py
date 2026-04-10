@@ -121,6 +121,58 @@ def _engine_get_result() -> dict | None:
     except Exception:
         return None
 
+
+def _engine_post_gaze_model_load(body: bytes) -> tuple[int, bytes]:
+    """POST JSON body to engine /gaze_model/load. Returns (status_code, response_bytes)."""
+    import urllib.request
+    try:
+        req = urllib.request.Request(
+            ENGINE_URL + "/gaze_model/load",
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=3) as r:
+            return r.status, r.read()
+    except Exception as e:
+        err = json.dumps({"ok": False, "error": str(e)}).encode()
+        return 502, err
+
+
+def _is_gaze_model_file(p) -> bool:
+    try:
+        data = json.loads(p.read_text())
+        return isinstance(data.get("A"), list) and isinstance(data.get("B"), list)
+    except Exception:
+        return False
+
+
+def _list_gaze_model_files() -> list[dict]:
+    root = _pathlib.Path(__file__).resolve().parent
+    out: list[dict] = []
+    seen: set = set()
+    primary = root / "gaze_model.json"
+    if primary.is_file() and _is_gaze_model_file(primary):
+        rp = primary.resolve()
+        seen.add(rp)
+        out.append({"path": str(primary.relative_to(root)), "label": "gaze_model.json"})
+    rec = root / "recordings"
+    if rec.is_dir():
+        for sub in sorted(rec.iterdir(), key=lambda x: x.name, reverse=True):
+            if not sub.is_dir():
+                continue
+            for fname in ("gaze_model_fitted.json", "gaze_model.json"):
+                cand = sub / fname
+                if not cand.is_file():
+                    continue
+                rp = cand.resolve()
+                if rp in seen or not _is_gaze_model_file(cand):
+                    continue
+                seen.add(rp)
+                rel = str(cand.relative_to(root))
+                out.append({"path": rel, "label": rel})
+    return out
+
 def _engine_post_settings(params: dict) -> bool:
     import urllib.request
     try:
@@ -422,6 +474,7 @@ class MJPEGHandler(BaseHTTPRequestHandler):
         elif path == "/jpeg/1":    self._jpeg(CAMS[1])
         elif path == "/jpeg/2":    self._jpeg(CAMS[2])
         elif path == "/stats":     self._stats()
+        elif path == "/gaze_model_files": self._gaze_model_files()
         elif path == "/settings":  self._get_settings()
         elif path == "/eye_settings": self._get_eye_settings()
         elif path == "/record/save": self._record_save()
@@ -437,9 +490,9 @@ class MJPEGHandler(BaseHTTPRequestHandler):
             except BrokenPipeError: pass
 
     def do_POST(self):
-        length = int(self.headers.get("Content-Length", 0))
-        body   = self.rfile.read(length)
         if self.path == "/calib_window":
+            length = int(self.headers.get("Content-Length", 0))
+            body   = self.rfile.read(length)
             # Calibration server sets the active capture window.
             # Body: {"x": float, "y": float, "from_ms": float, "until_ms": float}
             # or    {"clear": true}  to deactivate
@@ -477,9 +530,33 @@ class MJPEGHandler(BaseHTTPRequestHandler):
             except Exception:
                 try: self.send_error(400)
                 except BrokenPipeError: pass
+        elif self.path == "/engine/gaze_model/load":
+            length = int(self.headers.get("Content-Length", 0))
+            gbody = self.rfile.read(length) if length > 0 else b"{}"
+            code, resp = _engine_post_gaze_model_load(gbody)
+            try:
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(resp)))
+                self.end_headers()
+                self.wfile.write(resp)
+            except BrokenPipeError:
+                pass
         else:
             try: self.send_error(404)
             except BrokenPipeError: pass
+
+    # ── /gaze_model_files ─────────────────────────────────────────────────────
+    def _gaze_model_files(self):
+        body = json.dumps(_list_gaze_model_files()).encode()
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except BrokenPipeError:
+            pass
 
     # ── /closest_frame ────────────────────────────────────────────────────────
     def _closest_frame(self):
@@ -517,7 +594,7 @@ class MJPEGHandler(BaseHTTPRequestHandler):
 
     # ── /stats ────────────────────────────────────────────────────────────────
     def _stats(self):
-        body = json.dumps({
+        payload = {
             "cam1": CAMS[1].stats,
             "cam2": CAMS[2].stats,
             "sync_offset_ms": round(sync_offset_ms, 1),
@@ -526,7 +603,22 @@ class MJPEGHandler(BaseHTTPRequestHandler):
             "eye_cam": g_eye_cam,
             "streams_paused": g_streams_paused,
             "analysis_enabled": g_analysis_enabled,
-        }).encode()
+            "gaze_scene": None,
+            "gaze_scene_width": None,
+            "gaze_scene_height": None,
+            "gaze_model_trained": False,
+            "engine_online": False,
+        }
+        eng = _engine_get_result()
+        if eng is not None:
+            payload["engine_online"] = True
+            payload["gaze_model_trained"] = bool(eng.get("gaze_model_trained"))
+            payload["gaze_scene_width"] = eng.get("gaze_scene_width")
+            payload["gaze_scene_height"] = eng.get("gaze_scene_height")
+            g = eng.get("gaze")
+            if eng.get("ready") and isinstance(g, list) and len(g) == 2:
+                payload["gaze_scene"] = [float(g[0]), float(g[1])]
+        body = json.dumps(payload).encode()
         try:
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -1039,6 +1131,14 @@ class MJPEGHandler(BaseHTTPRequestHandler):
 
   <div class="sync-bar" id="sync-info">sync: —</div>
 
+  <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center; font-size:12px; width:100%; justify-content:center">
+    <label style="cursor:pointer; user-select:none"><input type="checkbox" id="gaze_overlay_world"> Show gaze on world cam (auto)</label>
+    <span style="color:#888">Model</span>
+    <select id="gaze_model_select" style="min-width:220px"></select>
+    <button type="button" onclick="applyGazeModel()" style="padding:4px 12px;background:#257;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px">Apply model</button>
+    <span id="gaze_model_feedback" style="color:#8af;min-width:80px"></span>
+  </div>
+
   <div style="display:flex; gap:8px; margin:4px 0; flex-wrap:wrap; align-items:center">
     <div class="ctrl-group" style="margin:0">
       <span>Target</span>
@@ -1300,6 +1400,64 @@ const c2  = document.getElementById('c2');
 const ctx1 = c1.getContext('2d');
 const ctx2 = c2.getContext('2d');
 
+let __lastStats = {};
+const gazeOverlayEl = document.getElementById('gaze_overlay_world');
+let gazeStatsTimer = null;
+
+function setGazePolling(on) {
+  if (gazeStatsTimer) { clearInterval(gazeStatsTimer); gazeStatsTimer = null; }
+  if (!on) return;
+  gazeStatsTimer = setInterval(() => {
+    fetch('/stats').then(r => r.json()).then(d => { __lastStats = d; }).catch(() => {});
+  }, 100);
+}
+if (gazeOverlayEl) gazeOverlayEl.addEventListener('change', () => setGazePolling(!!gazeOverlayEl.checked));
+
+function populateGazeModelSelect() {
+  const sel = document.getElementById('gaze_model_select');
+  if (!sel) return;
+  fetch('/gaze_model_files').then(r => r.json()).then(arr => {
+    sel.innerHTML = '';
+    if (!Array.isArray(arr) || !arr.length) {
+      const o = document.createElement('option');
+      o.value = '';
+      o.textContent = '(no model files)';
+      sel.appendChild(o);
+      return;
+    }
+    for (const row of arr) {
+      const o = document.createElement('option');
+      o.value = row.path;
+      o.textContent = row.label || row.path;
+      sel.appendChild(o);
+    }
+  }).catch(() => {
+    sel.innerHTML = '';
+    const o = document.createElement('option');
+    o.value = '';
+    o.textContent = '(list failed)';
+    sel.appendChild(o);
+  });
+}
+
+function applyGazeModel() {
+  const sel = document.getElementById('gaze_model_select');
+  const fb = document.getElementById('gaze_model_feedback');
+  const path = sel && sel.value;
+  if (!path) { if (fb) fb.textContent = 'Pick a file'; return; }
+  if (fb) fb.textContent = 'Loading…';
+  fetch('/engine/gaze_model/load', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path }),
+  }).then(r => r.json().then(j => ({ ok: r.ok, j })))
+    .then(({ ok, j }) => {
+      if (fb) fb.textContent = (ok && j.ok !== false) ? 'Loaded' : (j.error || j.path || 'Failed');
+    }).catch(() => { if (fb) fb.textContent = 'Engine offline'; });
+}
+
+populateGazeModelSelect();
+
 // ROI State
 let roi = {
   1: { x1: 0, y1: 0, x2: 1, y2: 1, active: false, start: null, current: null },
@@ -1398,6 +1556,33 @@ function drawBitmap(canvas, ctx, bmp, cid) {
   }
 }
 
+function drawGazeOnWorldCanvas() {
+  const d = __lastStats;
+  const on = gazeOverlayEl && gazeOverlayEl.checked;
+  if (!on || !d || !d.gaze_scene || d.gaze_scene.length !== 2) return;
+  if (!d.gaze_model_trained) return;
+  const eye = d.eye_cam;
+  if (eye !== 1 && eye !== 2) return;
+  const worldCam = 3 - eye;
+  const ctx = worldCam === 1 ? ctx1 : ctx2;
+  const cvs = worldCam === 1 ? c1 : c2;
+  let x = +d.gaze_scene[0], y = +d.gaze_scene[1];
+  const sw = d.gaze_scene_width, sh = d.gaze_scene_height;
+  if (sw && sh && cvs.width > 0 && cvs.height > 0) {
+    x = x / sw * cvs.width;
+    y = y / sh * cvs.height;
+  }
+  ctx.save();
+  ctx.strokeStyle = '#0ff';
+  ctx.lineWidth = 2;
+  const r = 14;
+  ctx.beginPath();
+  ctx.moveTo(x - r, y); ctx.lineTo(x + r, y);
+  ctx.moveTo(x, y - r); ctx.lineTo(x, y + r);
+  ctx.stroke();
+  ctx.restore();
+}
+
 async function loop() {
   if (!running) return;
   const start = performance.now();
@@ -1411,6 +1596,7 @@ async function loop() {
     requestAnimationFrame(() => {
       drawBitmap(c1, ctx1, bmp1, 1);
       drawBitmap(c2, ctx2, bmp2, 2);
+      drawGazeOnWorldCanvas();
     });
   } catch (_) {}
 
@@ -1429,6 +1615,7 @@ function fmtCam(s) {
 
 setInterval(() => {
   fetch('/stats').then(r => r.json()).then(d => {
+    __lastStats = d;
     document.getElementById('s1').textContent = fmtCam(d.cam1);
     document.getElementById('s2').textContent = fmtCam(d.cam2);
     c1.className = d.cam1.online ? 'online' : 'offline';
@@ -1441,6 +1628,10 @@ setInterval(() => {
     document.getElementById('sync-info').innerHTML =
       `sync offset: <span style="color:${color}">${off.toFixed(1)} ms</span>` +
       `  &nbsp;(NTP-based timestamp delta between cameras)`;
+    if (d.engine_online === false && gazeOverlayEl && gazeOverlayEl.checked) {
+      const fb = document.getElementById('gaze_model_feedback');
+      if (fb && !fb.textContent) fb.textContent = 'Engine offline';
+    }
   }).catch(() => {});
 }, 1000);
 

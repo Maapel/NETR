@@ -26,6 +26,8 @@ class GazeModel:
         self.A = None  # shape (6,) — X coefficients
         self.B = None  # shape (6,) — Y coefficients
         self.trained = False
+        self.scene_width: int | None = None
+        self.scene_height: int | None = None
 
     # ── Design matrix ────────────────────────────────────────────────────────
     @staticmethod
@@ -97,6 +99,10 @@ class GazeModel:
             self.A = np.array(data["A"])
             self.B = np.array(data["B"])
             self.trained = True
+            sw = data.get("scene_width")
+            sh = data.get("scene_height")
+            self.scene_width = int(sw) if sw is not None else None
+            self.scene_height = int(sh) if sh is not None else None
             return True
         except (FileNotFoundError, KeyError, json.JSONDecodeError):
             return False
