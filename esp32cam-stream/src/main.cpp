@@ -12,6 +12,9 @@
 // ── User config ──────────────────────────────────────────────────────────────
 #define WIFI_SSID     "iitm_wifi_"
 #define WIFI_PASSWORD "12345678"
+// If primary AP is unavailable, firmware tries this network (same order on reconnect).
+#define WIFI_FALLBACK_SSID     "007"
+#define WIFI_FALLBACK_PASSWORD "stfuplease"
 #define OTA_PASSWORD  "esp32ota"
 
 #ifndef CAM_ID
@@ -76,6 +79,8 @@ static volatile int  g_target_fps   = 14;
 static volatile int  g_framesize    = FRAMESIZE_HD;    // 1280×720
 // Set during OTA — pauses capture+send so WiFi bandwidth goes to the upload
 static volatile bool g_ota_active   = false;
+// True when associated on WIFI_FALLBACK_* (for LED pattern)
+static volatile bool g_wifi_on_fallback = false;
 
 // ── UDP log helper ────────────────────────────────────────────────────────────
 // Prints to Serial AND sends a UDP packet to the laptop log listener (port 5010)
@@ -441,8 +446,9 @@ void otaTask(void *) {
 
 // ── LED helpers (GPIO 33, active LOW) ────────────────────────────────────────
 // Blink pattern meanings:
-//   fast blink (100ms) : connecting to WiFi
-//   slow blink (500ms) : WiFi OK, waiting for laptop beacon
+//   fast blink (100ms) : no WiFi
+//   slow blink (500ms) : WiFi OK, waiting for laptop beacon (primary AP)
+//   double blink (100/100/600) : WiFi OK on fallback AP "007", waiting for beacon
 //   solid ON           : streaming (laptop discovered)
 //   3 rapid flashes    : camera init failed
 #define LED_PIN 33
@@ -463,9 +469,17 @@ void ledTask(void *) {
             ledOn();
             vTaskDelay(pdMS_TO_TICKS(500));
         } else if (WiFi.status() == WL_CONNECTED) {
-            // WiFi OK, no laptop yet — slow blink
-            ledOn();  vTaskDelay(pdMS_TO_TICKS(500));
-            ledOff(); vTaskDelay(pdMS_TO_TICKS(500));
+            if (g_wifi_on_fallback) {
+                // Fallback AP — double blink
+                ledOn();  vTaskDelay(pdMS_TO_TICKS(100));
+                ledOff(); vTaskDelay(pdMS_TO_TICKS(100));
+                ledOn();  vTaskDelay(pdMS_TO_TICKS(100));
+                ledOff(); vTaskDelay(pdMS_TO_TICKS(600));
+            } else {
+                // WiFi OK, no laptop yet — slow blink
+                ledOn();  vTaskDelay(pdMS_TO_TICKS(500));
+                ledOff(); vTaskDelay(pdMS_TO_TICKS(500));
+            }
         } else {
             // No WiFi — fast blink
             ledOn();  vTaskDelay(pdMS_TO_TICKS(100));
@@ -539,6 +553,34 @@ void timeSyncTask(void *) {
     }
 }
 
+// Try one SSID for up to (attempts * 500 ms). Returns true if associated + DHCP OK.
+static bool wifiTryProfile(const char *ssid, const char *pass, int attempts) {
+    WiFi.disconnect(true);
+    delay(100);
+    WiFi.begin(ssid, pass);
+    for (int i = 0; i < attempts; i++) {
+        if (WiFi.status() == WL_CONNECTED)
+            return true;
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+    return false;
+}
+
+// Primary then fallback; sets g_wifi_on_fallback. Returns true if either works.
+static bool wifiConnectPrimaryThenFallback(const char *phase) {
+    Serial.printf("[%s] Trying %s\n", phase, WIFI_SSID);
+    if (wifiTryProfile(WIFI_SSID, WIFI_PASSWORD, 20)) {
+        g_wifi_on_fallback = false;
+        return true;
+    }
+    Serial.printf("[%s] Primary failed, trying fallback %s\n", phase, WIFI_FALLBACK_SSID);
+    if (wifiTryProfile(WIFI_FALLBACK_SSID, WIFI_FALLBACK_PASSWORD, 20)) {
+        g_wifi_on_fallback = true;
+        return true;
+    }
+    return false;
+}
+
 // ── Task: WiFi watchdog — reconnects if connection drops ──────────────────────
 void wifiTask(void *) {
     while (true) {
@@ -546,21 +588,17 @@ void wifiTask(void *) {
             udp_log("WiFi lost — reconnecting (IP was: %s)",
                     g_laptop_ip[0] ? g_laptop_ip : "none");
             g_laptop_ip[0] = '\0';   // clear so stream pauses until rediscovered
-            WiFi.disconnect();
-            WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+            g_wifi_on_fallback = false;
 
-            int retries = 0;
-            while (WiFi.status() != WL_CONNECTED && retries++ < 20) {
-                vTaskDelay(pdMS_TO_TICKS(500));
-            }
-
-            if (WiFi.status() == WL_CONNECTED) {
-                udp_log("WiFi reconnected — IP: %s",
-                        WiFi.localIP().toString().c_str());
-
-                // Clock will re-sync automatically once beacon resumes
+            if (wifiConnectPrimaryThenFallback("wifi_wd")) {
+                if (g_wifi_on_fallback)
+                    udp_log("WiFi reconnected (fallback) — IP: %s",
+                            WiFi.localIP().toString().c_str());
+                else
+                    udp_log("WiFi reconnected — IP: %s",
+                            WiFi.localIP().toString().c_str());
             } else {
-                udp_log("WiFi reconnect failed — will retry");
+                udp_log("WiFi reconnect failed (primary + fallback) — will retry");
             }
         }
         vTaskDelay(pdMS_TO_TICKS(5000));  // check every 5s
@@ -582,14 +620,14 @@ void setup() {
     }
 
     WiFi.mode(WIFI_STA);
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-    Serial.printf("Connecting to %s", WIFI_SSID);
-    while (WiFi.status() != WL_CONNECTED) {
-        Serial.print('.');
-        ledOn();  delay(100);
-        ledOff(); delay(400);
+    while (!wifiConnectPrimaryThenFallback("boot")) {
+        Serial.println("Both networks failed — retrying");
+        ledBlink(2, 100);
+        delay(500);
     }
-    Serial.printf("\nWi-Fi OK — IP: %s\n", WiFi.localIP().toString().c_str());
+    Serial.printf("Wi-Fi OK%s — IP: %s\n",
+                  g_wifi_on_fallback ? " (fallback AP)" : "",
+                  WiFi.localIP().toString().c_str());
     // Clock syncs from laptop beacon — no NTP server needed
 
     udp.begin(LAPTOP_PORT);
