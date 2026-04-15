@@ -12,7 +12,7 @@
 // ── User config ──────────────────────────────────────────────────────────────
 #define WIFI_SSID     "iitm_wifi_"
 #define WIFI_PASSWORD "12345678"
-// If primary AP is unavailable, firmware tries this network (same order on reconnect).
+// Fallback AP — used only if seen in a Wi-Fi scan (never blindly dialed if absent).
 #define WIFI_FALLBACK_SSID     "007"
 #define WIFI_FALLBACK_PASSWORD "stfuplease"
 #define OTA_PASSWORD  "esp32ota"
@@ -566,18 +566,67 @@ static bool wifiTryProfile(const char *ssid, const char *pass, int attempts) {
     return false;
 }
 
-// Primary then fallback; sets g_wifi_on_fallback. Returns true if either works.
-static bool wifiConnectPrimaryThenFallback(const char *phase) {
-    Serial.printf("[%s] Trying %s\n", phase, WIFI_SSID);
-    if (wifiTryProfile(WIFI_SSID, WIFI_PASSWORD, 20)) {
-        g_wifi_on_fallback = false;
-        return true;
+struct ScanPick {
+    bool primary_in_scan;
+    bool fallback_in_scan;
+};
+
+// Mark which of our SSIDs appear in the current RF environment (prioritize primary when both).
+static void wifiScanForKnownSsids(ScanPick *out) {
+    out->primary_in_scan   = false;
+    out->fallback_in_scan = false;
+
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect(true);
+    delay(50);
+
+    // sync scan, include hidden, ~200 ms/channel budget
+    int n = WiFi.scanNetworks(false, true, false, 200);
+    if (n <= 0) {
+        if (n < 0)
+            Serial.printf("[wifi] scan error: %d\n", n);
+        WiFi.scanDelete();
+        return;
     }
-    Serial.printf("[%s] Primary failed, trying fallback %s\n", phase, WIFI_FALLBACK_SSID);
-    if (wifiTryProfile(WIFI_FALLBACK_SSID, WIFI_FALLBACK_PASSWORD, 20)) {
-        g_wifi_on_fallback = true;
-        return true;
+
+    for (int i = 0; i < n; i++) {
+        String s = WiFi.SSID(i);
+        if (s.equals(WIFI_SSID))
+            out->primary_in_scan = true;
+        else if (s.equals(WIFI_FALLBACK_SSID))
+            out->fallback_in_scan = true;
     }
+    WiFi.scanDelete();
+}
+
+// Scan once, then connect only to SSIDs that were actually seen (IITM first if both).
+static bool wifiConnectFromScan(const char *phase) {
+    ScanPick sp;
+    wifiScanForKnownSsids(&sp);
+
+    if (!sp.primary_in_scan && !sp.fallback_in_scan) {
+        Serial.printf("[%s] scan: neither \"%s\" nor \"%s\" in range\n",
+                      phase, WIFI_SSID, WIFI_FALLBACK_SSID);
+        return false;
+    }
+
+    if (sp.primary_in_scan) {
+        Serial.printf("[%s] \"%s\" in range — connecting (preferred)\n", phase, WIFI_SSID);
+        if (wifiTryProfile(WIFI_SSID, WIFI_PASSWORD, 40)) {
+            g_wifi_on_fallback = false;
+            return true;
+        }
+        Serial.printf("[%s] \"%s\" association failed\n", phase, WIFI_SSID);
+    }
+
+    if (sp.fallback_in_scan) {
+        Serial.printf("[%s] connecting to \"%s\"\n", phase, WIFI_FALLBACK_SSID);
+        if (wifiTryProfile(WIFI_FALLBACK_SSID, WIFI_FALLBACK_PASSWORD, 40)) {
+            g_wifi_on_fallback = true;
+            return true;
+        }
+    }
+
     return false;
 }
 
@@ -590,7 +639,7 @@ void wifiTask(void *) {
             g_laptop_ip[0] = '\0';   // clear so stream pauses until rediscovered
             g_wifi_on_fallback = false;
 
-            if (wifiConnectPrimaryThenFallback("wifi_wd")) {
+            if (wifiConnectFromScan("wifi_wd")) {
                 if (g_wifi_on_fallback)
                     udp_log("WiFi reconnected (fallback) — IP: %s",
                             WiFi.localIP().toString().c_str());
@@ -598,7 +647,7 @@ void wifiTask(void *) {
                     udp_log("WiFi reconnected — IP: %s",
                             WiFi.localIP().toString().c_str());
             } else {
-                udp_log("WiFi reconnect failed (primary + fallback) — will retry");
+                udp_log("WiFi reconnect failed (scan / assoc) — will retry");
             }
         }
         vTaskDelay(pdMS_TO_TICKS(5000));  // check every 5s
@@ -620,10 +669,10 @@ void setup() {
     }
 
     WiFi.mode(WIFI_STA);
-    while (!wifiConnectPrimaryThenFallback("boot")) {
-        Serial.println("Both networks failed — retrying");
+    while (!wifiConnectFromScan("boot")) {
+        Serial.println("No known AP in scan or connect failed — retrying");
         ledBlink(2, 100);
-        delay(500);
+        delay(2000);
     }
     Serial.printf("Wi-Fi OK%s — IP: %s\n",
                   g_wifi_on_fallback ? " (fallback AP)" : "",
