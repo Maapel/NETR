@@ -1,0 +1,7 @@
+numpy>=1.26
+opencv-python>=4.8
+pillow>=10.0
+requests>=2.31
+textual>=8.0
+rich>=13.0
+platformio>=6.1
