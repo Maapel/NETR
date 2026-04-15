@@ -17,6 +17,8 @@ Eye vectors: polled from receiver `/stats` (`pccr_vector`, `pccr_ts_ms`).
 Ports: HTTP/WS 8090
 """
 
+from __future__ import annotations
+
 import asyncio
 import json
 import time

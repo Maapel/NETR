@@ -3,6 +3,8 @@ NETR — ESP32-CAM XR Rig Manager TUI
 Run: /home/maadhav/pio-venv/bin/python tui.py
 """
 
+from __future__ import annotations
+
 import asyncio
 import re
 import socket

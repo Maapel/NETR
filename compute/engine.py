@@ -21,6 +21,8 @@ Calibration server polls the receiver GET /stats for pccr_vector and pccr_ts_ms.
 Debug UI calls GET/POST /settings.
 """
 
+from __future__ import annotations
+
 import json
 import sys
 import time

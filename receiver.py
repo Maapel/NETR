@@ -12,6 +12,9 @@ Ports:
 Open http://localhost:8080 in your browser.
 """
 
+from __future__ import annotations
+
+import errno
 import socket
 import struct
 import sys
@@ -354,8 +357,12 @@ class CamState:
     def send_cmd(self, cmd: bytes):
         if not self.ip:
             return
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.sendto(cmd, (self.ip, self.cmd_port))
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.sendto(cmd, (self.ip, self.cmd_port))
+        except OSError:
+            # e.g. errno 65 EHOSTUNREACH when laptop and camera are on different subnets
+            pass
 
     def _expire_old(self, now: float):
         expired = [fid for fid, f in self._frames.items()
@@ -2390,6 +2397,22 @@ def _own_ip() -> str:
         return s.getsockname()[0]
 
 
+def _udp_broadcast_targets(own_ip: str, port: int) -> list[tuple[str, int]]:
+    """(host, port) pairs to try for discovery beacons.
+
+    Limited broadcast 255.255.255.255 often fails on macOS (errno 65 EHOSTUNREACH),
+    especially over USB tether / hotspot-style interfaces; subnet broadcast for a
+    typical /24 is a practical fallback.
+    """
+    out: list[tuple[str, int]] = [("255.255.255.255", port)]
+    parts = own_ip.split(".")
+    if len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts):
+        directed = f"{parts[0]}.{parts[1]}.{parts[2]}.255"
+        if directed != own_ip:
+            out.append((directed, port))
+    return out
+
+
 def timesync_server():
     """
     NTP-style round-trip responder on UDP 5005.
@@ -2400,7 +2423,18 @@ def timesync_server():
     """
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind(("0.0.0.0", TIMESYNC_PORT))
+    try:
+        sock.bind(("0.0.0.0", TIMESYNC_PORT))
+    except OSError as e:
+        if e.errno == errno.EADDRINUSE:
+            print(
+                f"[timesync] UDP {TIMESYNC_PORT} already in use (stop the other "
+                "receiver or process using that port); Cristian sync disabled.",
+                flush=True,
+            )
+            sock.close()
+            return
+        raise
     while True:
         try:
             data, addr = sock.recvfrom(128)
@@ -2435,12 +2469,31 @@ def beacon_thread():
     sock.settimeout(1.0)
 
     own_ip = _own_ip()
+    bcast_targets = _udp_broadcast_targets(own_ip, DISCOVERY_PORT)
     print(f"Beacon: LAPTOP:{own_ip}  UDP:{DISCOVERY_PORT}")
 
+    last_bcast_warn = 0.0
     while True:
         # Include current timestamp so ESP32s sync their clock from the beacon
         msg = f"LAPTOP:{own_ip}:{int(time.time() * 1e6):.0f}".encode()
-        sock.sendto(msg, ("255.255.255.255", DISCOVERY_PORT))
+        sent = False
+        last_err = None
+        for dest in bcast_targets:
+            try:
+                sock.sendto(msg, dest)
+                sent = True
+                break
+            except OSError as e:
+                last_err = e
+        if not sent and last_err is not None:
+            now = time.time()
+            if now - last_bcast_warn > 60.0:
+                print(
+                    f"[beacon] UDP send failed ({last_err!r}); "
+                    "discovery beacons may not reach cameras on this interface",
+                    flush=True,
+                )
+                last_bcast_warn = now
         try:
             data, addr = sock.recvfrom(64)
             txt = data.decode(errors="ignore").strip()
