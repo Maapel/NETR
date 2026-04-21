@@ -1323,6 +1323,7 @@ def _handle_ws(rfile, wfile):
                 if _calibrating:
                     ts = msg["ts"]   # ms, same clock as receiver's time.time()*1000
                     x, y = msg["x"], msg["y"]
+                    fixate_ms = float(msg.get("fixate_ms", FIXATE_MS))
                     # Atomically swap: drain previous target+eyes AND install the new
                     # target in a single locked critical section.  Earlier code released
                     # the lock between snapshot (which set _pending_target=None) and
@@ -1341,9 +1342,9 @@ def _handle_ws(rfile, wfile):
                         ts, srv_now, ts - srv_now, x, y,
                         len(prev_eyes), "yes" if prev_target else "no",
                         str(bool(prev_eyes and prev_target)),
-                        ts, ts + FIXATE_MS,
+                        ts, ts + fixate_ms,
                     )
-                    _set_calib_window(x, y, from_ms=ts, until_ms=ts + FIXATE_MS)
+                    _set_calib_window(x, y, from_ms=ts, until_ms=ts + fixate_ms)
                     if prev_eyes and prev_target:
                         _start_async_flush_pending(prev_eyes, prev_target)
                     if _recording:
@@ -1351,7 +1352,7 @@ def _handle_ws(rfile, wfile):
                             "event": "fixation", "mode": _calib_mode,
                             "ts_browser_ms": float(ts),
                             "x": float(x), "y": float(y),
-                            "capture_window_ms": [float(ts), float(ts + FIXATE_MS)],
+                            "capture_window_ms": [float(ts), float(ts + fixate_ms)],
                         })
                     if _recording and _rec_target_f:
                         try:
@@ -1551,6 +1552,14 @@ button.trace-on   { background: #1a1a33; color: #88ccff; border-color: #6699cc; 
   <div class="slider-row">
     <label>ArUco marker size: <span id="marker-size-val">20</span>% of screen</label>
     <input type="range" id="marker-size" min="8" max="35" value="20" step="1">
+  </div>
+  <div class="slider-row">
+    <label>Point visibility (settle): <span id="settle-ms-val">700</span> ms</label>
+    <input type="range" id="settle-ms" min="200" max="2500" value="700" step="50">
+  </div>
+  <div class="slider-row">
+    <label>Capture time (fixate): <span id="fixate-ms-val">300</span> ms</label>
+    <input type="range" id="fixate-ms" min="100" max="1500" value="300" step="50">
   </div>
   <div class="slider-row">
     <label>ArUco dictionary: <span id="d-dict">4x4</span></label>
@@ -1765,6 +1774,16 @@ document.getElementById('marker-size').addEventListener('input', function() {
   updateMarkers();
 });
 
+// Saccade timing sliders — take effect on the NEXT point jump
+document.getElementById('settle-ms').addEventListener('input', function() {
+  SETTLE_MS = Number(this.value);
+  document.getElementById('settle-ms-val').textContent = SETTLE_MS;
+});
+document.getElementById('fixate-ms').addEventListener('input', function() {
+  FIXATE_MS = Number(this.value);
+  document.getElementById('fixate-ms-val').textContent = FIXATE_MS;
+});
+
 // ── Collision detection — list of rects to avoid ─────────────────────────────
 function getBlockedRects() {
   const S    = Math.min(W, H) * markerPct / 100;
@@ -1821,8 +1840,8 @@ function readingPos(t) {
 }
 
 // ── Saccade mode — stratified 9-zone grid, max-distance sequencing ───────────
-const SETTLE_MS = 700;   // eye settling time after jump (ms)
-const FIXATE_MS = 300;   // sample window after gated fixation (ms)
+let SETTLE_MS = 700;   // eye settling time after jump (ms) — live-tunable via slider
+let FIXATE_MS = 300;   // sample window after gated fixation (ms) — live-tunable via slider
 const ARUCO_POLL_MS = 80;  // /debug poll rate during saccade (homography + IDs)
 
 // 3×3 zone grid — (row, col) for distance math
@@ -1931,6 +1950,7 @@ function tickSaccade(now) {
         ts:   performance.timeOrigin + now,
         x:    saccadePos.x,
         y:    saccadePos.y,
+        fixate_ms: FIXATE_MS,
       }));
     }
     fixationSentAt = now;
