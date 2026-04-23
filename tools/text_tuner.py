@@ -43,13 +43,17 @@ def _build_detector(params: dict) -> TextROIDetector:
     return TextROIDetector(
         min_area=int(params.get("min_area", 60)),
         max_area=int(params.get("max_area", 14000)),
-        min_aspect=float(params.get("min_aspect", 0.1)),
+        min_aspect=float(params.get("min_aspect", 0.2)),
         max_aspect=float(params.get("max_aspect", 10.0)),
+        blur_ksize=int(params.get("blur_ksize", 3)),
         merge_y_overlap=float(params.get("merge_y_overlap", 0.5)),
         merge_x_gap=int(params.get("merge_x_gap", 40)),
-        blur_ksize=int(params.get("blur_ksize", 3)),
+        x_gap_scale=float(params.get("x_gap_scale", 2.0)),
+        min_line_len=int(params.get("min_line_len", 2)),
         skew_method=str(params.get("skew_method", "projection")),
         line_method=str(params.get("line_method", "mser_global")),
+        max_line_angle=float(params.get("max_line_angle", 45.0)),
+        nms_iou=float(params.get("nms_iou", 0.5)),
         docstrum_k=int(params.get("docstrum_k", 6)),
         docstrum_angle_tol=float(params.get("docstrum_angle_tol", 15.0)),
         docstrum_ht_ratio=float(params.get("docstrum_ht_ratio", 1.8)),
@@ -239,11 +243,15 @@ HTML = """<!doctype html>
     <div class=row><label>max_area <span class=val id=v_max_area></span></label>
       <input type=range id=max_area min=500 max=50000 step=100 value=14000></div>
     <div class=row><label>min_aspect <span class=val id=v_min_aspect></span></label>
-      <input type=range id=min_aspect min=0.02 max=1.0 step=0.01 value=0.1></div>
+      <input type=range id=min_aspect min=0.02 max=1.0 step=0.01 value=0.2></div>
     <div class=row><label>max_aspect <span class=val id=v_max_aspect></span></label>
       <input type=range id=max_aspect min=1.0 max=30 step=0.1 value=10></div>
     <div class=row><label>blur_ksize <span class=val id=v_blur_ksize></span></label>
       <input type=range id=blur_ksize min=0 max=9 step=1 value=3></div>
+    <div class=row><label>max_line_angle&deg; <span class=val id=v_max_line_angle></span></label>
+      <input type=range id=max_line_angle min=5 max=45 step=1 value=45></div>
+    <div class=row><label>nms_iou <span class=val id=v_nms_iou></span></label>
+      <input type=range id=nms_iou min=0.2 max=0.95 step=0.05 value=0.5></div>
 
     <div id=g_mser_global>
       <h3>mser_global — line merge</h3>
@@ -254,8 +262,12 @@ HTML = """<!doctype html>
         </select></div>
       <div class=row><label>merge_y_overlap <span class=val id=v_merge_y_overlap></span></label>
         <input type=range id=merge_y_overlap min=0 max=1 step=0.01 value=0.5></div>
-      <div class=row><label>merge_x_gap <span class=val id=v_merge_x_gap></span></label>
+      <div class=row><label>merge_x_gap (px) <span class=val id=v_merge_x_gap></span></label>
         <input type=range id=merge_x_gap min=0 max=200 step=1 value=40></div>
+      <div class=row><label>x_gap_scale (× char h) <span class=val id=v_x_gap_scale></span></label>
+        <input type=range id=x_gap_scale min=0.5 max=6 step=0.1 value=2.0></div>
+      <div class=row><label>min_line_len <span class=val id=v_min_line_len></span></label>
+        <input type=range id=min_line_len min=1 max=8 step=1 value=2></div>
     </div>
 
     <div id=g_docstrum class=hide>
@@ -306,15 +318,16 @@ HTML = """<!doctype html>
 </div>
 
 <script>
-const MSER_IDS = ["min_area","max_area","min_aspect","max_aspect","blur_ksize"];
-const MG_IDS   = ["merge_y_overlap","merge_x_gap"];
+const MSER_IDS = ["min_area","max_area","min_aspect","max_aspect","blur_ksize","max_line_angle","nms_iou"];
+const MG_IDS   = ["merge_y_overlap","merge_x_gap","x_gap_scale","min_line_len"];
 const DS_IDS   = ["docstrum_k","docstrum_angle_tol","docstrum_ht_ratio","docstrum_max_dist","docstrum_min_len"];
 const LP_IDS   = ["patch_grid"];
 const ALL_IDS  = [...MSER_IDS, ...MG_IDS, ...DS_IDS, ...LP_IDS];
 
 const DEFAULTS = {
-  min_area:60, max_area:14000, min_aspect:0.1, max_aspect:10, blur_ksize:3,
-  merge_y_overlap:0.5, merge_x_gap:40,
+  min_area:60, max_area:14000, min_aspect:0.2, max_aspect:10, blur_ksize:3,
+  max_line_angle:45, nms_iou:0.5,
+  merge_y_overlap:0.5, merge_x_gap:40, x_gap_scale:2.0, min_line_len:2,
   docstrum_k:6, docstrum_angle_tol:15, docstrum_ht_ratio:1.8, docstrum_max_dist:4, docstrum_min_len:3,
   patch_grid:3,
 };

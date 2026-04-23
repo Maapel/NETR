@@ -19,44 +19,58 @@ Quad = np.ndarray  # shape (4, 2), int32 — four corners in image space
 class TextROIDetector:
     def __init__(
         self,
+        # MSER region filter
         min_area: int = 60,
         max_area: int = 14000,
-        min_aspect: float = 0.1,
+        min_aspect: float = 0.2,      # tightened: rejects near-vertical strokes
         max_aspect: float = 10.0,
+        blur_ksize: int = 3,
+        # line merge (mser_global)
         merge_y_overlap: float = 0.5,
         merge_x_gap: int = 40,
-        blur_ksize: int = 3,
+        x_gap_scale: float = 2.0,     # gap = max(merge_x_gap, x_gap_scale * median_h)
+        min_line_len: int = 2,         # min regions per line to keep
+        # skew estimation
         skew_method: str = "projection",  # "projection" | "nn"
-        skew_range: float = 45.0,  # search ±deg
-        skew_coarse: float = 1.0,  # coarse step deg
-        skew_fine: float = 0.2,   # refine step deg
+        skew_range: float = 45.0,
+        skew_coarse: float = 1.0,
+        skew_fine: float = 0.2,
+        # method dispatch
         line_method: str = "mser_global",  # "mser_global" | "docstrum" | "local_patch"
+        max_line_angle: float = 45.0,  # reject lines more vertical than this (°)
+        nms_iou: float = 0.5,          # quad NMS overlap threshold
+        # docstrum
         docstrum_k: int = 6,
         docstrum_angle_tol: float = 15.0,
         docstrum_ht_ratio: float = 1.8,
         docstrum_min_len: int = 3,
         docstrum_max_dist: float = 4.0,  # units of median region height
+        # local_patch
         patch_grid: int = 3,
     ):
         self.min_area = min_area
         self.max_area = max_area
         self.min_aspect = min_aspect
         self.max_aspect = max_aspect
+        self.blur_ksize = blur_ksize
         self.merge_y_overlap = merge_y_overlap
         self.merge_x_gap = merge_x_gap
-        self.blur_ksize = blur_ksize
+        self.x_gap_scale = x_gap_scale
+        self.min_line_len = min_line_len
         self.skew_method = skew_method
         self.skew_range = skew_range
         self.skew_coarse = skew_coarse
         self.skew_fine = skew_fine
         self.line_method = line_method
+        self.max_line_angle = max_line_angle
+        self.nms_iou = nms_iou
         self.docstrum_k = docstrum_k
         self.docstrum_angle_tol = docstrum_angle_tol
         self.docstrum_ht_ratio = docstrum_ht_ratio
         self.docstrum_min_len = docstrum_min_len
         self.docstrum_max_dist = docstrum_max_dist
         self.patch_grid = patch_grid
-        self._last_debug: dict = {}  # per-method aux data for debug overlay
+        self._last_debug: dict = {}
         self._mser = cv2.MSER_create()
         self._mser.setMinArea(min_area)
         self._mser.setMaxArea(max_area)
@@ -124,21 +138,21 @@ class TextROIDetector:
 
         def score(theta_deg: float) -> float:
             rad = np.radians(theta_deg)
-            # Perpendicular-to-line axis: rotate by -theta then take y
             y_proj = -np.sin(rad) * c[:, 0] + np.cos(rad) * c[:, 1]
             span = y_proj.max() - y_proj.min()
             if span < bin_size:
                 return 0.0
             n_bins = max(4, int(span / bin_size) + 1)
             hist, _ = np.histogram(y_proj, bins=n_bins)
-            # Normalize by count so variance isn't dominated by total glyph count
             h = hist.astype(np.float32) / max(1.0, hist.sum())
             return float(h.var())
 
         coarse = np.arange(-self.skew_range, self.skew_range + 1e-9, self.skew_coarse)
         scores = [score(t) for t in coarse]
+        # Confidence guard: if no clear periodicity, don't refine noise
+        if max(scores) < 1e-5:
+            return 0.0
         best = float(coarse[int(np.argmax(scores))])
-        # Fine refine ±coarse_step around best
         lo, hi = best - self.skew_coarse, best + self.skew_coarse
         fine = np.arange(lo, hi + 1e-9, self.skew_fine)
         scores_f = [score(t) for t in fine]
@@ -156,13 +170,31 @@ class TextROIDetector:
             return [], 0.0
 
         if self.line_method == "docstrum":
-            return self._detect_lines_docstrum(regions)
-        if self.line_method == "local_patch":
-            return self._detect_lines_local_patch(bgr)
-        return self._detect_lines_mser_global(regions)
+            quads, theta = self._detect_lines_docstrum(regions)
+        elif self.line_method == "local_patch":
+            quads, theta = self._detect_lines_local_patch(bgr)
+        else:
+            quads, theta = self._detect_lines_mser_global(regions)
+
+        return self._nms_quads(quads), theta
+
+    def _nms_quads(self, quads: list[Quad]) -> list[Quad]:
+        """IoU-based deduplication of output quads (esp. for local_patch seams)."""
+        if len(quads) < 2:
+            return quads
+        bboxes = [cv2.boundingRect(q) for q in quads]
+        order = sorted(range(len(bboxes)),
+                       key=lambda i: bboxes[i][2] * bboxes[i][3], reverse=True)
+        kept: list[int] = []
+        for i in order:
+            if not any(_iou(bboxes[i], bboxes[j]) > self.nms_iou for j in kept):
+                kept.append(i)
+        return [quads[i] for i in kept]
 
     def _detect_lines_mser_global(self, regions: list[Box]) -> tuple[list[Quad], float]:
         theta = self.estimate_skew(regions)
+        # Clamp skew to horizontal-bias constraint
+        theta = float(np.clip(theta, -self.max_line_angle, self.max_line_angle))
         rad = -np.radians(theta)
         R = np.array([[np.cos(rad), -np.sin(rad)],
                       [np.sin(rad),  np.cos(rad)]], dtype=np.float32)
@@ -178,10 +210,12 @@ class TextROIDetector:
             rot_boxes.append((int(rx), int(ry), int(rw), int(rh)))
             orig_corners.append(corners)
         rot_lines = _merge_into_lines_indexed(
-            rot_boxes, self.merge_y_overlap, self.merge_x_gap,
+            rot_boxes, self.merge_y_overlap, self.merge_x_gap, self.x_gap_scale,
         )
         out: list[Quad] = []
         for member_idxs in rot_lines:
+            if len(member_idxs) < self.min_line_len:
+                continue
             pts = np.concatenate([orig_corners[i] for i in member_idxs], axis=0)
             rect = cv2.minAreaRect(pts)
             quad = cv2.boxPoints(rect).astype(np.int32)
@@ -193,9 +227,11 @@ class TextROIDetector:
         """Docstrum-lite (O'Gorman 1993 style).
 
         1. Per region: kNN among similar-height regions → nearest = local baseline dir.
-        2. Smooth each region's orientation with median of its kNN's orientations.
-        3. Edge (i,j) kept iff direction (i→j) matches region i's smoothed orientation.
+        2. Smooth each region's orientation with complex-mean of kNN orientations.
+        3. Edge (i,j) kept iff direction (i→j) matches region i's smoothed orientation,
+           using adaptive tolerance based on local angle spread.
         4. Connected components of surviving graph = text lines.
+        5. Post-filter: discard near-vertical line clusters (max_line_angle).
         Handles arbitrary page orientation, mild perspective, curl.
         """
         N = len(regions)
@@ -227,16 +263,14 @@ class TextROIDetector:
             a = np.degrees(np.arctan2(dy, dx))
             local_ang[i] = (a + 90.0) % 180.0 - 90.0
 
-        # Smooth via median of self + knn's angles (unwrap-safe by complex avg)
+        # Smooth via complex-mean on doubled angle (unwrap-safe: 0°=180°)
         smoothed = np.zeros(N, dtype=np.float32)
         for i in range(N):
             vals = np.concatenate(([local_ang[i]], local_ang[knn[i]]))
-            # Convert to unit vectors on doubled angle so 180° flip = same
             z = np.exp(2j * np.radians(vals))
             smoothed[i] = 0.5 * np.degrees(np.angle(z.mean()))
 
         max_dist = self.docstrum_max_dist * median_h
-        tol = self.docstrum_angle_tol
 
         parent = list(range(N))
         def find(x: int) -> int:
@@ -252,18 +286,18 @@ class TextROIDetector:
         edges_kept: list[tuple[int, int]] = []
         edges_rejected: list[tuple[int, int]] = []
         for i in range(N):
+            # Adaptive tolerance: loosen when neighbours point in diverse directions
+            spread = float(np.std(smoothed[knn[i]]))
+            local_tol = min(self.docstrum_angle_tol, max(5.0, spread * 1.5))
             for j in knn[i]:
-                if j <= i:  # avoid duplicate edge work
-                    pass  # still keep directional check below
                 dij = d[i, j]
                 if not np.isfinite(dij) or dij > max_dist:
                     continue
                 dx, dy = c[j] - c[i]
                 a = np.degrees(np.arctan2(dy, dx))
                 a = (a + 90.0) % 180.0 - 90.0
-                # Angular delta with wrap
                 delta = abs(((a - smoothed[i] + 90.0) % 180.0) - 90.0)
-                if delta <= tol:
+                if delta <= local_tol:
                     union(int(i), int(j))
                     edges_kept.append((int(i), int(j)))
                 else:
@@ -277,6 +311,10 @@ class TextROIDetector:
         line_members: list[list[int]] = []
         for members in groups.values():
             if len(members) < self.docstrum_min_len:
+                continue
+            # Horizontal-bias filter: skip clusters whose mean angle is too vertical
+            mean_ang = float(np.mean(np.abs(smoothed[members])))
+            if mean_ang > self.max_line_angle:
                 continue
             pts_list = []
             for idx in members:
@@ -302,8 +340,8 @@ class TextROIDetector:
     def _detect_lines_local_patch(self, bgr: np.ndarray) -> tuple[list[Quad], float]:
         """Split image into a grid, run mser_global per patch, union quads.
 
-        Tolerates per-patch orientation (different tilt across page) but does
-        NOT stitch lines across patch boundaries — lines are cut at edges.
+        Tolerates per-patch orientation (different tilt across page). NMS at the
+        end (inside detect_lines) removes duplicates from overlapping seam zones.
         """
         h, w = bgr.shape[:2]
         g = max(1, self.patch_grid)
@@ -454,14 +492,20 @@ def _iou(a: Box, b: Box) -> float:
 
 
 def _merge_into_lines_indexed(
-    boxes: list[Box], y_overlap: float, x_gap: int,
+    boxes: list[Box], y_overlap: float, x_gap: int, x_gap_scale: float = 2.0,
 ) -> list[list[int]]:
-    """Like _merge_into_lines but returns member-index lists, not merged boxes."""
+    """Returns member-index lists grouped into text lines.
+
+    x_gap is the minimum pixel gap; x_gap_scale * median_h gives a
+    scale-invariant gap that adapts to character height automatically.
+    """
     if not boxes:
         return []
     heights = sorted(b[3] for b in boxes)
     median_h = heights[len(heights) // 2]
     tol = max(4, int((1.0 - y_overlap) * median_h))
+    # Scale-invariant x gap: whichever is larger of fixed pixels or height-relative
+    effective_x_gap = max(x_gap, int(median_h * x_gap_scale))
 
     idx_sorted = sorted(range(len(boxes)), key=lambda i: boxes[i][1] + boxes[i][3] / 2)
     lines: list[list[int]] = []
@@ -487,7 +531,7 @@ def _merge_into_lines_indexed(
         for i in members[1:]:
             prev = boxes[group[-1]]
             prev_right = prev[0] + prev[2]
-            if boxes[i][0] - prev_right <= x_gap:
+            if boxes[i][0] - prev_right <= effective_x_gap:
                 group.append(i)
             else:
                 out.append(group)
