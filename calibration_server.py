@@ -1465,20 +1465,22 @@ button.trace-on   { background: #1a1a33; color: #88ccff; border-color: #6699cc; 
   color: #888; font-size: 13px; min-width: 320px; text-align: center;
 }
 #reopen-debug {
-  position: fixed; bottom: 30vh; left: 12px; z-index: 25;
+  position: fixed; bottom: 12px; left: 12px; z-index: 25;
   display: none;
   padding: 4px 10px; font-size: 11px; background: rgba(0,0,0,0.7);
   border: 1px solid #555; border-radius: 4px; color: #aaa; cursor: pointer;
 }
 #debug-panel {
-  position: fixed; bottom: 30vh; left: 12px; z-index: 20;
+  position: fixed; z-index: 20;
   background: rgba(0,0,0,0.82); border: 1px solid #333; border-radius: 6px;
-  padding: 10px 14px; font-size: 12px; color: #ccc; min-width: 280px;
-  max-width: 340px;
+  padding: 10px 14px; font-size: 12px; color: #ccc;
+  min-width: 220px; max-width: 520px;
+  resize: both; overflow: auto;
 }
 #debug-panel h4 {
   color: #888; margin-bottom: 6px; font-size: 11px; letter-spacing: 1px;
   display: flex; justify-content: space-between; align-items: center;
+  cursor: grab; user-select: none;
 }
 #debug-panel h4 button {
   font-size: 11px; padding: 0 6px; line-height: 16px; border-radius: 3px;
@@ -1495,12 +1497,20 @@ button.trace-on   { background: #1a1a33; color: #88ccff; border-color: #6699cc; 
   border: 1px solid #444; border-radius: 3px; cursor: pointer; }
 .dict-btn.active { background: #333; color: #ffcc00; border-color: #ffcc00; }
 #cam-container {
-  position: fixed; bottom: 40vh; right: 12px; z-index: 20;
-  display: none; flex-direction: column; gap: 4px;
+  position: fixed; z-index: 20;
+  display: none; flex-direction: column; gap: 0;
+  min-width: 160px; min-height: 80px;
+  resize: both; overflow: hidden;
+  border: 1px solid #444; border-radius: 4px;
+}
+#cam-drag-handle {
+  background: rgba(0,0,0,0.75); color: #888; font-size: 11px;
+  padding: 3px 8px; cursor: grab; user-select: none;
+  border-bottom: 1px solid #333; flex-shrink: 0;
 }
 #scene-view {
-  border: 1px solid #444; border-radius: 4px;
-  width: 320px; display: block;
+  border: none; border-radius: 0;
+  width: 100%; flex: 1; min-height: 0; display: block; object-fit: contain;
 }
 #cam-switch {
   display: flex; gap: 0;
@@ -1573,6 +1583,7 @@ button.trace-on   { background: #1a1a33; color: #88ccff; border-color: #6699cc; 
 </div>
 <button id="reopen-debug">⬛ DEBUG</button>
 <div id="cam-container">
+  <div id="cam-drag-handle">📷 Cam ↕↔</div>
   <div id="cam-switch">
     <button id="btnWorld" class="active">🌍 World (ArUco)</button>
     <button id="btnEye">👁 Eye (PCCR)</button>
@@ -1659,6 +1670,7 @@ function resize() {
 }
 resize();
 window.addEventListener('resize', resize);
+initPanelPositions();
 
 let mode = 'saccade';  // sweep deprecated
 btnSaccade.classList.add('active');
@@ -1784,11 +1796,57 @@ document.getElementById('fixate-ms').addEventListener('input', function() {
   document.getElementById('fixate-ms-val').textContent = FIXATE_MS;
 });
 
+// ── Draggable panels ──────────────────────────────────────────────────────────
+function makeDraggable(el, handle) {
+  let ox = 0, oy = 0;
+  handle.addEventListener('mousedown', e => {
+    e.preventDefault();
+    ox = e.clientX - el.offsetLeft;
+    oy = e.clientY - el.offsetTop;
+    handle.style.cursor = 'grabbing';
+    function onMove(e) {
+      el.style.left = Math.max(0, Math.min(window.innerWidth  - 40, e.clientX - ox)) + 'px';
+      el.style.top  = Math.max(0, Math.min(window.innerHeight - 20, e.clientY - oy)) + 'px';
+      el.style.bottom = ''; el.style.right = '';
+    }
+    function onUp() {
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+      handle.style.cursor = 'grab';
+    }
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+  });
+}
+
+function initPanelPositions() {
+  // debug-panel: bottom-left equivalent
+  const dp = document.getElementById('debug-panel');
+  dp.style.left   = '12px';
+  dp.style.top    = Math.max(0, window.innerHeight - window.innerHeight * 0.30 - 300) + 'px';
+  makeDraggable(dp, document.querySelector('#debug-panel h4'));
+
+  // cam-container: bottom-right equivalent (set later when shown)
+  const cc = document.getElementById('cam-container');
+  cc._defaultRight  = 12;
+  cc._defaultBottom = window.innerHeight * 0.40;
+  cc._posSet = false;
+}
+
+function ensureCamPos() {
+  const cc = document.getElementById('cam-container');
+  if (!cc._posSet) {
+    cc.style.left   = Math.max(0, window.innerWidth  - 332 - cc._defaultRight) + 'px';
+    cc.style.top    = Math.max(0, window.innerHeight - 240 - cc._defaultBottom) + 'px';
+    cc.style.width  = '320px';
+    cc._posSet = true;
+  }
+}
+
 // ── Collision detection — list of rects to avoid ─────────────────────────────
 function getBlockedRects() {
   const S    = Math.min(W, H) * markerPct / 100;
   const mEnd = EDGE_PX + 2 * QUIET_PX + S;  // outer edge of marker+quietzone
-  const R    = TARGET_R + 6;                 // dot radius + margin
   const rects = [
     // HUD bar at top
     { x: 0, y: 0, w: W, h: 70 },
@@ -1797,11 +1855,15 @@ function getBlockedRects() {
     { x: W - mEnd,y: 0,       w: mEnd, h: mEnd },
     { x: 0,       y: H - mEnd,w: mEnd, h: mEnd },
     { x: W - mEnd,y: H - mEnd,w: mEnd, h: mEnd },
-    // Debug panel — bottom:30vh, left:12px, ~340px wide, ~300px tall
-    { x: 0, y: H - H*0.30 - 300, w: 360, h: 300 + H*0.30 },
-    // Scene view  — bottom:40vh, right:12px, 320px wide, ~240px tall
-    { x: W - 336, y: H - H*0.40 - 240, w: 336, h: 240 + H*0.40 },
   ];
+  // Live panel positions (drag-aware)
+  for (const id of ['debug-panel', 'cam-container']) {
+    const el = document.getElementById(id);
+    if (el && el.style.display !== 'none') {
+      const r = el.getBoundingClientRect();
+      if (r.width > 0) rects.push({ x: r.left, y: r.top, w: r.width, h: r.height });
+    }
+  }
   return rects;
 }
 
@@ -2196,6 +2258,11 @@ function startCamStream(view) {
   const url = view === 'eye' ? '/eye_stream' : '/scene_stream';
   sceneImg.src = url;
   camContainer.style.display = 'flex';
+  ensureCamPos();
+  if (!camContainer._dragInit) {
+    camContainer._dragInit = true;
+    makeDraggable(camContainer, document.getElementById('cam-drag-handle'));
+  }
   btnWorld.classList.toggle('active', view === 'world');
   btnEye.classList.toggle('active', view === 'eye');
 }
