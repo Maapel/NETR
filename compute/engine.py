@@ -114,7 +114,10 @@ def _process(jpeg: bytes) -> bytes:
     gaze = None
     if result.pccr_vector and _gaze_model.trained:
         try:
-            gaze = _gaze_model.predict(*result.pccr_vector)
+            if _gaze_model.n_terms == 7:
+                gaze = _gaze_model.predict(*result.pccr_vector, result.pccr_sep)
+            else:
+                gaze = _gaze_model.predict(*result.pccr_vector)
         except Exception:
             pass
 
@@ -161,6 +164,9 @@ _EYE_PARAM_RANGES = {
     "g_max_area":             (50,  5000),
     "g_search_radius_factor": (1.0, 5.0),
     "g_circularity_min":      (0.1, 1.0),
+    "g_pair_min_sep_factor":  (0.05, 2.0),
+    "g_pair_max_sep_factor":  (1.0, 10.0),
+    "g_pair_search_top":      (2, 8),
 }
 _VALID_ALGORITHMS = ("threshold", "edge", "gradient", "seed")
 _VALID_DEBUG_VIEWS = ("original", "p_suppressed", "p_blurred", "p_thresh",
@@ -240,6 +246,7 @@ class Handler(BaseHTTPRequestHandler):
             if res and res.pccr_vector:
                 self.send_header("X-Pccr-Dx", f"{res.pccr_vector[0]:.4f}")
                 self.send_header("X-Pccr-Dy", f"{res.pccr_vector[1]:.4f}")
+                self.send_header("X-Pccr-Sep", f"{res.pccr_sep:.4f}")
             if res and res.pupil_radius is not None:
                 self.send_header("X-Pupil-Radius", f"{res.pupil_radius:.2f}")
             self.end_headers()
@@ -268,6 +275,7 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
 
+        gr = res.glint
         out = {
             "ready":       True,
             "ts":          ts,
@@ -275,14 +283,20 @@ class Handler(BaseHTTPRequestHandler):
             "gaze_scene_width": getattr(_gaze_model, "scene_width", None),
             "gaze_scene_height": getattr(_gaze_model, "scene_height", None),
             "pccr_vector": list(res.pccr_vector) if res.pccr_vector else None,
+            "pccr_sep":    res.pccr_sep,
             "pupil": {
                 "center":     res.pupil_center,
                 "radius":     res.pupil_radius,
                 "confidence": res.pupil.confidence,
             },
             "glint": {
-                "primary":    res.glint_pos,
-                "all":        res.glint.glints,
+                "primary":       res.glint_pos,
+                "closest_blob":  list(gr.primary) if gr.primary else None,
+                "all":           gr.glints,
+                "pair_valid":    gr.pair_valid,
+                "glint_a":       list(gr.glint_a) if gr.glint_a else None,
+                "glint_b":       list(gr.glint_b) if gr.glint_b else None,
+                "inter_glint_sep": gr.inter_glint_sep,
             },
             "gaze": list(gaze) if gaze else None,
         }
@@ -329,6 +343,7 @@ class Handler(BaseHTTPRequestHandler):
         if _gaze_model.trained:
             body = json.dumps({
                 "trained": True,
+                "n_terms": _gaze_model.n_terms,
                 "A": _gaze_model.A.tolist(),
                 "B": _gaze_model.B.tolist(),
             }).encode()

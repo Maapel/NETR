@@ -1,18 +1,9 @@
 """
 Eye analysis pipeline — combines pupil + glint detection for PCCR.
 
-This is the single entry point to drop into receiver.py. It takes a
-grayscale frame and returns pupil center, glint position, and the
-pupil-glint vector needed for gaze mapping.
-
-Usage:
-    from eye_pipeline import EyePipeline
-    pipe = EyePipeline()
-    result = pipe.process(gray_frame)
-    # result.pupil_center, result.glint, result.pccr_vector, ...
-
-    # Or draw the overlay on a BGR frame:
-    annotated = pipe.draw(bgr_frame, result)
+PCCR uses the virtual corneal reference: midpoint of a validated dual-glint pair
+when both LEDs are visible, otherwise the closest single glint.
+Optional pccr_sep (inter-glint distance) feeds the extended gaze polynomial.
 """
 
 import cv2
@@ -30,7 +21,8 @@ class EyeResult:
     pupil_center: tuple[int, int] | None = None
     pupil_radius: int | None = None
     glint_pos: tuple[int, int] | None = None
-    pccr_vector: tuple[float, float] | None = None   # (dx, dy) glint→pupil
+    pccr_vector: tuple[float, float] | None = None
+    pccr_sep: float = 0.0
     intermediate_frames: dict = field(default_factory=dict)
 
 
@@ -68,7 +60,8 @@ class EyePipeline:
                       "seed_flood_tolerance"):
             d["p_" + attr] = getattr(self._pupil_det, attr)
         for attr in ("brightness_thresh", "min_area", "max_area",
-                      "search_radius_factor", "circularity_min"):
+                      "search_radius_factor", "circularity_min",
+                      "pair_min_sep_factor", "pair_max_sep_factor", "pair_search_top"):
             d["g_" + attr] = getattr(self._glint_det, attr)
         return d
 
@@ -82,12 +75,17 @@ class EyePipeline:
         )
 
         pccr = None
-        if pr.center and gr.primary:
-            dx = pr.center[0] - gr.primary[0]
-            dy = pr.center[1] - gr.primary[1]
+        pccr_sep = 0.0
+        glint_pos = None
+        ref = gr.reference_point
+        if pr.center and ref is not None:
+            dx = pr.center[0] - ref[0]
+            dy = pr.center[1] - ref[1]
             pccr = (float(dx), float(dy))
+            if gr.pair_valid and gr.inter_glint_sep is not None:
+                pccr_sep = float(gr.inter_glint_sep)
+            glint_pos = (int(round(ref[0])), int(round(ref[1])))
 
-        # Merge intermediate frames
         intermediate = {**pr.intermediate_frames, **gr.intermediate_frames}
 
         return EyeResult(
@@ -95,8 +93,9 @@ class EyePipeline:
             glint=gr,
             pupil_center=pr.center,
             pupil_radius=pr.radius,
-            glint_pos=gr.primary,
+            glint_pos=glint_pos,
             pccr_vector=pccr,
+            pccr_sep=pccr_sep,
             intermediate_frames=intermediate,
         )
 
@@ -107,7 +106,6 @@ class EyePipeline:
         pr = result.pupil
         gr = result.glint
 
-        # Pupil ellipse + crosshair
         if pr.center:
             cx, cy = pr.center
             r = pr.radius or 20
@@ -119,28 +117,33 @@ class EyePipeline:
             cv2.line(out, (cx - r, cy), (cx + r, cy), (0, 255, 0), 1)
             cv2.line(out, (cx, cy - r), (cx, cy + r), (0, 255, 0), 1)
 
-        # All glints
+        if gr.pair_valid and gr.glint_a and gr.glint_b:
+            ax, ay = int(round(gr.glint_a[0])), int(round(gr.glint_a[1]))
+            bx, by = int(round(gr.glint_b[0])), int(round(gr.glint_b[1]))
+            cv2.line(out, (ax, ay), (bx, by), (180, 180, 255), 1)
+
         for i, (gx, gy) in enumerate(gr.glints):
             color = (0, 255, 255) if i == 0 else (200, 200, 0)
-            cv2.circle(out, (gx, gy), 6, color, 2)
-            cv2.circle(out, (gx, gy), 2, color, -1)
+            igx, igy = int(round(gx)), int(round(gy))
+            cv2.circle(out, (igx, igy), 6, color, 2)
+            cv2.circle(out, (igx, igy), 2, color, -1)
 
-        # PCCR vector arrow
         if result.pccr_vector and result.glint_pos and result.pupil_center:
             cv2.arrowedLine(out, result.glint_pos, result.pupil_center,
                             (255, 0, 255), 2, tipLength=0.15)
 
-        # HUD text
-        h = bgr.shape[0]
         if pr.center:
             cv2.putText(out, f"Pupil ({pr.center[0]},{pr.center[1]}) r={pr.radius}",
                         (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
         if gr.primary:
-            cv2.putText(out, f"Glint ({gr.primary[0]},{gr.primary[1]})",
+            cv2.putText(out, f"Glint closest ({gr.primary[0]:.0f},{gr.primary[1]:.0f})",
                         (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
+        if gr.pair_valid:
+            cv2.putText(out, f"Pair sep={result.pccr_sep:.1f}px",
+                        (10, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 220, 255), 1)
         if result.pccr_vector:
             dx, dy = result.pccr_vector
-            cv2.putText(out, f"PCCR vec ({dx:.0f},{dy:.0f})",
-                        (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 0, 255), 1)
+            cv2.putText(out, f"PCCR ({dx:.0f},{dy:.0f})",
+                        (10, 76), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 0, 255), 1)
 
         return out
