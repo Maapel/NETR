@@ -56,6 +56,7 @@ class TextROIDetector:
         gap_min_h: int = 2,            # min gap band height in pixels before it counts
         # word_chain
         split_pages: bool = False,       # detect spine and process left/right pages separately
+        spine_method: str = "column_sum",  # "column_sum" | "rotated_proj" | "none"
         adaptive_thresh: bool = False,   # adaptive binarisation before MSER (non-uniform light)
         adaptive_block: int = 51,        # adaptive threshold block size (odd px)
         adaptive_c: float = 10.0,        # constant subtracted in adaptive threshold
@@ -113,6 +114,7 @@ class TextROIDetector:
         self.track_max_gap = track_max_gap
         self.smooth_win = smooth_win
         self.min_track_len = min_track_len
+        self.spine_method = spine_method
         self._last_debug: dict = {}
         self._mser = cv2.MSER_create()
         self._mser.setMinArea(min_area)
@@ -937,7 +939,18 @@ class TextROIDetector:
             block, int(self.adaptive_c),
         )
 
-        split_x = _ct_find_page_split(bin_inv) if self.split_pages else None
+        # ── Spine detection ───────────────────────────────────────────────────
+        split_x     = None
+        split_angle = 0.0
+        if self.split_pages and self.spine_method != "none":
+            if self.spine_method == "rotated_proj":
+                result = _ct_find_spine_rotated(bin_inv)
+                if result is not None:
+                    split_x, split_angle = result
+            else:  # "column_sum" (default)
+                sx = _ct_find_page_split(bin_inv)
+                if sx is not None:
+                    split_x, split_angle = sx, 0.0
 
         sc = self.strip_count
         kw = dict(
@@ -952,7 +965,9 @@ class TextROIDetector:
         if split_x is None:
             tracks = _ct_detect_tracks(bin_inv, sc, **kw)
         else:
-            pad = max(8, W // 120)
+            # Pad wider for rotated spines: spine drifts H/2*tan(angle) at edges
+            angle_rad = abs(np.radians(split_angle))
+            pad = max(8, W // 120) + int(H / 2 * np.tan(angle_rad))
             left  = bin_inv[:, :max(1, split_x - pad)]
             right = bin_inv[:, min(W - 1, split_x + pad):]
             r_off = min(W - 1, split_x + pad)
@@ -985,6 +1000,7 @@ class TextROIDetector:
             "tracks": tracks,
             "bin_inv": bin_inv,
             "split_x": split_x,
+            "split_angle": split_angle,
         }
         return out, float("nan")
 
@@ -1022,7 +1038,9 @@ class TextROIDetector:
                 cv2.circle(out, (int(x), int(y)), 2, col, -1, cv2.LINE_AA)
         split_x = dbg.get("split_x")
         if split_x is not None:
-            cv2.line(out, (split_x, 0), (split_x, H - 1), (0, 180, 255), 2)
+            angle = dbg.get("split_angle", 0.0) or 0.0
+            dx = int(H / 2 * np.tan(np.radians(angle)))
+            cv2.line(out, (split_x - dx, 0), (split_x + dx, H - 1), (0, 180, 255), 2)
         hud = f"[curve_track]  tracks={len(tracks)}"
         cv2.rectangle(out, (0, 0), (W, 22), (0, 0, 0), -1)
         cv2.putText(out, hud, (6, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
@@ -1585,7 +1603,7 @@ def _ct_find_peaks(
 
 
 def _ct_find_page_split(bin_inv: np.ndarray, search_frac: float = 0.18) -> int | None:
-    """Return the x coordinate of the book spine gutter, or None if not detected."""
+    """Spine detection via vertical column-sum valley (assumes vertical spine)."""
     h, w = bin_inv.shape[:2]
     vprof = bin_inv.sum(axis=0).astype(np.float32)
     if vprof.max() <= 0:
@@ -1605,6 +1623,70 @@ def _ct_find_page_split(bin_inv: np.ndarray, search_frac: float = 0.18) -> int |
     if neighbor <= 1e-6:
         return None
     return valley_idx if float(vsm[valley_idx]) <= neighbor * 0.72 else None
+
+
+def _ct_find_spine_rotated(
+    bin_inv: np.ndarray,
+    search_frac: float = 0.25,
+    angle_range: float = 20.0,
+    n_angles: int = 9,
+) -> tuple[int, float] | None:
+    """Spine detection via rotated projection search.
+
+    For each candidate angle (−angle_range … +angle_range degrees from
+    vertical) sums bin_inv along lines at that angle through every x offset
+    in the central search band.  The angle + offset with the deepest valley
+    is the spine.  Handles books rotated or in perspective view.
+
+    Returns (split_x_at_mid_height, angle_deg) or None.
+    """
+    h, w = bin_inv.shape[:2]
+    cx = w // 2
+    span = max(10, int(w * search_frac))
+    ys = np.arange(h, dtype=np.float32)
+    y_mid = h / 2.0
+
+    best_val   = float("inf")
+    best_x     = cx
+    best_angle = 0.0
+    found      = False
+
+    for angle_deg in np.linspace(-angle_range, angle_range, n_angles):
+        angle_rad = float(np.radians(angle_deg))
+        # x_bases: each candidate spine x at mid-height, shape (2*span,)
+        x_bases = np.arange(cx - span, cx + span, dtype=np.float32)
+        # col[i, y] = x_bases[i] + (y - y_mid) * tan(angle)
+        offsets = ((ys - y_mid) * np.tan(angle_rad)).astype(np.int32)   # (h,)
+        cols = np.clip(
+            x_bases[:, None].astype(np.int32) + offsets[None, :],       # (2*span, h)
+            0, w - 1,
+        )
+        # density[i] = total ink along the rotated line at x_bases[i]
+        density = bin_inv[np.arange(h)[None, :], cols].sum(axis=1).astype(np.float32)
+
+        # Smooth then find valley
+        k = max(5, span // 10) | 1
+        density_sm = np.convolve(density, np.ones(k, np.float32) / k, mode="same")
+        min_i = int(np.argmin(density_sm))
+        val   = float(density_sm[min_i])
+
+        # Validate: valley must be significantly deeper than its neighbours
+        nb_r = max(5, span // 5)
+        left  = density_sm[max(0, min_i - nb_r):min_i]
+        right = density_sm[min_i + 1:min(len(density_sm), min_i + nb_r)]
+        if not len(left) or not len(right):
+            continue
+        neighbor = float((np.median(left) + np.median(right)) / 2.0)
+        if neighbor <= 1e-6 or val > neighbor * 0.72:
+            continue
+
+        if val < best_val:
+            best_val   = val
+            best_x     = int(x_bases[min_i])
+            best_angle = float(angle_deg)
+            found      = True
+
+    return (best_x, best_angle) if found else None
 
 
 

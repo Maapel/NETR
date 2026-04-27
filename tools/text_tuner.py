@@ -79,6 +79,7 @@ def _build_detector(params: dict) -> TextROIDetector:
         track_max_gap=int(params.get("track_max_gap", 2)),
         smooth_win=int(params.get("smooth_win", 7)),
         min_track_len=int(params.get("min_track_len", 4)),
+        spine_method=params.get("spine_method", "column_sum"),
     )
 
 
@@ -373,6 +374,14 @@ HTML = """<!doctype html>
         <input type=range id=smooth_win min=1 max=31 step=1 value=7></div>
       <div class=row><label>min_track_len <span class=val id=v_min_track_len></span><span class=tip title="Minimum number of strips a track must span to be kept as a detected line. Raise to suppress short spurious tracks (noise, margin annotations).">ⓘ</span></label>
         <input type=range id=min_track_len min=1 max=30 step=1 value=4></div>
+      <div class=toggle><input type=checkbox id=ct_split_pages><label for=ct_split_pages>split_pages — process each page half separately</label></div>
+      <div class=row><label>spine_method</label>
+        <select id=spine_method>
+          <option value="column_sum" selected>column_sum — vertical projection valley (fast, straight-on)</option>
+          <option value="rotated_proj">rotated_proj — angle search ±20° (handles tilted books)</option>
+          <option value="none">none — no spine detection</option>
+        </select>
+      </div>
     </div>
 
     <button onclick="resetAll()">Reset</button>
@@ -444,8 +453,10 @@ function qs() {
   for (const k of ALL_IDS) p.set(k, document.getElementById(k).value);
   if (document.getElementById("split").checked) p.set("split","1");
   if (document.getElementById("split_pages").checked) p.set("split_pages","1");
+  if (document.getElementById("ct_split_pages").checked) p.set("split_pages","1");
   if (document.getElementById("adaptive_thresh").checked) p.set("adaptive_thresh","1");
   if (document.getElementById("binarize").checked) p.set("binarize","1");
+  p.set("spine_method", document.getElementById("spine_method").value);
   p.set("line_method", currentMethod());
   const m = currentMethod();
   if (m === "mser_global") p.set("skew_method", document.getElementById("skew_method").value);
@@ -486,6 +497,8 @@ function schedule(){ clearTimeout(t); t=setTimeout(refresh, 150); }
 ALL_IDS.forEach(id => document.getElementById(id).addEventListener("input", schedule));
 document.getElementById("split").addEventListener("change", refresh);
 document.getElementById("split_pages").addEventListener("change", refresh);
+document.getElementById("ct_split_pages").addEventListener("change", refresh);
+document.getElementById("spine_method").addEventListener("change", refresh);
 document.getElementById("adaptive_thresh").addEventListener("change", refresh);
 document.getElementById("binarize").addEventListener("change", refresh);
 document.getElementById("skew_method").addEventListener("change", refresh);
