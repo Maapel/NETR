@@ -94,7 +94,7 @@ For each new strip's peaks, the algorithm tries to extend existing tracks:
 ```
 for each existing track:
     find the peak in this strip closest to track's last y
-    if distance <= y_tol AND prominence is consistent:
+    if distance <= y_tol:
         extend track with this peak
     else:
         mark track as "missed this strip"
@@ -103,38 +103,40 @@ for any peaks not claimed by any track:
     start a new track
 ```
 
-The `track_max_gap` parameter allows a track to survive up to N consecutive
-strips with no matching peak (e.g. over an illustration or wide margin) before
-it is considered dead.
+`track_max_gap` lets a track survive N consecutive strips with no matching peak (e.g. over a margin or illustration). Tracks shorter than `min_track_len` are discarded at the end.
 
-At the end, tracks shorter than `min_track_len` strips are discarded — these
-are typically noise, not real text lines.
+Tracks are sorted by mean y so output index 0 = topmost line.
 
-### Neighbour-support pre-filter (Pass 2)
+### Outlier filtering (three layers)
 
-Before track association, each peak is checked against its immediate
-neighbouring strips (s−1 and s+1).  A peak at y in strip s is kept only if
-at least one neighbour strip also has a peak within `y_tol` of that y.
+**Important:** adaptive threshold converts shadow/hand boundaries into thin
+horizontal edge artefacts — same FWHM as real text — so simple shape tests
+are not enough. Three layers work together:
+
+**Layer 1 — FWHM filter (Pass 2 pre-filter)**
+Compute each peak's FWHM (full-width at half-maximum in the profile). The
+global median FWHM across all peaks in the frame is the reference line height.
+Peaks wider than 2.5× the median are dropped — genuine wide blobs that
+adaptive threshold didn't convert to thin edges.
+
+**Layer 2 — Neighbour support (Pass 2 pre-filter)**
+After FWHM filtering, a peak must also have at least one peak within `y_tol`
+in the adjacent strip (s−1 or s+1). Removes single-strip spikes and trims the
+boundary strips of any object that enters/exits the frame mid-page.
+
+**Layer 3 — Inter-spacing post-check**
+After track assembly, sort tracks by mean y and compute consecutive gaps.
+Any pair of tracks closer than 55% of the median gap is flagged as a shadow
+edge pair (adaptive threshold produces one peak at each edge of a shadow band,
+creating two closely-spaced tracks). The shorter track of the pair is dropped.
 
 ```
-strip s-1:  peaks [80, 160, 240]
-strip s:    peaks [80, 160, 240, 310]   ← 310 is new
-strip s+1:  peaks [80, 160, 241]        ← no peak near 310
-
-→ 310 dropped from strip s before tracking
+real lines:   y=80, 160, 240   gaps=[80,80]  median=80  threshold=44
+shadow pair:  y=294, 327       gap=33  →  33 < 44  →  drop shorter one
 ```
 
-This removes peaks that appear in isolation — a hand entering the frame for
-one or two strips, a shadow spike, a noise blob. Works regardless of book
-tilt because the check is purely local (strip-to-strip y-drift is fine as
-long as the peak is consistently present in neighbours).
-
-For a hand or shadow that covers many consecutive strips, the edge strips are
-still trimmed (the boundary strip has no neighbour support), shortening the
-resulting track. `min_track_len` is then the final defence — raise it if
-contiguous noise objects still produce surviving tracks.
-
-Tracks are sorted by their mean y so output index 0 = topmost line.
+`min_track_len` remains the final gate — for partial-width hands/shadows that
+survive all three layers, raise this value.
 
 ---
 
