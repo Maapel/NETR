@@ -42,6 +42,20 @@ except ImportError as e:
 _text_lines_lock   = threading.Lock()
 _text_lines_cache: dict = {}   # cid → {lines, w, h, ts}
 _text_detector     = None
+_tl_params: dict = {
+    "clahe_clip":      2.5,
+    "blur_ksize":      3,
+    "adaptive_block":  31,
+    "adaptive_c":      10.0,
+    "strip_count":     24,
+    "peak_min_height": 0.28,
+    "peak_min_dist":   10,
+    "y_tol":           10,
+    "track_max_gap":   2,
+    "smooth_win":      7,
+    "min_track_len":   4,
+    "split_pages":     False,
+}
 
 def _get_text_detector():
     global _text_detector
@@ -49,13 +63,20 @@ def _get_text_detector():
         return _text_detector
     try:
         from compute.text_detector import TextROIDetector
+        p = _tl_params
         _text_detector = TextROIDetector(
             line_method="curve_track",
-            clahe_clip=2.5, clahe_tile=8,
-            blur_ksize=3,
-            adaptive_block=31, adaptive_c=10,
-            strip_count=24, peak_min_height=0.28, peak_min_dist=10,
-            y_tol=10, track_max_gap=2, smooth_win=7, min_track_len=4,
+            clahe_clip=float(p["clahe_clip"]), clahe_tile=8,
+            blur_ksize=int(p["blur_ksize"]),
+            adaptive_block=int(p["adaptive_block"]), adaptive_c=float(p["adaptive_c"]),
+            strip_count=int(p["strip_count"]),
+            peak_min_height=float(p["peak_min_height"]),
+            peak_min_dist=int(p["peak_min_dist"]),
+            y_tol=int(p["y_tol"]),
+            track_max_gap=int(p["track_max_gap"]),
+            smooth_win=int(p["smooth_win"]),
+            min_track_len=int(p["min_track_len"]),
+            split_pages=bool(p["split_pages"]),
         )
     except Exception as _e:
         print(f"text_detector unavailable: {_e}")
@@ -1037,6 +1058,27 @@ class MJPEGHandler(BaseHTTPRequestHandler):
             g_debug_view = params["debug_view"]
             _engine_post_settings({"debug_view": g_debug_view})
 
+        # Text-line overlay params — any tl_* key rebuilds the detector
+        _tl_int   = {"blur_ksize", "adaptive_block", "strip_count", "peak_min_dist",
+                     "y_tol", "track_max_gap", "smooth_win", "min_track_len"}
+        _tl_float = {"clahe_clip", "adaptive_c", "peak_min_height"}
+        _tl_dirty = False
+        for k in list(_tl_int | _tl_float | {"split_pages"}):
+            key = "tl_" + k
+            if key in params:
+                if k in _tl_int:
+                    _tl_params[k] = int(float(params[key]))
+                elif k in _tl_float:
+                    _tl_params[k] = float(params[key])
+                else:
+                    _tl_params[k] = params[key] not in ("0", "false", "")
+                _tl_dirty = True
+        if _tl_dirty:
+            global _text_detector
+            _text_detector = None
+            with _text_lines_lock:
+                _text_lines_cache.clear()
+
         # ROI settings (x1,y1,x2,y2 normalized)
         new_roi = None
         if "roi" in params:
@@ -1421,6 +1463,76 @@ class MJPEGHandler(BaseHTTPRequestHandler):
     <button onclick="applySettings()">Apply</button>
     </details>
 
+    <details id="tl_panel" style="flex:1; min-width:350px; border:1px solid #444; border-radius:4px; padding:4px 8px; background:#1a2020">
+    <summary style="cursor:pointer; color:#fd8; font-weight:bold; padding:4px 0">
+      Text-Line Overlay Settings (curve_track)
+    </summary>
+    <div style="display:grid; grid-template-columns:1fr 1fr; gap:4px 16px; padding:8px 0; font-size:12px">
+      <div class="ctrl-group">
+        <span>CLAHE clip (0=off): <b id="tl_clahe_clip_v">2.5</b></span>
+        <input type="range" min="0" max="8" step="0.5" value="2.5" id="tl_clahe_clip"
+               oninput="document.getElementById('tl_clahe_clip_v').textContent=this.value;tlSet('clahe_clip',this.value)">
+      </div>
+      <div class="ctrl-group">
+        <span>Blur k: <b id="tl_blur_ksize_v">3</b></span>
+        <input type="range" min="1" max="21" step="2" value="3" id="tl_blur_ksize"
+               oninput="document.getElementById('tl_blur_ksize_v').textContent=this.value;tlSet('blur_ksize',this.value)">
+      </div>
+      <div class="ctrl-group">
+        <span>Adaptive block: <b id="tl_adaptive_block_v">31</b></span>
+        <input type="range" min="3" max="81" step="2" value="31" id="tl_adaptive_block"
+               oninput="document.getElementById('tl_adaptive_block_v').textContent=this.value;tlSet('adaptive_block',this.value)">
+      </div>
+      <div class="ctrl-group">
+        <span>Adaptive C: <b id="tl_adaptive_c_v">10</b></span>
+        <input type="range" min="1" max="40" step="1" value="10" id="tl_adaptive_c"
+               oninput="document.getElementById('tl_adaptive_c_v').textContent=this.value;tlSet('adaptive_c',this.value)">
+      </div>
+      <div class="ctrl-group">
+        <span>Strips: <b id="tl_strip_count_v">24</b></span>
+        <input type="range" min="4" max="80" step="1" value="24" id="tl_strip_count"
+               oninput="document.getElementById('tl_strip_count_v').textContent=this.value;tlSet('strip_count',this.value)">
+      </div>
+      <div class="ctrl-group">
+        <span>Peak min height: <b id="tl_peak_min_height_v">0.28</b></span>
+        <input type="range" min="0.05" max="0.9" step="0.01" value="0.28" id="tl_peak_min_height"
+               oninput="document.getElementById('tl_peak_min_height_v').textContent=(+this.value).toFixed(2);tlSet('peak_min_height',this.value)">
+      </div>
+      <div class="ctrl-group">
+        <span>Peak min dist (px): <b id="tl_peak_min_dist_v">10</b></span>
+        <input type="range" min="2" max="60" step="1" value="10" id="tl_peak_min_dist"
+               oninput="document.getElementById('tl_peak_min_dist_v').textContent=this.value;tlSet('peak_min_dist',this.value)">
+      </div>
+      <div class="ctrl-group">
+        <span>Y tol (px): <b id="tl_y_tol_v">10</b></span>
+        <input type="range" min="1" max="60" step="1" value="10" id="tl_y_tol"
+               oninput="document.getElementById('tl_y_tol_v').textContent=this.value;tlSet('y_tol',this.value)">
+      </div>
+      <div class="ctrl-group">
+        <span>Max gap (strips): <b id="tl_track_max_gap_v">2</b></span>
+        <input type="range" min="0" max="10" step="1" value="2" id="tl_track_max_gap"
+               oninput="document.getElementById('tl_track_max_gap_v').textContent=this.value;tlSet('track_max_gap',this.value)">
+      </div>
+      <div class="ctrl-group">
+        <span>Smooth win: <b id="tl_smooth_win_v">7</b></span>
+        <input type="range" min="1" max="31" step="1" value="7" id="tl_smooth_win"
+               oninput="document.getElementById('tl_smooth_win_v').textContent=this.value;tlSet('smooth_win',this.value)">
+      </div>
+      <div class="ctrl-group">
+        <span>Min track len: <b id="tl_min_track_len_v">4</b></span>
+        <input type="range" min="1" max="30" step="1" value="4" id="tl_min_track_len"
+               oninput="document.getElementById('tl_min_track_len_v').textContent=this.value;tlSet('min_track_len',this.value)">
+      </div>
+      <div class="ctrl-group">
+        <span>Split pages</span>
+        <select id="tl_split_pages" onchange="tlSet('split_pages',this.value)">
+          <option value="0" selected>Off</option>
+          <option value="1">On</option>
+        </select>
+      </div>
+    </div>
+    </details>
+
     <details style="flex:1; min-width:350px; border:1px solid #444; border-radius:4px; padding:4px 8px; background:#1a1a2e">
     <summary style="cursor:pointer; color:#8df; font-weight:bold; padding:4px 0">
       Eye Pipeline Settings
@@ -1579,6 +1691,10 @@ function _fetchTextLines() {
     .then(j => { if (j) _lastTextLines = j; })
     .catch(() => {})
     .finally(() => { _textLinesFetching = false; });
+}
+
+function tlSet(key, val) {
+  fetch('/set?tl_' + key + '=' + encodeURIComponent(val)).catch(() => {});
 }
 
 function drawTextLinesOnWorldCanvas() {
