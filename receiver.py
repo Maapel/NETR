@@ -38,6 +38,29 @@ except ImportError as e:
     print(f"Failed to load eye_pipeline: {e}")
     _PUPIL_OK = False
 
+# Text-line overlay (curve_track detector, lazy-init, cached per cam)
+_text_lines_lock   = threading.Lock()
+_text_lines_cache: dict = {}   # cid → {lines, w, h, ts}
+_text_detector     = None
+
+def _get_text_detector():
+    global _text_detector
+    if _text_detector is not None:
+        return _text_detector
+    try:
+        from compute.text_detector import TextROIDetector
+        _text_detector = TextROIDetector(
+            line_method="curve_track",
+            clahe_clip=2.5, clahe_tile=8,
+            blur_ksize=3,
+            adaptive_block=31, adaptive_c=10,
+            strip_count=24, peak_min_height=0.28, peak_min_dist=10,
+            y_tol=10, track_max_gap=2, smooth_win=7, min_track_len=4,
+        )
+    except Exception as _e:
+        print(f"text_detector unavailable: {_e}")
+    return _text_detector
+
 g_analysis_enabled = False   # toggled via /set?analysis=1|0
 g_debug_view = "original"    # passed through to engine
 g_streams_paused = False     # toggled via /set?pause_streams=1|0 — stops MJPEG pushes
@@ -476,6 +499,8 @@ class MJPEGHandler(BaseHTTPRequestHandler):
         elif path == "/stream/2":  self._mjpeg(CAMS[2])
         elif path == "/jpeg/1":    self._jpeg(CAMS[1])
         elif path == "/jpeg/2":    self._jpeg(CAMS[2])
+        elif path == "/text_lines/1": self._text_lines(CAMS[1])
+        elif path == "/text_lines/2": self._text_lines(CAMS[2])
         elif path == "/stats":     self._stats()
         elif path == "/gaze_model_files": self._gaze_model_files()
         elif path == "/settings":  self._get_settings()
@@ -1116,6 +1141,63 @@ class MJPEGHandler(BaseHTTPRequestHandler):
         except BrokenPipeError:
             pass
 
+    # ── /text_lines/<n>  text-line polygons for world cam overlay ───────────────
+    def _text_lines(self, cam: CamState):
+        det = _get_text_detector()
+        if det is None or not _PUPIL_OK:
+            body = json.dumps({"lines": [], "w": 0, "h": 0}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            try: self.wfile.write(body)
+            except BrokenPipeError: pass
+            return
+
+        with cam.frame_lock:
+            data = cam.latest_frame
+
+        cid = cam.cam_id
+        now = time.monotonic()
+
+        with _text_lines_lock:
+            cached = _text_lines_cache.get(cid)
+            if cached and (now - cached["ts"]) < 0.2:
+                body = json.dumps({"lines": cached["lines"], "w": cached["w"], "h": cached["h"]}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                try: self.wfile.write(body)
+                except BrokenPipeError: pass
+                return
+
+        result = {"lines": [], "w": 0, "h": 0, "ts": now}
+        if data:
+            try:
+                buf = np.frombuffer(data, dtype=np.uint8)
+                bgr = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+                if bgr is not None:
+                    H, W = bgr.shape[:2]
+                    quads, _ = det.detect_lines(bgr)
+                    result = {"lines": [q.tolist() for q in quads], "w": W, "h": H, "ts": now}
+            except Exception:
+                pass
+
+        with _text_lines_lock:
+            _text_lines_cache[cid] = result
+
+        body = json.dumps({"lines": result["lines"], "w": result["w"], "h": result["h"]}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        try: self.wfile.write(body)
+        except BrokenPipeError: pass
+
     # ── /stream/<n>  MJPEG (fallback) ─────────────────────────────────────────
     def _mjpeg(self, cam: CamState):
         self.send_response(200)
@@ -1209,6 +1291,7 @@ class MJPEGHandler(BaseHTTPRequestHandler):
 
   <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center; font-size:12px; width:100%; justify-content:center">
     <label style="cursor:pointer; user-select:none"><input type="checkbox" id="gaze_overlay_world"> Show gaze on world cam (auto)</label>
+    <label style="cursor:pointer; user-select:none"><input type="checkbox" id="text_lines_world"> Show text lines on world cam</label>
     <span style="color:#888">Model</span>
     <select id="gaze_model_select" style="min-width:220px"></select>
     <button type="button" onclick="applyGazeModel()" style="padding:4px 12px;background:#257;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px">Apply model</button>
@@ -1479,7 +1562,50 @@ const ctx1 = c1.getContext('2d');
 const ctx2 = c2.getContext('2d');
 
 let __lastStats = {};
-const gazeOverlayEl = document.getElementById('gaze_overlay_world');
+const gazeOverlayEl    = document.getElementById('gaze_overlay_world');
+const textLinesEl      = document.getElementById('text_lines_world');
+let   _lastTextLines   = null;   // {lines, w, h} cached from last /text_lines fetch
+let   _textLinesFetching = false;
+
+function _fetchTextLines() {
+  if (_textLinesFetching || !textLinesEl || !textLinesEl.checked) return;
+  const d = __lastStats;
+  if (!d) return;
+  const worldCam = 3 - d.eye_cam;
+  if (worldCam !== 1 && worldCam !== 2) return;
+  _textLinesFetching = true;
+  fetch('/text_lines/' + worldCam + '?t=' + Date.now())
+    .then(r => r.ok ? r.json() : null)
+    .then(j => { if (j) _lastTextLines = j; })
+    .catch(() => {})
+    .finally(() => { _textLinesFetching = false; });
+}
+
+function drawTextLinesOnWorldCanvas() {
+  if (!textLinesEl || !textLinesEl.checked) return;
+  if (!_lastTextLines || !_lastTextLines.lines || !_lastTextLines.lines.length) return;
+  const d = __lastStats;
+  if (!d) return;
+  const worldCam = 3 - d.eye_cam;
+  const ctx = worldCam === 1 ? ctx1 : ctx2;
+  const cvs = worldCam === 1 ? c1 : c2;
+  if (!cvs.width || !cvs.height) return;
+  const sx = cvs.width  / (_lastTextLines.w || cvs.width);
+  const sy = cvs.height / (_lastTextLines.h || cvs.height);
+  ctx.save();
+  ctx.strokeStyle = 'rgba(255, 200, 0, 0.85)';
+  ctx.lineWidth = 1.5;
+  for (const poly of _lastTextLines.lines) {
+    if (!poly || poly.length < 2) continue;
+    ctx.beginPath();
+    ctx.moveTo(poly[0][0] * sx, poly[0][1] * sy);
+    for (let i = 1; i < poly.length; i++)
+      ctx.lineTo(poly[i][0] * sx, poly[i][1] * sy);
+    ctx.closePath();
+    ctx.stroke();
+  }
+  ctx.restore();
+}
 let gazeStatsTimer = null;
 
 function setGazePolling(on) {
@@ -1675,7 +1801,9 @@ async function loop() {
       drawBitmap(c1, ctx1, bmp1, 1);
       drawBitmap(c2, ctx2, bmp2, 2);
       drawGazeOnWorldCanvas();
+      drawTextLinesOnWorldCanvas();
     });
+    _fetchTextLines();
   } catch (_) {}
 
   const elapsed = performance.now() - start;
