@@ -71,7 +71,6 @@ class TextROIDetector:
         track_max_gap: int = 2,         # max strips a track can be absent
         smooth_win: int = 7,            # projection profile smoothing window
         min_track_len: int = 4,         # min strip count to keep a track
-        book_mask: bool = False,        # discard line quads outside detected page boundary
     ):
         self.min_area = min_area
         self.max_area = max_area
@@ -114,7 +113,6 @@ class TextROIDetector:
         self.track_max_gap = track_max_gap
         self.smooth_win = smooth_win
         self.min_track_len = min_track_len
-        self.book_mask = book_mask
         self._last_debug: dict = {}
         self._mser = cv2.MSER_create()
         self._mser.setMinArea(min_area)
@@ -981,26 +979,12 @@ class TextROIDetector:
             bot = np.stack([xs_d, np.clip(ys_d + half_h, 0, H - 1)], axis=1).astype(np.int32)
             out.append(np.vstack([top, bot[::-1]]))
 
-        book_quad = None
-        if self.book_mask and out:
-            book_quad = _find_book_quad(bgr)
-            if book_quad is not None:
-                out = [
-                    q for q in out
-                    if cv2.pointPolygonTest(
-                        book_quad,
-                        (float(q[:, 0].mean()), float(q[:, 1].mean())),
-                        False,
-                    ) >= 0
-                ]
-
         self._last_debug = {
             "regions": [],
             "method": "curve_track",
             "tracks": tracks,
             "bin_inv": bin_inv,
             "split_x": split_x,
-            "book_quad": book_quad,
         }
         return out, float("nan")
 
@@ -1622,36 +1606,6 @@ def _ct_find_page_split(bin_inv: np.ndarray, search_frac: float = 0.18) -> int |
         return None
     return valley_idx if float(vsm[valley_idx]) <= neighbor * 0.72 else None
 
-
-def _find_book_quad(bgr: np.ndarray) -> np.ndarray | None:
-    """Largest quadrilateral contour = book page boundary (document-scanner style).
-
-    Returns shape (N, 2) int32 polygon, or None if the image is featureless.
-    Uses auto Canny thresholds derived from Otsu so it works for any book colour.
-    Falls back to the convex hull of the largest contour if no clean quad is found.
-    """
-    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY) if bgr.ndim == 3 else bgr
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    otsu_val, _ = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    if otsu_val < 1:
-        return None
-    edges = cv2.Canny(blurred, otsu_val * 0.5, otsu_val)
-    edges = cv2.dilate(edges, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
-    cnts, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not cnts:
-        return None
-    H, W = (bgr.shape[0], bgr.shape[1])
-    min_area = H * W * 0.1
-    cnts = sorted(cnts, key=cv2.contourArea, reverse=True)
-    for cnt in cnts[:5]:
-        if cv2.contourArea(cnt) < min_area:
-            break
-        peri = cv2.arcLength(cnt, True)
-        approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
-        if len(approx) == 4:
-            return approx.reshape(4, 2).astype(np.int32)
-    hull = cv2.convexHull(cnts[0])
-    return hull.reshape(-1, 2).astype(np.int32)
 
 
 def _ct_detect_tracks(
