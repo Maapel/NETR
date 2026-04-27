@@ -1538,7 +1538,8 @@ class MJPEGHandler(BaseHTTPRequestHandler):
         <span>Spine method</span>
         <select id="tl_spine_method" onchange="tlSet('spine_method',this.value)">
           <option value="column_sum" selected>column_sum (fast, vertical)</option>
-          <option value="rotated_proj">rotated_proj (handles tilt ±20°)</option>
+          <option value="rotated_proj">rotated_proj (angle search ±20°)</option>
+          <option value="line_perp">line_perp (perpendicular to tracks)</option>
           <option value="none">none</option>
         </select>
       </div>

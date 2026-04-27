@@ -379,6 +379,7 @@ HTML = """<!doctype html>
         <select id=spine_method>
           <option value="column_sum" selected>column_sum — vertical projection valley (fast, straight-on)</option>
           <option value="rotated_proj">rotated_proj — angle search ±20° (handles tilted books)</option>
+          <option value="line_perp">line_perp — perpendicular to avg track direction (accurate, auto-angle)</option>
           <option value="none">none — no spine detection</option>
         </select>
       </div>

@@ -947,6 +947,15 @@ class TextROIDetector:
                 result = _ct_find_spine_rotated(bin_inv)
                 if result is not None:
                     split_x, split_angle = result
+            elif self.spine_method == "line_perp":
+                kw_spine = dict(
+                    peak_h=self.peak_min_height, peak_dist=self.peak_min_dist,
+                    y_tol=self.y_tol, max_gap=self.track_max_gap,
+                    smooth_win=self.smooth_win,
+                )
+                result = _ct_find_spine_line_perp(bin_inv, self.strip_count, **kw_spine)
+                if result is not None:
+                    split_x, split_angle = result
             else:  # "column_sum" (default)
                 sx = _ct_find_page_split(bin_inv)
                 if sx is not None:
@@ -1647,47 +1656,114 @@ def _ct_find_spine_rotated(
     y_mid = h / 2.0
 
     best_val   = float("inf")
-    best_x     = cx
-    best_angle = 0.0
-    found      = False
+    best_result: tuple[int, float] | None = None
 
     for angle_deg in np.linspace(-angle_range, angle_range, n_angles):
-        angle_rad = float(np.radians(angle_deg))
-        # x_bases: each candidate spine x at mid-height, shape (2*span,)
+        result = _ct_project_valley(bin_inv, float(angle_deg), search_frac)
+        if result is None:
+            continue
+        # Pick the angle whose valley is deepest
         x_bases = np.arange(cx - span, cx + span, dtype=np.float32)
-        # col[i, y] = x_bases[i] + (y - y_mid) * tan(angle)
-        offsets = ((ys - y_mid) * np.tan(angle_rad)).astype(np.int32)   # (h,)
-        cols = np.clip(
-            x_bases[:, None].astype(np.int32) + offsets[None, :],       # (2*span, h)
-            0, w - 1,
-        )
-        # density[i] = total ink along the rotated line at x_bases[i]
+        ys      = np.arange(h, dtype=np.float32)
+        offsets = ((ys - h / 2.0) * np.tan(np.radians(angle_deg))).astype(np.int32)
+        cols    = np.clip(x_bases[:, None].astype(np.int32) + offsets[None, :], 0, w - 1)
         density = bin_inv[np.arange(h)[None, :], cols].sum(axis=1).astype(np.float32)
-
-        # Smooth then find valley
-        k = max(5, span // 10) | 1
-        density_sm = np.convolve(density, np.ones(k, np.float32) / k, mode="same")
-        min_i = int(np.argmin(density_sm))
-        val   = float(density_sm[min_i])
-
-        # Validate: valley must be significantly deeper than its neighbours
-        nb_r = max(5, span // 5)
-        left  = density_sm[max(0, min_i - nb_r):min_i]
-        right = density_sm[min_i + 1:min(len(density_sm), min_i + nb_r)]
-        if not len(left) or not len(right):
-            continue
-        neighbor = float((np.median(left) + np.median(right)) / 2.0)
-        if neighbor <= 1e-6 or val > neighbor * 0.72:
-            continue
-
+        val     = float(density[result[0] - (cx - span)]) if 0 <= result[0] - (cx - span) < len(density) else float("inf")
         if val < best_val:
-            best_val   = val
-            best_x     = int(x_bases[min_i])
-            best_angle = float(angle_deg)
-            found      = True
+            best_val    = val
+            best_result = result
 
-    return (best_x, best_angle) if found else None
+    return best_result
 
+
+def _ct_project_valley(
+    bin_inv: np.ndarray,
+    angle_deg: float,
+    search_frac: float = 0.25,
+) -> tuple[int, float] | None:
+    """Project bin_inv along lines at angle_deg from vertical, find the
+    lowest-density line in the central band.  Shared by rotated_proj and
+    line_perp.  Returns (split_x_at_mid, angle_deg) or None."""
+    h, w = bin_inv.shape[:2]
+    cx   = w // 2
+    span = max(10, int(w * search_frac))
+    ys   = np.arange(h, dtype=np.float32)
+    y_mid = h / 2.0
+    angle_rad = np.radians(angle_deg)
+
+    x_bases = np.arange(cx - span, cx + span, dtype=np.float32)
+    offsets  = ((ys - y_mid) * np.tan(angle_rad)).astype(np.int32)
+    cols     = np.clip(
+        x_bases[:, None].astype(np.int32) + offsets[None, :],
+        0, w - 1,
+    )
+    density    = bin_inv[np.arange(h)[None, :], cols].sum(axis=1).astype(np.float32)
+    k          = max(5, span // 10) | 1
+    density_sm = np.convolve(density, np.ones(k, np.float32) / k, mode="same")
+    min_i      = int(np.argmin(density_sm))
+    val        = float(density_sm[min_i])
+
+    nb_r  = max(5, span // 5)
+    left  = density_sm[max(0, min_i - nb_r):min_i]
+    right = density_sm[min_i + 1:min(len(density_sm), min_i + nb_r)]
+    if not len(left) or not len(right):
+        return None
+    neighbor = float((np.median(left) + np.median(right)) / 2.0)
+    if neighbor <= 1e-6 or val > neighbor * 0.72:
+        return None
+    return int(x_bases[min_i]), float(angle_deg)
+
+
+def _ct_find_spine_line_perp(
+    bin_inv: np.ndarray,
+    strip_count: int,
+    peak_h: float,
+    peak_dist: int,
+    y_tol: int,
+    max_gap: int,
+    smooth_win: int,
+    search_frac: float = 0.25,
+) -> tuple[int, float] | None:
+    """Spine detection guided by the average text-line direction.
+
+    Runs a quick first-pass track detection on the full image to measure the
+    average slope (dy/dx) of the text lines.  The spine is perpendicular to
+    the text, so the spine angle from vertical equals arctan(avg_slope).
+    One projection is then made at exactly that angle to locate the valley.
+
+    Advantages over rotated_proj:
+    - Single projection instead of N — faster
+    - Angle derived from the actual page orientation — more accurate
+    - No manual angle range to configure
+    """
+    h, w = bin_inv.shape[:2]
+
+    # Quick pass — no split, relaxed min_track_len
+    tracks = _ct_detect_tracks(
+        bin_inv, strip_count,
+        peak_h=peak_h, peak_dist=peak_dist, y_tol=y_tol,
+        max_gap=max_gap, smooth_win=smooth_win,
+        min_track_len=2,
+    )
+    if len(tracks) < 2:
+        return None
+
+    # Median slope across all tracks (median is robust to cross-spine outliers)
+    slopes: list[float] = []
+    for track in tracks:
+        pts = np.array(track, dtype=np.float32)
+        xs, ys = pts[:, 0], pts[:, 1]
+        if xs.max() - xs.min() < 10:
+            continue
+        slopes.append(float(np.polyfit(xs, ys, 1)[0]))
+    if not slopes:
+        return None
+
+    avg_slope  = float(np.median(slopes))
+    # text direction dy/dx = avg_slope → spine angle from vertical = arctan(avg_slope)
+    spine_angle = float(np.degrees(np.arctan(avg_slope)))
+
+    return _ct_project_valley(bin_inv, spine_angle, search_frac)
 
 
 def _ct_fwhm(profile: np.ndarray, peak: int, max_hw: int) -> int:
