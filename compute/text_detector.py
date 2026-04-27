@@ -1608,6 +1608,22 @@ def _ct_find_page_split(bin_inv: np.ndarray, search_frac: float = 0.18) -> int |
 
 
 
+def _ct_peak_prominence(profile: np.ndarray, peak: int, min_dist: int) -> float:
+    """Local prominence of a peak: how much it rises above its nearest valleys.
+
+    Looks min_dist pixels to each side and takes the mean of those two valley
+    minima.  Returns peak_value - valley_mean, so a peak surrounded by deep
+    troughs (clear inter-line gaps) has high prominence, while a bump on a
+    flat or noisy region (hand, blank page, background object) has low
+    prominence.
+    """
+    lo = max(0, peak - min_dist)
+    hi = min(len(profile), peak + min_dist + 1)
+    left_val  = float(profile[lo:peak].min())  if peak > lo  else float(profile[peak])
+    right_val = float(profile[peak + 1:hi].min()) if peak + 1 < hi else float(profile[peak])
+    return float(profile[peak]) - (left_val + right_val) * 0.5
+
+
 def _ct_detect_tracks(
     bin_inv: np.ndarray,
     strip_count: int,
@@ -1624,6 +1640,10 @@ def _ct_detect_tracks(
     strip_w = max(1, w // strip_count)
     tracks: list[dict] = []
 
+    # A track may skip up to max_gap strips; during a gap its last known
+    # prominence is still used for consistency checks.
+    _PROM_RATIO_MAX = 6.0   # candidate prominence must be within 6× of track's
+
     for s in range(strip_count):
         x0 = s * strip_w
         x1 = w if s == strip_count - 1 else min(w, (s + 1) * strip_w)
@@ -1635,6 +1655,8 @@ def _ct_detect_tracks(
             kernel = np.ones(smooth_win, np.float32) / smooth_win
             profile = np.convolve(profile, kernel, mode="same")
         peaks = _ct_find_peaks(profile, min_rel_height=peak_h, min_dist=peak_dist)
+        # Compute prominence for each peak in this strip
+        proms = {p: _ct_peak_prominence(profile, p, peak_dist) for p in peaks}
         x_center = x_offset + (x0 + x1) // 2
 
         used_peaks: set[int] = set()
@@ -1646,11 +1668,23 @@ def _ct_detect_tracks(
                 if p in used_peaks:
                     continue
                 d = abs(p - tr["last_y"])
-                if d <= y_tol and (best_d is None or d < best_d):
+                if d > y_tol:
+                    continue
+                # Prominence consistency: reject if candidate is wildly
+                # different from the track's established prominence.
+                # This filters blank-page bumps, hands, background clutter.
+                ref_prom = tr["last_prom"]
+                if ref_prom > 0:
+                    ratio = proms[p] / ref_prom
+                    if ratio < 1.0 / _PROM_RATIO_MAX or ratio > _PROM_RATIO_MAX:
+                        continue
+                if best_d is None or d < best_d:
                     best_p, best_d = p, d
             if best_p is not None:
                 tr["pts"].append((x_center, best_p))
                 tr["last_y"] = best_p
+                # EMA so prominence can drift gradually (font size, lighting change)
+                tr["last_prom"] = 0.7 * tr["last_prom"] + 0.3 * proms[best_p]
                 tr["missed"] = 0
                 used_peaks.add(best_p)
             else:
@@ -1658,7 +1692,12 @@ def _ct_detect_tracks(
 
         for p in peaks:
             if p not in used_peaks:
-                tracks.append({"pts": [(x_center, p)], "last_y": p, "missed": 0})
+                tracks.append({
+                    "pts": [(x_center, p)],
+                    "last_y": p,
+                    "last_prom": proms[p],
+                    "missed": 0,
+                })
 
     final = [tr["pts"] for tr in tracks if len(tr["pts"]) >= min_track_len]
     final.sort(key=lambda pts: float(np.mean([p[1] for p in pts])))
