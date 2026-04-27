@@ -110,30 +110,29 @@ it is considered dead.
 At the end, tracks shorter than `min_track_len` strips are discarded — these
 are typically noise, not real text lines.
 
-### Prominence consistency check
+### Neighbour-support pre-filter (Pass 2)
 
-Each peak has a **prominence** = how much it rises above its local valleys on
-either side (within `peak_min_dist` pixels):
+Before track association, each peak is checked against its immediate
+neighbouring strips (s−1 and s+1).  A peak at y in strip s is kept only if
+at least one neighbour strip also has a peak within `y_tol` of that y.
 
 ```
-prominence = profile[peak] - mean(min_left, min_right)
+strip s-1:  peaks [80, 160, 240]
+strip s:    peaks [80, 160, 240, 310]   ← 310 is new
+strip s+1:  peaks [80, 160, 241]        ← no peak near 310
+
+→ 310 dropped from strip s before tracking
 ```
 
-A text line on a real page has high prominence — clear ink band with deep
-inter-line gaps on both sides. A peak from a hand, blank region, or background
-object has low or inconsistent prominence (no clean valleys around it).
+This removes peaks that appear in isolation — a hand entering the frame for
+one or two strips, a shadow spike, a noise blob. Works regardless of book
+tilt because the check is purely local (strip-to-strip y-drift is fine as
+long as the peak is consistently present in neighbours).
 
-When extending a track, the candidate peak's prominence must be within 6×
-of the track's established prominence (stored as an EMA so it can drift
-gradually for lighting changes). Peaks outside this range are rejected even
-if their y-position matches.
-
-This means:
-- A faint bump on a blank page can't latch onto a strong text-line track
-- A hand resting on the page generates peaks with different prominence than
-  the text lines it partially overlaps → doesn't corrupt those tracks
-- Tracks do update their reference prominence slowly via EMA so genuine
-  changes (approaching the spine, different page brightness) are tolerated
+For a hand or shadow that covers many consecutive strips, the edge strips are
+still trimmed (the boundary strip has no neighbour support), shortening the
+resulting track. `min_track_len` is then the final defence — raise it if
+contiguous noise objects still produce surviving tracks.
 
 Tracks are sorted by their mean y so output index 0 = topmost line.
 
