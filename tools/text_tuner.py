@@ -80,6 +80,10 @@ def _build_detector(params: dict) -> TextROIDetector:
         smooth_win=int(params.get("smooth_win", 7)),
         min_track_len=int(params.get("min_track_len", 4)),
         spine_method=params.get("spine_method", "column_sum"),
+        spine_search_frac=float(params.get("spine_search_frac", 0.35)),
+        spine_valley_thresh=float(params.get("spine_valley_thresh", 0.85)),
+        spine_angle_range=float(params.get("spine_angle_range", 20.0)),
+        spine_n_angles=int(params.get("spine_n_angles", 9)),
     )
 
 
@@ -383,6 +387,14 @@ HTML = """<!doctype html>
           <option value="none">none — no spine detection</option>
         </select>
       </div>
+      <div class=row><label>spine_search_frac <span class=val id=v_spine_search_frac></span><span class=tip title="±fraction of image width to search for the spine (centred on image mid). 0.35 = search within middle 70% of image. Increase if spine is off-centre.">ⓘ</span></label>
+        <input type=range id=spine_search_frac min=0.05 max=0.50 step=0.01 value=0.35></div>
+      <div class=row><label>spine_valley_thresh <span class=val id=v_spine_valley_thresh></span><span class=tip title="Valley/neighbour density ratio threshold. Valley must be below this fraction of its neighbours to count as a spine. 0.85 = valley must be at least 15% below neighbours. Lower = stricter (fewer false positives); higher = more permissive (detects weaker gutters).">ⓘ</span></label>
+        <input type=range id=spine_valley_thresh min=0.50 max=1.00 step=0.01 value=0.85></div>
+      <div class=row><label>spine_angle_range (°) <span class=val id=v_spine_angle_range></span><span class=tip title="rotated_proj only: ±degrees from vertical to search for the spine angle. Increase for heavily tilted books.">ⓘ</span></label>
+        <input type=range id=spine_angle_range min=0 max=45 step=1 value=20></div>
+      <div class=row><label>spine_n_angles <span class=val id=v_spine_n_angles></span><span class=tip title="rotated_proj only: number of angles to test within ±spine_angle_range. More angles = finer search, slower.">ⓘ</span></label>
+        <input type=range id=spine_n_angles min=3 max=25 step=2 value=9></div>
     </div>
 
     <button onclick="resetAll()">Reset</button>
@@ -421,7 +433,7 @@ const MG_IDS   = ["merge_y_overlap","merge_x_gap","x_gap_scale","min_line_len"];
 const DS_IDS   = ["docstrum_k","docstrum_angle_tol","docstrum_ht_ratio","docstrum_max_dist","docstrum_min_len","chain_merge_gap","chain_break_dist","chain_merge_dist"];
 const GS_IDS   = ["gap_threshold","gap_min_h"];
 const LP_IDS   = ["patch_grid"];
-const CT_IDS   = ["strip_count","peak_min_height","peak_min_dist","y_tol","track_max_gap","smooth_win","min_track_len"];
+const CT_IDS   = ["strip_count","peak_min_height","peak_min_dist","y_tol","track_max_gap","smooth_win","min_track_len","spine_search_frac","spine_valley_thresh","spine_angle_range","spine_n_angles"];
 const ALL_IDS  = [...MSER_IDS, ...MG_IDS, ...DS_IDS, ...GS_IDS, ...LP_IDS, ...CT_IDS];
 
 const DEFAULTS = {

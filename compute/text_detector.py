@@ -72,6 +72,11 @@ class TextROIDetector:
         track_max_gap: int = 2,         # max strips a track can be absent
         smooth_win: int = 7,            # projection profile smoothing window
         min_track_len: int = 4,         # min strip count to keep a track
+        # spine detection (split_pages)
+        spine_search_frac: float = 0.35,   # ±fraction of image width to search for spine
+        spine_valley_thresh: float = 0.85, # valley/neighbour ratio threshold (lower = stricter)
+        spine_angle_range: float = 20.0,   # ±degrees to search (rotated_proj)
+        spine_n_angles: int = 9,           # number of angles to test (rotated_proj)
     ):
         self.min_area = min_area
         self.max_area = max_area
@@ -115,6 +120,10 @@ class TextROIDetector:
         self.smooth_win = smooth_win
         self.min_track_len = min_track_len
         self.spine_method = spine_method
+        self.spine_search_frac = spine_search_frac
+        self.spine_valley_thresh = spine_valley_thresh
+        self.spine_angle_range = spine_angle_range
+        self.spine_n_angles = spine_n_angles
         self._last_debug: dict = {}
         self._mser = cv2.MSER_create()
         self._mser.setMinArea(min_area)
@@ -944,7 +953,13 @@ class TextROIDetector:
         split_angle = 0.0
         if self.split_pages and self.spine_method != "none":
             if self.spine_method == "rotated_proj":
-                result = _ct_find_spine_rotated(bin_inv)
+                result = _ct_find_spine_rotated(
+                    bin_inv,
+                    search_frac=self.spine_search_frac,
+                    angle_range=self.spine_angle_range,
+                    n_angles=self.spine_n_angles,
+                    valley_threshold=self.spine_valley_thresh,
+                )
                 if result is not None:
                     split_x, split_angle = result
             elif self.spine_method == "line_perp":
@@ -953,11 +968,20 @@ class TextROIDetector:
                     y_tol=self.y_tol, max_gap=self.track_max_gap,
                     smooth_win=self.smooth_win,
                 )
-                result = _ct_find_spine_line_perp(bin_inv, self.strip_count, **kw_spine)
+                result = _ct_find_spine_line_perp(
+                    bin_inv, self.strip_count,
+                    search_frac=self.spine_search_frac,
+                    valley_threshold=self.spine_valley_thresh,
+                    **kw_spine,
+                )
                 if result is not None:
                     split_x, split_angle = result
             else:  # "column_sum" (default)
-                sx = _ct_find_page_split(bin_inv)
+                sx = _ct_find_page_split(
+                    bin_inv,
+                    search_frac=self.spine_search_frac,
+                    valley_threshold=self.spine_valley_thresh,
+                )
                 if sx is not None:
                     split_x, split_angle = sx, 0.0
 
@@ -1611,7 +1635,11 @@ def _ct_find_peaks(
     return [idx for idx, _ in selected]
 
 
-def _ct_find_page_split(bin_inv: np.ndarray, search_frac: float = 0.18) -> int | None:
+def _ct_find_page_split(
+    bin_inv: np.ndarray,
+    search_frac: float = 0.18,
+    valley_threshold: float = 0.72,
+) -> int | None:
     """Spine detection via vertical column-sum valley (assumes vertical spine)."""
     h, w = bin_inv.shape[:2]
     vprof = bin_inv.sum(axis=0).astype(np.float32)
@@ -1631,7 +1659,7 @@ def _ct_find_page_split(bin_inv: np.ndarray, search_frac: float = 0.18) -> int |
     neighbor = float((np.median(left) + np.median(right)) / 2.0)
     if neighbor <= 1e-6:
         return None
-    return valley_idx if float(vsm[valley_idx]) <= neighbor * 0.72 else None
+    return valley_idx if float(vsm[valley_idx]) <= neighbor * valley_threshold else None
 
 
 def _ct_find_spine_rotated(
@@ -1639,6 +1667,7 @@ def _ct_find_spine_rotated(
     search_frac: float = 0.35,
     angle_range: float = 20.0,
     n_angles: int = 9,
+    valley_threshold: float = 0.85,
 ) -> tuple[int, float] | None:
     """Spine detection via rotated projection search.
 
@@ -1653,7 +1682,7 @@ def _ct_find_spine_rotated(
     best_result: tuple[int, float] | None = None
 
     for angle_deg in np.linspace(-angle_range, angle_range, n_angles):
-        result = _ct_project_valley(bin_inv, float(angle_deg), search_frac)
+        result = _ct_project_valley(bin_inv, float(angle_deg), search_frac, valley_threshold)
         if result is None:
             continue
         _x, _a, ratio = result
