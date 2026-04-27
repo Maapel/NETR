@@ -937,6 +937,8 @@ class TextROIDetector:
             block, int(self.adaptive_c),
         )
 
+        split_x = _ct_find_page_split(bin_inv) if self.split_pages else None
+
         sc = self.strip_count
         kw = dict(
             peak_h=self.peak_min_height,
@@ -946,38 +948,19 @@ class TextROIDetector:
             smooth_win=self.smooth_win,
             min_track_len=self.min_track_len,
         )
-
-        spine = None
-        if self.split_pages:
-            spine = _ct_find_spine(
-                bin_inv, sc,
-                peak_h=self.peak_min_height,
-                peak_dist=self.peak_min_dist,
-                y_tol=self.y_tol,
-                max_gap=self.track_max_gap,
-                smooth_win=self.smooth_win,
-            )
-
         tracks: list[list[tuple[int, int]]] = []
-        split_x = None
-        if spine is None:
-            tracks, _ = _ct_detect_tracks(bin_inv, sc, **kw)
+        if split_x is None:
+            tracks = _ct_detect_tracks(bin_inv, sc, **kw)
         else:
-            split_x, split_angle = spine
-            # Wider pad for rotated spine: the spine line drifts by
-            # H/2 * tan(angle) pixels from center to top/bottom edge.
-            angle_rad = abs(np.radians(split_angle))
-            pad = max(8, W // 120) + int(H / 2 * np.tan(angle_rad))
+            pad = max(8, W // 120)
             left  = bin_inv[:, :max(1, split_x - pad)]
             right = bin_inv[:, min(W - 1, split_x + pad):]
             r_off = min(W - 1, split_x + pad)
             sc2 = max(2, sc // 2)
             if left.size:
-                t, _ = _ct_detect_tracks(left, sc2, x_offset=0, **kw)
-                tracks += t
+                tracks += _ct_detect_tracks(left, sc2, x_offset=0, **kw)
             if right.size:
-                t, _ = _ct_detect_tracks(right, sc2, x_offset=r_off, **kw)
-                tracks += t
+                tracks += _ct_detect_tracks(right, sc2, x_offset=r_off, **kw)
 
         half_h = max(4, self.peak_min_dist // 2)
         out: list[Quad] = []
@@ -1002,7 +985,6 @@ class TextROIDetector:
             "tracks": tracks,
             "bin_inv": bin_inv,
             "split_x": split_x,
-            "split_angle": split_angle if spine else None,
         }
         return out, float("nan")
 
@@ -1039,13 +1021,8 @@ class TextROIDetector:
             for x, y in poly[::step]:
                 cv2.circle(out, (int(x), int(y)), 2, col, -1, cv2.LINE_AA)
         split_x = dbg.get("split_x")
-        split_angle = dbg.get("split_angle")
         if split_x is not None:
-            if split_angle:
-                dx = int(H / 2 * np.tan(np.radians(split_angle)))
-                cv2.line(out, (split_x - dx, 0), (split_x + dx, H - 1), (0, 180, 255), 2)
-            else:
-                cv2.line(out, (split_x, 0), (split_x, H - 1), (0, 180, 255), 2)
+            cv2.line(out, (split_x, 0), (split_x, H - 1), (0, 180, 255), 2)
         hud = f"[curve_track]  tracks={len(tracks)}"
         cv2.rectangle(out, (0, 0), (W, 22), (0, 0, 0), -1)
         cv2.putText(out, hud, (6, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
@@ -1607,65 +1584,27 @@ def _ct_find_peaks(
     return [idx for idx, _ in selected]
 
 
-def _ct_find_spine(
-    bin_inv: np.ndarray,
-    strip_count: int,
-    peak_h: float,
-    peak_dist: int,
-    y_tol: int,
-    max_gap: int,
-    smooth_win: int,
-    search_frac: float = 0.25,
-) -> tuple[int, float] | None:
-    """Detect the book spine as a line using track miss events.
-
-    Runs a lightweight first-pass track detection on the full image (no split,
-    relaxed min_track_len=2).  Where the spine/gutter blocks text, active
-    tracks fail to find a matching peak and generate miss events at
-    (x_center_of_strip, last_known_y).  These cluster along the spine line.
-
-    Fits a line through the miss cluster in the central search band to recover
-    both the spine x-position (at mid-height) and its angle — handling books
-    that are rotated or in perspective view.
-
-    Returns (split_x_at_mid, angle_deg) or None if no clear spine found.
-    """
+def _ct_find_page_split(bin_inv: np.ndarray, search_frac: float = 0.18) -> int | None:
+    """Return the x coordinate of the book spine gutter, or None if not detected."""
     h, w = bin_inv.shape[:2]
-    cx, span = w // 2, max(10, int(w * search_frac))
-
-    _, miss_events = _ct_detect_tracks(
-        bin_inv, strip_count,
-        peak_h=peak_h, peak_dist=peak_dist, y_tol=y_tol,
-        max_gap=max_gap, smooth_win=smooth_win,
-        min_track_len=2,   # relaxed — we only want miss topology
-    )
-
-    if not miss_events:
+    vprof = bin_inv.sum(axis=0).astype(np.float32)
+    if vprof.max() <= 0:
         return None
-
-    # Keep only misses in the central horizontal band
-    center = [(x, y) for x, y in miss_events if cx - span <= x <= cx + span]
-    if len(center) < 4:
+    k = max(9, (w // 50) | 1)
+    vsm = np.convolve(vprof, np.ones(k, np.float32) / k, mode="same")
+    mid, span = w // 2, max(10, int(w * search_frac))
+    lo, hi = max(1, mid - span), min(w - 2, mid + span)
+    if hi <= lo:
         return None
-
-    # Must span at least 25% of image height to be a real spine, not a gap
-    ys = [m[1] for m in center]
-    if (max(ys) - min(ys)) < h * 0.25:
+    valley_idx = int(np.argmin(vsm[lo:hi])) + lo
+    left  = vsm[max(0, valley_idx - span):valley_idx]
+    right = vsm[valley_idx + 1:min(w, valley_idx + span)]
+    if not len(left) or not len(right):
         return None
-
-    xs_arr = np.array([m[0] for m in center], dtype=np.float64)
-    ys_arr = np.array(ys, dtype=np.float64)
-
-    # Fit spine as x = a*y + b  (x as function of y handles near-vertical lines)
-    coeff = np.polyfit(ys_arr, xs_arr, 1)
-    split_x = int(round(np.polyval(coeff, h / 2)))
-    # coeff[0] = dx/dy → angle from vertical
-    angle_deg = float(np.degrees(np.arctan(coeff[0])))
-
-    if not (cx - span <= split_x <= cx + span):
+    neighbor = float((np.median(left) + np.median(right)) / 2.0)
+    if neighbor <= 1e-6:
         return None
-
-    return split_x, angle_deg
+    return valley_idx if float(vsm[valley_idx]) <= neighbor * 0.72 else None
 
 
 
@@ -1696,13 +1635,8 @@ def _ct_detect_tracks(
     smooth_win: int,
     min_track_len: int,
     x_offset: int = 0,
-) -> tuple[list[list[tuple[int, int]]], list[tuple[int, int]]]:
-    """Greedy strip-to-strip peak tracking.
-
-    Returns (tracks, miss_events) where miss_events is a list of (x, y)
-    points recording where each active track failed to find a peak.  These
-    cluster at the spine/gutter and are used by _ct_find_spine.
-    """
+) -> list[list[tuple[int, int]]]:
+    """Greedy strip-to-strip peak tracking. Returns tracks as (x, y) lists."""
     h, w = bin_inv.shape[:2]
     strip_w = max(1, w // strip_count)
 
@@ -1778,7 +1712,6 @@ def _ct_detect_tracks(
 
     # ── Pass 3: greedy track association on filtered peaks ────────────────────
     tracks: list[dict] = []
-    miss_events: list[tuple[int, int]] = []
     for s, peaks in enumerate(filtered_peaks):
         x_center = strip_x_centers[s]
         used_peaks: set[int] = set()
@@ -1799,7 +1732,6 @@ def _ct_detect_tracks(
                 used_peaks.add(best_p)
             else:
                 tr["missed"] += 1
-                miss_events.append((x_center, tr["last_y"]))
         for p in peaks:
             if p not in used_peaks:
                 tracks.append({"pts": [(x_center, p)], "last_y": p, "missed": 0})
@@ -1829,7 +1761,7 @@ def _ct_detect_tracks(
         if drop:
             final = [t for i, t in enumerate(final) if i not in drop]
 
-    return final, miss_events
+    return final
 
 
 def _dedupe_boxes(boxes: list[Box], iou_thresh: float = 0.7) -> list[Box]:
