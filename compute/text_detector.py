@@ -1608,6 +1608,23 @@ def _ct_find_page_split(bin_inv: np.ndarray, search_frac: float = 0.18) -> int |
 
 
 
+def _ct_fwhm(profile: np.ndarray, peak: int, max_hw: int) -> int:
+    """Full-width at half-maximum of a peak in a 1-D profile.
+
+    Walks outward from the peak until the profile drops below half the peak
+    value (or hits the max_hw boundary).  Returns the total width in rows —
+    this is the estimated text-line height in pixels for that strip.
+    """
+    half = profile[peak] * 0.5
+    lo = peak
+    while lo > max(0, peak - max_hw) and profile[lo - 1] >= half:
+        lo -= 1
+    hi = peak
+    while hi < min(len(profile) - 1, peak + max_hw) and profile[hi + 1] >= half:
+        hi += 1
+    return hi - lo
+
+
 def _ct_detect_tracks(
     bin_inv: np.ndarray,
     strip_count: int,
@@ -1623,7 +1640,8 @@ def _ct_detect_tracks(
     h, w = bin_inv.shape[:2]
     strip_w = max(1, w // strip_count)
 
-    # ── Pass 1: compute peaks for every strip ────────────────────────────────
+    # ── Pass 1: compute profiles and peaks for every strip ───────────────────
+    strip_profiles: list[np.ndarray] = []
     strip_peaks: list[list[int]] = []
     strip_x_centers: list[int] = []
     for s in range(strip_count):
@@ -1631,6 +1649,7 @@ def _ct_detect_tracks(
         x1 = w if s == strip_count - 1 else min(w, (s + 1) * strip_w)
         strip = bin_inv[:, x0:x1]
         if strip.size == 0:
+            strip_profiles.append(np.zeros(1, np.float32))
             strip_peaks.append([])
             strip_x_centers.append(x_offset + (x0 + x1) // 2)
             continue
@@ -1638,24 +1657,57 @@ def _ct_detect_tracks(
         if smooth_win > 1:
             kernel = np.ones(smooth_win, np.float32) / smooth_win
             profile = np.convolve(profile, kernel, mode="same")
+        strip_profiles.append(profile)
         strip_peaks.append(_ct_find_peaks(profile, min_rel_height=peak_h, min_dist=peak_dist))
         strip_x_centers.append(x_offset + (x0 + x1) // 2)
 
-    # ── Pass 2: neighbour-support filter ─────────────────────────────────────
-    # Keep a peak only if at least one immediate neighbour strip (s-1 or s+1)
-    # also has a peak within y_tol.  Peaks that appear in isolation (sudden
-    # spike in line count — hand, shadow, background object) are dropped here
-    # before track association starts.
+    # ── Pass 2: FWHM outlier filter ───────────────────────────────────────────
+    # For every peak compute its FWHM (line-height in pixels).  The median
+    # FWHM across all peaks is the global reference for "what a real text line
+    # looks like".  Peaks whose FWHM exceeds the median by more than 2.5×
+    # are wide diffuse bumps (hand shadow, background object) and are dropped.
+    #
+    # Using the global median (not just the immediate neighbour) means this
+    # works even when the hand covers the full frame width — neighbouring
+    # strips both have wide bumps, but they're still outliers relative to
+    # the majority of peaks on the actual text.
+    #
+    # After FWHM filtering, also require y-neighbour support (at least one
+    # adjacent strip must have a surviving peak within y_tol) to catch any
+    # remaining single-strip noise spikes.
+    max_hw = peak_dist  # FWHM walk bounded to ±peak_dist px each side
+
+    # Collect all FWHMs across all strips
+    peak_fwhms: list[list[int]] = []
+    all_fwhms: list[int] = []
+    for s, (peaks, prof) in enumerate(zip(strip_peaks, strip_profiles)):
+        fw = [_ct_fwhm(prof, p, max_hw) for p in peaks]
+        peak_fwhms.append(fw)
+        all_fwhms.extend(fw)
+
+    if all_fwhms:
+        median_fwhm = float(np.median(all_fwhms))
+        fwhm_limit  = max(median_fwhm * 2.5, 4.0)  # never reject very short profiles
+    else:
+        fwhm_limit = float("inf")
+
+    # First pass: drop FWHM outliers
+    fwhm_filtered: list[list[int]] = [
+        [p for p, fw in zip(peaks, fws) if fw <= fwhm_limit]
+        for peaks, fws in zip(strip_peaks, peak_fwhms)
+    ]
+
+    # Second pass: require at least one y-neighbour among FWHM-clean peaks
     def _has_neighbour(s: int, y: int) -> bool:
         for nb in (s - 1, s + 1):
-            if 0 <= nb < len(strip_peaks):
-                if any(abs(y - p) <= y_tol for p in strip_peaks[nb]):
+            if 0 <= nb < len(fwhm_filtered):
+                if any(abs(y - p) <= y_tol for p in fwhm_filtered[nb]):
                     return True
         return False
 
     filtered_peaks = [
         [y for y in peaks if _has_neighbour(s, y)]
-        for s, peaks in enumerate(strip_peaks)
+        for s, peaks in enumerate(fwhm_filtered)
     ]
 
     # ── Pass 3: greedy track association on filtered peaks ────────────────────
@@ -1686,6 +1738,29 @@ def _ct_detect_tracks(
 
     final = [tr["pts"] for tr in tracks if len(tr["pts"]) >= min_track_len]
     final.sort(key=lambda pts: float(np.mean([p[1] for p in pts])))
+
+    # ── Post-process: drop shadow-edge pairs ──────────────────────────────────
+    # A shadow/hand boundary creates two closely-spaced tracks (top and bottom
+    # edge of the shadow band).  Real text lines have roughly uniform spacing;
+    # a pair closer than 55% of the median inter-track gap is very likely an
+    # edge artefact, not two separate lines.  Of the pair, drop whichever has
+    # fewer strip points (less supported); if equal, drop the lower one.
+    if len(final) >= 3:
+        ys = [float(np.mean([p[1] for p in t])) for t in final]
+        gaps = [ys[i + 1] - ys[i] for i in range(len(ys) - 1)]
+        med_gap = float(np.median(gaps))
+        threshold = med_gap * 0.55
+        drop: set[int] = set()
+        for i, g in enumerate(gaps):
+            if g < threshold and i not in drop and (i + 1) not in drop:
+                # Keep whichever track has more strip support
+                if len(final[i]) >= len(final[i + 1]):
+                    drop.add(i + 1)
+                else:
+                    drop.add(i)
+        if drop:
+            final = [t for i, t in enumerate(final) if i not in drop]
+
     return final
 
 
