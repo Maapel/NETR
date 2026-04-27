@@ -1746,6 +1746,7 @@ def _ct_find_spine_line_perp(
     max_gap: int,
     smooth_win: int,
     search_frac: float = 0.35,
+    valley_threshold: float = 0.85,
 ) -> tuple[int, float] | None:
     """Spine detection guided by the average text-line direction.
 
@@ -1786,7 +1787,7 @@ def _ct_find_spine_line_perp(
     # text direction dy/dx = avg_slope → spine angle from vertical = arctan(avg_slope)
     spine_angle = float(np.degrees(np.arctan(avg_slope)))
 
-    result = _ct_project_valley(bin_inv, spine_angle, search_frac)
+    result = _ct_project_valley(bin_inv, spine_angle, search_frac, valley_threshold)
     if result is None:
         return None
     x, a, _ratio = result
