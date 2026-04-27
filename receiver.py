@@ -55,6 +55,7 @@ _tl_params: dict = {
     "smooth_win":      7,
     "min_track_len":   4,
     "split_pages":     False,
+    "book_mask":       False,
 }
 
 def _get_text_detector():
@@ -77,6 +78,7 @@ def _get_text_detector():
             smooth_win=int(p["smooth_win"]),
             min_track_len=int(p["min_track_len"]),
             split_pages=bool(p["split_pages"]),
+            book_mask=bool(p["book_mask"]),
         )
     except Exception as _e:
         print(f"text_detector unavailable: {_e}")
@@ -1063,7 +1065,7 @@ class MJPEGHandler(BaseHTTPRequestHandler):
                      "y_tol", "track_max_gap", "smooth_win", "min_track_len"}
         _tl_float = {"clahe_clip", "adaptive_c", "peak_min_height"}
         _tl_dirty = False
-        for k in list(_tl_int | _tl_float | {"split_pages"}):
+        for k in list(_tl_int | _tl_float | {"split_pages", "book_mask"}):
             key = "tl_" + k
             if key in params:
                 if k in _tl_int:
@@ -1526,6 +1528,13 @@ class MJPEGHandler(BaseHTTPRequestHandler):
       <div class="ctrl-group">
         <span>Split pages</span>
         <select id="tl_split_pages" onchange="tlSet('split_pages',this.value)">
+          <option value="0" selected>Off</option>
+          <option value="1">On</option>
+        </select>
+      </div>
+      <div class="ctrl-group">
+        <span>Book mask (Canny quad)</span>
+        <select id="tl_book_mask" onchange="tlSet('book_mask',this.value)">
           <option value="0" selected>Off</option>
           <option value="1">On</option>
         </select>

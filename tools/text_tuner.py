@@ -79,6 +79,7 @@ def _build_detector(params: dict) -> TextROIDetector:
         track_max_gap=int(params.get("track_max_gap", 2)),
         smooth_win=int(params.get("smooth_win", 7)),
         min_track_len=int(params.get("min_track_len", 4)),
+        book_mask=params.get("book_mask", "0") == "1",
     )
 
 
@@ -373,6 +374,7 @@ HTML = """<!doctype html>
         <input type=range id=smooth_win min=1 max=31 step=1 value=7></div>
       <div class=row><label>min_track_len <span class=val id=v_min_track_len></span><span class=tip title="Minimum number of strips a track must span to be kept as a detected line. Raise to suppress short spurious tracks (noise, margin annotations).">ⓘ</span></label>
         <input type=range id=min_track_len min=1 max=30 step=1 value=4></div>
+      <div class=toggle><input type=checkbox id=book_mask><label for=book_mask>book_mask — discard lines outside detected page quad (Canny)</label></div>
     </div>
 
     <button onclick="resetAll()">Reset</button>
@@ -446,6 +448,7 @@ function qs() {
   if (document.getElementById("split_pages").checked) p.set("split_pages","1");
   if (document.getElementById("adaptive_thresh").checked) p.set("adaptive_thresh","1");
   if (document.getElementById("binarize").checked) p.set("binarize","1");
+  if (document.getElementById("book_mask").checked) p.set("book_mask","1");
   p.set("line_method", currentMethod());
   const m = currentMethod();
   if (m === "mser_global") p.set("skew_method", document.getElementById("skew_method").value);
@@ -488,6 +491,7 @@ document.getElementById("split").addEventListener("change", refresh);
 document.getElementById("split_pages").addEventListener("change", refresh);
 document.getElementById("adaptive_thresh").addEventListener("change", refresh);
 document.getElementById("binarize").addEventListener("change", refresh);
+document.getElementById("book_mask").addEventListener("change", refresh);
 document.getElementById("skew_method").addEventListener("change", refresh);
 document.getElementById("skew_method_lp").addEventListener("change", refresh);
 document.getElementById("line_method").addEventListener("change", () => { updateMethodUI(); refresh(); });
