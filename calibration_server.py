@@ -1651,18 +1651,17 @@ button.trace-on   { background: #1a1a33; color: #88ccff; border-color: #6699cc; 
 <div id="hud">
   <button id="btnSweep" class="mode" disabled style="display:none">SWEEP</button>
   <button id="btnSaccade" class="mode">SACCADE</button>
-  <button id="btnStart">START</button>
-  <button id="btnStop" disabled>STOP</button>
-  <button id="btnLive" disabled>LIVE OFF</button>
+  <button id="btnStart"  title="Start calibration [Enter]">START</button>
+  <button id="btnStop"   title="Stop calibration [Esc]" disabled>STOP</button>
+  <button id="btnLive"   title="Toggle live gaze cursor [L]" disabled>LIVE OFF</button>
   <button id="btnRecord" style="display:none" title="Manual session (optional)">⏺ Record</button>
   <span id="status">Connecting…</span>
 </div>
 <div id="bottom-bar">
-  <button onclick="window.open('/viz','_blank')">📊 Viz</button>
-  <button id="btnTrace" type="button">Trace OFF</button>
-  <button id="btnGlintSweepStart" title="Manual glint sweep (legacy)">🔦 Sweep</button>
-  <button id="btnGlintSweepStop" disabled>⏹</button>
+  <button onclick="window.open('/viz','_blank')" title="Open visualiser [V]">📊 Viz</button>
+  <button id="btnTrace" type="button" title="Toggle pipeline trace [T]">Trace OFF</button>
   <span id="glintSweepStatus"></span>
+  <span style="font-size:11px;color:#555;margin-left:8px">[H] hide panels</span>
 </div>
 <div id="debug-panel">
   <h4>DEBUG <button id="close-debug">✕</button></h4>
@@ -1765,49 +1764,8 @@ function handleRecordAck(m) {
 }
 
 
-// ── Glint sweep calibration ──────────────────────────────────────────────────
 const ENGINE_URL = 'http://localhost:8081';
-const btnGlintSweepStart = document.getElementById('btnGlintSweepStart');
-const btnGlintSweepStop  = document.getElementById('btnGlintSweepStop');
-const glintSweepStatus   = document.getElementById('glintSweepStatus');
-let _sweepPoll = null;
-
-function _updateSweepStatus() {
-  fetch(ENGINE_URL + '/glint_sweep/status').then(r => r.json()).then(d => {
-    if (d.active) {
-      glintSweepStatus.textContent = `Collecting… ${d.n_samples} samples`;
-    } else {
-      glintSweepStatus.textContent = d.switch_dx !== 0
-        ? `switch_dx = ${d.switch_dx.toFixed(2)}`
-        : '';
-    }
-  }).catch(() => { glintSweepStatus.textContent = 'engine offline'; });
-}
-
-btnGlintSweepStart.onclick = () => {
-  fetch(ENGINE_URL + '/glint_sweep/start', {method:'POST'}).then(r => r.json()).then(d => {
-    if (d.ok) {
-      btnGlintSweepStart.disabled = true;
-      btnGlintSweepStop.disabled  = false;
-      glintSweepStatus.textContent = 'Collecting… look left → right slowly';
-      _sweepPoll = setInterval(_updateSweepStatus, 500);
-    }
-  }).catch(() => { glintSweepStatus.textContent = 'engine offline'; });
-};
-
-btnGlintSweepStop.onclick = () => {
-  fetch(ENGINE_URL + '/glint_sweep/stop', {method:'POST'}).then(r => r.json()).then(d => {
-    clearInterval(_sweepPoll);
-    btnGlintSweepStart.disabled = false;
-    btnGlintSweepStop.disabled  = true;
-    if (d.ok) {
-      glintSweepStatus.textContent =
-        `✓ switch_dx=${d.switch_dx} (n=${d.n_samples}, dx range [${d.dx_range}])`;
-    } else {
-      glintSweepStatus.textContent = `✗ ${d.reason}`;
-    }
-  }).catch(() => { glintSweepStatus.textContent = 'engine offline'; });
-};
+const glintSweepStatus = document.getElementById('glintSweepStatus');
 
 let W, H;
 function resize() {
@@ -2417,6 +2375,60 @@ btnStop.onclick = () => {
   statusEl.textContent = 'Processing…';
   ws.send(JSON.stringify({type:'stop'}));
 };
+
+// ── Keyboard shortcuts ────────────────────────────────────────────────────────
+// Enter → START   Esc → STOP   L → LIVE   V → Viz   T → Trace   H → hide panels
+let panelsHidden = false;
+function togglePanels() {
+  panelsHidden = !panelsHidden;
+  const debugPanel  = document.getElementById('debug-panel');
+  const camContainer = document.getElementById('cam-container');
+  const bottomBar   = document.getElementById('bottom-bar');
+  const reopenDebug = document.getElementById('reopen-debug');
+  const hud         = document.getElementById('hud');
+  if (panelsHidden) {
+    debugPanel.style.display   = 'none';
+    camContainer.style.display = 'none';
+    bottomBar.style.display    = 'none';
+    reopenDebug.style.display  = 'none';
+    hud.style.opacity          = '0.15';
+  } else {
+    camContainer.style.display = 'flex';
+    bottomBar.style.display    = 'flex';
+    hud.style.opacity          = '1';
+    // debug panel restores only if it wasn't manually closed
+    if (!reopenDebug.style.display || reopenDebug.style.display === 'none') {
+      debugPanel.style.display = '';
+    } else {
+      reopenDebug.style.display = 'block';
+    }
+  }
+}
+
+document.addEventListener('keydown', e => {
+  // Ignore when typing in an input/textarea
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+  switch (e.key) {
+    case 'Enter':
+      if (!btnStart.disabled) btnStart.click();
+      break;
+    case 'Escape':
+      if (!btnStop.disabled) btnStop.click();
+      break;
+    case 'l': case 'L':
+      if (!btnLive.disabled) btnLive.click();
+      break;
+    case 'v': case 'V':
+      window.open('/viz', '_blank');
+      break;
+    case 't': case 'T':
+      btnTrace.click();
+      break;
+    case 'h': case 'H':
+      togglePanels();
+      break;
+  }
+});
 
 // ── Debug panel ───────────────────────────────────────────────────────────────
 function cls(id, c) {
