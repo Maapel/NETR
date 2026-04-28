@@ -2668,17 +2668,11 @@ class Handler(BaseHTTPRequestHandler):
                 if not vec:
                     body = json.dumps({"ok": False, "reason": "no pccr vector"}).encode()
                 elif _screen_model.trained:
-                    if _screen_model.n_terms == 7:
-                        sx, sy = _screen_model.predict(vec[0], vec[1], sd)
-                    else:
-                        sx, sy = _screen_model.predict(vec[0], vec[1])
+                    sx, sy = _screen_model.predict(vec[0], vec[1], sd)
                     body = json.dumps({"ok": True, "x": sx, "y": sy,
                                        "dx": vec[0], "dy": vec[1], "side": sd}).encode()
                 else:
-                    if _model.n_terms == 7:
-                        scene_x, scene_y = _model.predict(vec[0], vec[1], sd)
-                    else:
-                        scene_x, scene_y = _model.predict(vec[0], vec[1])
+                    scene_x, scene_y = _model.predict(vec[0], vec[1], sd)
                     with _homography_lock:
                         H = _homography
                     if H is None:

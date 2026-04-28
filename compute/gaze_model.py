@@ -1,16 +1,26 @@
 """
-Gaze mapping model — Phase 4.
+Gaze mapping model — Phase 5.
 
-2nd-order polynomial in (dx, dy), optionally augmented with glint side:
+2nd-order polynomial in (dx, dy) with LED-side identity interactions:
 
-  6-term:  X = a0 + a1*dx + a2*dy + a3*dx*dy + a4*dx² + a5*dy²
-  7-term:  same + a6*side   where side ∈ {-1, +1} (glint vs pupil center on x-axis)
+  6-term:   1, dx, dy, dx·dy, dx², dy²
+  10-term:  same + side, side·dx, side·dy, side·dx·dy
 
-When len(samples) >= 7, fit uses lstsq (robust if side is constant).
+  side ∈ {-1, +1} — which LED produced the glint (sign of glint_x - pupil_x).
+
+The interaction terms let the model learn a different dx/dy sensitivity per LED,
+which corrects for each LED being at a different physical position on the rig.
+Works correctly even when only one LED is visible at a time — side is always
+known for whichever glint is detected.
+
+Term selection:
+  ≥ 10 samples, side varies across samples  →  10-term (full side-interaction model)
+  ≥  6 samples  (side constant or too few)  →   6-term (no side)
 
 Usage:
-    model.fit(samples)   # {"dx","dy","X","Y"} or + "side"
-    model.predict(dx, dy, side=1.0)
+    model = GazeModel()
+    model.fit(samples)              # list of {"dx","dy","X","Y"} + optional "side"
+    model.predict(dx, dy, side)     # side ∈ {-1,+1} or any float → snapped to ±1
 """
 
 import json
@@ -32,39 +42,37 @@ class GazeModel:
         return self._n_terms if self.trained and self.A is not None else 6
 
     @staticmethod
-    def _design(dx, dy, side, n_terms: int):
+    def _design(dx, dy, side, n_terms: int) -> np.ndarray:
         dx = np.asarray(dx, dtype=float)
         dy = np.asarray(dy, dtype=float)
         sd = np.asarray(side, dtype=float)
         ones = np.ones_like(dx)
         base = [ones, dx, dy, dx * dy, dx**2, dy**2]
-        if n_terms == 7:
-            base.append(sd)
+        if n_terms == 10:
+            base += [sd, sd * dx, sd * dy, sd * dx * dy]
         return np.column_stack(base)
 
     def fit(self, samples: list[dict]) -> dict:
         if len(samples) < 6:
             raise ValueError(f"Need at least 6 samples, got {len(samples)}")
 
-        dx = np.array([s["dx"] for s in samples], dtype=float)
-        dy = np.array([s["dy"] for s in samples], dtype=float)
-        Ux = np.array([s["X"] for s in samples])
-        Uy = np.array([s["Y"] for s in samples])
-        raw_side = [float(s["side"]) if "side" in s else 1.0 for s in samples]
-        side = np.array([1.0 if v >= 0.0 else -1.0 for v in raw_side], dtype=float)
+        dx   = np.array([s["dx"] for s in samples], dtype=float)
+        dy   = np.array([s["dy"] for s in samples], dtype=float)
+        Ux   = np.array([s["X"]  for s in samples], dtype=float)
+        Uy   = np.array([s["Y"]  for s in samples], dtype=float)
+        raw  = [float(s.get("side", 1.0)) for s in samples]
+        side = np.array([1.0 if v >= 0.0 else -1.0 for v in raw], dtype=float)
 
-        if len(samples) >= 7:
-            n_terms = 7
-            M = self._design(dx, dy, side, n_terms)
-            self.A, _, _, _ = np.linalg.lstsq(M, Ux, rcond=None)
-            self.B, _, _, _ = np.linalg.lstsq(M, Uy, rcond=None)
+        # Use 10-term when enough samples AND both LEDs represented
+        side_varies = bool(np.any(side > 0) and np.any(side < 0))
+        if len(samples) >= 10 and side_varies:
+            n_terms = 10
         else:
             n_terms = 6
-            M = self._design(dx, dy, side, n_terms)
-            MtM = M.T @ M
-            self.A = np.linalg.solve(MtM, M.T @ Ux)
-            self.B = np.linalg.solve(MtM, M.T @ Uy)
 
+        M = self._design(dx, dy, side, n_terms)
+        self.A, _, _, _ = np.linalg.lstsq(M, Ux, rcond=None)
+        self.B, _, _, _ = np.linalg.lstsq(M, Uy, rcond=None)
         self._n_terms = n_terms
         self.trained = True
 
@@ -75,23 +83,24 @@ class GazeModel:
         return {
             "r2_x": float(r2_x), "r2_y": float(r2_y),
             "n_samples": len(samples), "n_terms": n_terms,
+            "side_varies": side_varies,
         }
 
     def predict(self, dx: float, dy: float, side: float = 1.0) -> tuple[float, float]:
         if not self.trained or self.A is None:
             raise RuntimeError("Model not trained")
-        n = len(self.A)
-        sd = (1.0 if float(side) >= 0.0 else -1.0) if n == 7 else 0.0
+        n  = self.n_terms
+        sd = (1.0 if float(side) >= 0.0 else -1.0) if n == 10 else 0.0
         row = self._design([dx], [dy], [sd], n)[0]
         return float(row @ self.A), float(row @ self.B)
 
     def save(self, path: str | pathlib.Path):
         if not self.trained:
             raise RuntimeError("Nothing to save — model not trained")
-        data = {
+        data: dict = {
             "A": self.A.tolist(),
             "B": self.B.tolist(),
-            "n_terms": int(len(self.A)),
+            "n_terms": int(self._n_terms),
             "aug_feature": "side",
         }
         if self.scene_width is not None:

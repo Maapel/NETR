@@ -114,10 +114,7 @@ def _process(jpeg: bytes) -> bytes:
     gaze = None
     if result.pccr_vector and _gaze_model.trained:
         try:
-            if _gaze_model.n_terms == 7:
-                gaze = _gaze_model.predict(*result.pccr_vector, result.pccr_side)
-            else:
-                gaze = _gaze_model.predict(*result.pccr_vector)
+            gaze = _gaze_model.predict(*result.pccr_vector, result.pccr_side)
         except Exception:
             pass
 
