@@ -79,11 +79,12 @@ def _build_iris_mask(
     iris_radius_factor: float,
     limbus_radius: float | None,
 ) -> tuple[np.ndarray, float]:
-    """Build annular iris mask and return (mask, used_limbus_radius).
+    """Build cornea mask and return (mask, used_limbus_radius).
 
-    Outer boundary: detected limbus circle (or disk fallback).
-    Inner boundary: pupil ellipse or circle, eroded slightly so glints right
-    on the pupil edge are still kept.
+    Filled disk up to the limbus boundary — includes pupil area because IR
+    glints appear on the cornea surface (in front of the eye) and commonly
+    land over the dark pupil as well as the iris.  Only the sclera (outside
+    limbus) is excluded.
     """
     h, w = gray.shape
     cx, cy = int(round(pupil_center[0])), int(round(pupil_center[1]))
@@ -93,15 +94,6 @@ def _build_iris_mask(
 
     mask = np.zeros((h, w), dtype=np.uint8)
     cv2.circle(mask, (cx, cy), int(outer_r), 255, -1)
-
-    # Subtract pupil — shrink slightly so glints on cornea edge aren't clipped
-    inner_r = max(1, int(pr * 0.85))
-    if pupil_ellipse is not None:
-        (ecx, ecy), (ew, eh), eang = pupil_ellipse
-        shrunk = (ecx, ecy), (ew * 0.85, eh * 0.85), eang
-        cv2.ellipse(mask, shrunk, 0, -1)
-    else:
-        cv2.circle(mask, (cx, cy), inner_r, 0, -1)
 
     return mask, outer_r
 
