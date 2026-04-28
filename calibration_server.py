@@ -163,6 +163,10 @@ _last_homography_debug_save_ts: float = 0.0   # throttle: save at most 1/sec
 _saccade_samples: list[dict] = []
 _saccade_lock = threading.Lock()
 
+# Sweep phase: per-point {dx, side} for switch_dx computation
+_sweep_calib_samples: list[dict] = []
+_sweep_calib_lock = threading.Lock()
+
 # Push-based capture: frames received from receiver during the active capture window
 _pending_eye: list[dict] = []   # [{ts, dx, dy, side?}] for the current target
 _pending_target: dict | None = None  # {x, y} of the target being captured
@@ -559,6 +563,13 @@ def _flush_pending_target(eyes: list | None = None, target: dict | None = None):
             _rec_fixation_f.flush()
         except Exception: pass
 
+    # Sweep phase: collect (dx, side) for switch_dx computation
+    if target.get("is_sweep"):
+        with _sweep_calib_lock:
+            _sweep_calib_samples.append({"dx": avg_dx, "side": avg_side})
+            n_sw = len(_sweep_calib_samples)
+        print(f"[sweep] point {n_sw}: dx={avg_dx:.2f} side={avg_side:+.0f}", flush=True)
+
     # Add to calibration dataset.
     # When both LED sides are observed in this fixation, emit one sample per
     # side — doubles training data and preserves per-LED geometry.
@@ -619,6 +630,39 @@ def _refit_models():
         return diag
     except Exception:
         return None
+
+def _compute_sweep_switch_dx(samples: list[dict]) -> float | None:
+    """Find dx transition point (side flip) from ordered left→right sweep.
+
+    Returns midpoint dx between the two neighboring points where side changes,
+    or 0.0 if no flip found (default sign-based labeling).
+    """
+    if len(samples) < 2:
+        return None
+    for i in range(len(samples) - 1):
+        s1, s2 = samples[i], samples[i + 1]
+        if s1["side"] != s2["side"]:
+            sw = (s1["dx"] + s2["dx"]) / 2.0
+            print(f"[sweep] side flip between pt{i}(dx={s1['dx']:.2f},side={s1['side']:+.0f}) "
+                  f"and pt{i+1}(dx={s2['dx']:.2f},side={s2['side']:+.0f}) → switch_dx={sw:.3f}")
+            return sw
+    print(f"[sweep] no side flip found in {len(samples)} sweep points — keeping switch_dx=0.0")
+    return 0.0
+
+
+def _push_switch_dx_to_engine(switch_dx: float):
+    try:
+        req = urllib.request.Request(
+            ENGINE_URL + "/set_switch_dx",
+            data=json.dumps({"switch_dx": switch_dx}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=2).close()
+        print(f"[sweep] switch_dx={switch_dx:.3f} pushed to engine", flush=True)
+    except Exception as e:
+        print(f"[sweep] push switch_dx failed: {e}", flush=True)
+
 
 # ── ArUco helpers ─────────────────────────────────────────────────────────────
 ARUCO_DICTS = {
@@ -1301,6 +1345,8 @@ def _handle_ws(rfile, wfile):
                     _eye_buf.clear()
                 with _saccade_lock:
                     _saccade_samples.clear()
+                with _sweep_calib_lock:
+                    _sweep_calib_samples.clear()
                 with _pending_lock:
                     _pending_eye.clear()
                     _pending_target = None
@@ -1372,7 +1418,8 @@ def _handle_ws(rfile, wfile):
                         prev_eyes = _pending_eye
                         prev_target = _pending_target
                         _pending_eye = []
-                        _pending_target = {"x": x, "y": y}
+                        _pending_target = {"x": x, "y": y,
+                                           "is_sweep": bool(msg.get("is_sweep", False))}
                     srv_now = time.time() * 1000
                     _calib_trace(
                         "WS fixation ts=%.1f server_now=%.1f delta_ms=%.1f xy=(%.1f,%.1f) "
@@ -1455,6 +1502,24 @@ def _handle_ws(rfile, wfile):
                 _ws_send_frame(wfile, json.dumps(result))
                 if _recording:
                     _rec_stop()
+
+            elif mtype == "sweep_end":
+                # Flush the last pending sweep fixation, then compute switch_dx
+                _flush_pending_target()
+                _wait_async_flushes()
+                with _sweep_calib_lock:
+                    sw_samples = list(_sweep_calib_samples)
+                    _sweep_calib_samples.clear()
+                switch_dx = _compute_sweep_switch_dx(sw_samples)
+                if switch_dx is None:
+                    switch_dx = 0.0
+                _push_switch_dx_to_engine(switch_dx)
+                _calib_trace("WS sweep_end: n=%d switch_dx=%.3f", len(sw_samples), switch_dx)
+                _ws_send_frame(wfile, json.dumps({
+                    "type": "sweep_calibrated",
+                    "switch_dx": round(switch_dx, 3),
+                    "n_samples": len(sw_samples),
+                }))
 
             elif mtype == "status":
                 with _homography_lock:
@@ -1788,6 +1853,15 @@ ws.onmessage = e => {
     statusEl.textContent = `Homography: ${m.homography?'✓':'✗'}  Model: ${m.model_trained?'✓':'✗'}`;
     if (m.model_trained && m.homography) btnLive.disabled = false;
   }
+  if (m.type === 'sweep_calibrated') {
+    const note = m.n_samples > 0
+      ? `switch_dx=${m.switch_dx.toFixed(1)} (${m.n_samples} pts)`
+      : 'sweep: no data — check eye pipeline';
+    statusEl.textContent = `Sweep done — ${note} — starting calibration…`;
+    // Kick off main saccade phase
+    initSaccade();
+    return;
+  }
   if (m.type === 'ready') {
     btnLive.disabled = false;  // model just refitted, enable live
     statusEl.textContent = `${m.n} pts — R²x=${m.r2_x}  R²y=${m.r2_y}`;
@@ -2041,6 +2115,105 @@ function randomInZone(zoneIdx) {
   }));
 }
 
+// ── Pre-calibration glint sweep phase ────────────────────────────────────────
+// 5 horizontal fixation points at 50% height, spread 10%…80% of width.
+// User fixates each in sequence; server derives switch_dx for glint labeling.
+// Sweep data also feeds the gaze model as normal training samples.
+const SWEEP_XS = [0.10, 0.275, 0.45, 0.625, 0.80];
+let sweepPhase         = false;   // true while sweep is running
+let sweepIdx           = 0;       // next SWEEP_XS index to show
+let sweepPos           = {x: 0, y: 0};
+let sweepStart         = 0;
+let sweepSampled       = false;
+let sweepFixationSent  = null;    // performance.now() when WS sent
+
+function initSweep() {
+  sweepPhase    = true;
+  sweepIdx      = 0;
+  arucoGateOk   = false;
+  lastArucoPoll = 0;
+  nextSweepPoint();
+}
+
+function nextSweepPoint() {
+  if (sweepIdx >= SWEEP_XS.length) {
+    // All points collected — signal server to compute switch_dx
+    sweepPhase = false;
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({type: 'sweep_end'}));
+    }
+    // Render loop pauses here; resumes when 'sweep_calibrated' arrives
+    return;
+  }
+  sweepPos           = {x: SWEEP_XS[sweepIdx] * W, y: H * 0.5};
+  sweepStart         = performance.now();
+  sweepSampled       = false;
+  sweepFixationSent  = null;
+  sweepIdx++;
+}
+
+function tickSweep(now) {
+  pollArucoGate(now);
+  const dwell   = now - sweepStart;
+  const settled = dwell >= SETTLE_MS;
+
+  if (settled && !sweepSampled && arucoGateOk) {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({
+        type:       'fixation',
+        ts:         performance.timeOrigin + now,
+        x:          sweepPos.x,
+        y:          sweepPos.y,
+        fixate_ms:  FIXATE_MS,
+        is_sweep:   true,
+      }));
+    }
+    sweepFixationSent = now;
+    sweepSampled      = true;
+    statusEl.textContent = `Sweep: ${sweepIdx}/${SWEEP_XS.length} — look at the blue dot`;
+  } else if (settled && !sweepSampled) {
+    statusEl.textContent =
+      `Sweep: ${sweepIdx}/${SWEEP_XS.length} — waiting for ArUco markers`;
+  }
+
+  if (sweepSampled && sweepFixationSent !== null && (now - sweepFixationSent) >= FIXATE_MS) {
+    nextSweepPoint();
+  }
+
+  // Draw sweep target (blue, distinct from main saccade yellow/green)
+  const progress = Math.min(dwell / SETTLE_MS, 1);
+  const ringR    = TARGET_R + 18 * (1 - progress);
+  const color    = settled ? '#66aaff' : '#ffcc00';
+
+  ctx.beginPath();
+  ctx.arc(sweepPos.x, sweepPos.y, ringR, 0, Math.PI * 2);
+  ctx.strokeStyle = color;
+  ctx.lineWidth   = 2;
+  ctx.stroke();
+
+  ctx.beginPath();
+  ctx.arc(sweepPos.x, sweepPos.y, TARGET_R, 0, Math.PI * 2);
+  ctx.fillStyle = color;
+  ctx.fill();
+
+  // Horizontal progress dots
+  const barY = H * 0.5 + TARGET_R + 22;
+  ctx.strokeStyle = '#444';
+  ctx.lineWidth   = 2;
+  ctx.beginPath();
+  ctx.moveTo(W * 0.08, barY);
+  ctx.lineTo(W * 0.92, barY);
+  ctx.stroke();
+  for (let i = 0; i < SWEEP_XS.length; i++) {
+    const done = i < sweepIdx - (sweepSampled ? 0 : 1);
+    ctx.fillStyle = done ? '#66aaff' : '#444';
+    ctx.beginPath();
+    ctx.arc(SWEEP_XS[i] * W, barY, 5, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+// ── Saccade state ─────────────────────────────────────────────────────────────
 let zoneSeq      = [];
 let zoneSeqIdx   = 0;
 let saccadePos   = { x: 0, y: 0 };
@@ -2204,7 +2377,11 @@ function render(now) {
   if (!running) return;
 
   if (mode === 'saccade') {
-    tickSaccade(now);
+    if (sweepPhase) {
+      tickSweep(now);
+    } else {
+      tickSaccade(now);
+    }
   } else {
     const elapsed = now - startTime;
     const pos = readingPos(elapsed);
@@ -2226,7 +2403,8 @@ btnStart.onclick = () => {
   ws.send(JSON.stringify({type:'screen_size', w:W, h:H}));
   startTime    = performance.now();
   saccadeCount = 0;
-  if (mode === 'saccade') initSaccade();
+  sweepPhase   = false;
+  if (mode === 'saccade') initSweep();
   running = true;
   btnStart.disabled  = true;
   btnStop.disabled   = false;
@@ -2234,7 +2412,8 @@ btnStart.onclick = () => {
   btnSaccade.disabled= true;
 };
 btnStop.onclick = () => {
-  running = false;
+  running     = false;
+  sweepPhase  = false;
   btnStop.disabled    = true;
   btnStart.disabled   = false;
   btnSweep.disabled   = false;

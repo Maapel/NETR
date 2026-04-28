@@ -396,6 +396,22 @@ class Handler(BaseHTTPRequestHandler):
             _sweep_active  = True
         self._send(200, json.dumps({"ok": True, "msg": "sweep started — look left→right slowly"}).encode())
 
+    # ── POST /set_switch_dx ───────────────────────────────────────────────────
+    def _handle_set_switch_dx(self):
+        length = int(self.headers.get("Content-Length", 0))
+        body   = self.rfile.read(length) if length > 0 else b""
+        try:
+            data = json.loads(body)
+            sw   = float(data["switch_dx"])
+        except (KeyError, ValueError, json.JSONDecodeError) as e:
+            self._send(400, json.dumps({"error": str(e)}).encode())
+            return
+        with _pipe_lock:
+            _pipe.switch_dx = sw
+        _save_settings()
+        print(f"[engine] switch_dx set to {sw:.3f}", flush=True)
+        self._send(200, json.dumps({"ok": True, "switch_dx": round(sw, 3)}).encode())
+
     # ── POST /glint_sweep/stop ────────────────────────────────────────────────
     def _handle_sweep_stop(self):
         """Stop collection, fit switch_dx from observations, save to settings."""
@@ -453,6 +469,8 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_sweep_start()
         elif self.path == "/glint_sweep/stop":
             self._handle_sweep_stop()
+        elif self.path == "/set_switch_dx":
+            self._handle_set_switch_dx()
         else:
             self._send(404, b'{"error":"not found"}')
 
