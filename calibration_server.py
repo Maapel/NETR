@@ -559,15 +559,40 @@ def _flush_pending_target(eyes: list | None = None, target: dict | None = None):
             _rec_fixation_f.flush()
         except Exception: pass
 
-    # Add to calibration dataset — scene_xy is the temporally-matched average
+    # Add to calibration dataset.
+    # When both LED sides are observed in this fixation, emit one sample per
+    # side — doubles training data and preserves per-LED geometry.
+    new_samples: list[dict] = []
+    sides_present = set(int(s[2]) for s in synced[mask] if len(synced) > 0 and mask.sum() > 0) if mask.sum() >= 2 else {int(avg_side)}
+
+    if len(sides_present) == 2:
+        # Both sides represented — emit one averaged sample per side
+        all_arr = _np.array(synced, dtype=object)
+        for side_val in (1.0, -1.0):
+            side_mask = _np.array([s[2] == side_val for s in synced])
+            if side_mask.sum() < 2:
+                continue
+            s_dx  = float(_np.array([s[0] for s in synced])[side_mask].mean())
+            s_dy  = float(_np.array([s[1] for s in synced])[side_mask].mean())
+            s_X   = float(_np.array([s[3] for s in synced])[side_mask].mean())
+            s_Y   = float(_np.array([s[4] for s in synced])[side_mask].mean())
+            new_samples.append({"dx": s_dx, "dy": s_dy, "side": side_val,
+                                "X": s_X, "Y": s_Y, "sx": sx, "sy": sy})
+            _calib_trace(
+                "flush_pending APPEND per-side sample side=%+.0f n=%d dx=%.3f dy=%.3f",
+                side_val, int(side_mask.sum()), s_dx, s_dy,
+            )
+    else:
+        new_samples.append({"dx": avg_dx, "dy": avg_dy, "side": avg_side,
+                            "X": avg_X, "Y": avg_Y, "sx": sx, "sy": sy})
+        _calib_trace(
+            "flush_pending APPEND sample clean=%d avg dx=%.3f dy=%.3f scene X=%.1f Y=%.1f",
+            n_clean, avg_dx, avg_dy, avg_X, avg_Y,
+        )
+
     with _saccade_lock:
-        _saccade_samples.append({"dx": avg_dx, "dy": avg_dy, "side": avg_side,
-                                 "X": avg_X, "Y": avg_Y, "sx": sx, "sy": sy})
+        _saccade_samples.extend(new_samples)
         n = len(_saccade_samples)
-    _calib_trace(
-        "flush_pending APPEND sample #%d clean=%d avg dx=%.3f dy=%.3f scene X=%.1f Y=%.1f",
-        n, n_clean, avg_dx, avg_dy, avg_X, avg_Y,
-    )
     diag = _refit_models()
     if diag:
         _broadcast(json.dumps({
@@ -1553,8 +1578,11 @@ button.trace-on   { background: #1a1a33; color: #88ccff; border-color: #6699cc; 
   <button id="btnLive" disabled>LIVE OFF</button>
   <button onclick="window.open('/viz','_blank')">📊 Viz</button>
   <button id="btnRecord" style="display:none" title="Manual session (optional)">⏺ Record</button>
+  <button id="btnGlintSweepStart" title="Glint switch calibration: look left→right slowly">🔦 Glint Sweep</button>
+  <button id="btnGlintSweepStop" disabled>⏹ Stop Sweep</button>
   <button id="btnPause">⏸ Pause Streams</button>
   <button id="btnTrace" type="button">Trace OFF</button>
+  <span id="glintSweepStatus" style="font-size:12px;color:#aef;"></span>
   <span id="status">Connecting…</span>
 </div>
 <div id="debug-panel">
@@ -1675,6 +1703,50 @@ function setStreamsPaused(val) {
 setStreamsPaused(true);
 window.addEventListener('beforeunload', () => setStreamsPaused(false));
 btnPause.onclick = () => setStreamsPaused(!streamsPaused);
+
+// ── Glint sweep calibration ──────────────────────────────────────────────────
+const ENGINE_URL = 'http://localhost:8081';
+const btnGlintSweepStart = document.getElementById('btnGlintSweepStart');
+const btnGlintSweepStop  = document.getElementById('btnGlintSweepStop');
+const glintSweepStatus   = document.getElementById('glintSweepStatus');
+let _sweepPoll = null;
+
+function _updateSweepStatus() {
+  fetch(ENGINE_URL + '/glint_sweep/status').then(r => r.json()).then(d => {
+    if (d.active) {
+      glintSweepStatus.textContent = `Collecting… ${d.n_samples} samples`;
+    } else {
+      glintSweepStatus.textContent = d.switch_dx !== 0
+        ? `switch_dx = ${d.switch_dx.toFixed(2)}`
+        : '';
+    }
+  }).catch(() => { glintSweepStatus.textContent = 'engine offline'; });
+}
+
+btnGlintSweepStart.onclick = () => {
+  fetch(ENGINE_URL + '/glint_sweep/start', {method:'POST'}).then(r => r.json()).then(d => {
+    if (d.ok) {
+      btnGlintSweepStart.disabled = true;
+      btnGlintSweepStop.disabled  = false;
+      glintSweepStatus.textContent = 'Collecting… look left → right slowly';
+      _sweepPoll = setInterval(_updateSweepStatus, 500);
+    }
+  }).catch(() => { glintSweepStatus.textContent = 'engine offline'; });
+};
+
+btnGlintSweepStop.onclick = () => {
+  fetch(ENGINE_URL + '/glint_sweep/stop', {method:'POST'}).then(r => r.json()).then(d => {
+    clearInterval(_sweepPoll);
+    btnGlintSweepStart.disabled = false;
+    btnGlintSweepStop.disabled  = true;
+    if (d.ok) {
+      glintSweepStatus.textContent =
+        `✓ switch_dx=${d.switch_dx} (n=${d.n_samples}, dx range [${d.dx_range}])`;
+    } else {
+      glintSweepStatus.textContent = `✗ ${d.reason}`;
+    }
+  }).catch(() => { glintSweepStatus.textContent = 'engine offline'; });
+};
 
 let W, H;
 function resize() {

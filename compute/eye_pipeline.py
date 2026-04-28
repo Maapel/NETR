@@ -22,15 +22,21 @@ class EyeResult:
     glint_pos: tuple[int, int] | None = None
     pccr_vector: tuple[float, float] | None = None
     pccr_side: float = 0.0
+    # labeled_glints: list of (gx, gy, side) for all detected glints this frame
+    # side ∈ {-1, +1} — derived from switch_dx calibration or sign(gx - pupil_cx)
+    labeled_glints: list[tuple[float, float, float]] = field(default_factory=list)
     intermediate_frames: dict = field(default_factory=dict)
 
 
 class EyePipeline:
     """Full eye analysis: pupil detection → glint detection → PCCR vector."""
 
-    def __init__(self, pupil_kwargs=None, glint_kwargs=None):
+    def __init__(self, pupil_kwargs=None, glint_kwargs=None, switch_dx: float = 0.0):
         self._pupil_det = PupilDetector(**(pupil_kwargs or {}))
         self._glint_det = GlintDetector(**(glint_kwargs or {}))
+        # dx threshold for glint labeling: side=+1 if dx>switch_dx else -1
+        # dx = pupil_cx - glint_x (PCCR convention); 0.0 = use sign of (glint_x - pupil_x)
+        self.switch_dx: float = float(switch_dx)
 
     def update_params(self, params: dict):
         """Update detector parameters at runtime. Keys prefixed with 'p_' go to
@@ -65,6 +71,17 @@ class EyePipeline:
             d["g_" + attr] = getattr(self._glint_det, attr)
         return d
 
+    def _label_side(self, dx: float) -> float:
+        """Label a glint as LED_left(-1) or LED_right(+1) using switch_dx.
+
+        dx = pupil_cx - glint_x  (positive when glint is left of pupil).
+        switch_dx is the crossing point found during glint sweep calibration.
+        Above switch_dx → glint is to the left → LED_right is visible → side=+1.
+        Below switch_dx → glint is to the right → LED_left is visible → side=-1.
+        With switch_dx=0 this reduces to sign(glint_x - pupil_x).
+        """
+        return 1.0 if dx > self.switch_dx else -1.0
+
     def process(self, gray: np.ndarray) -> EyeResult:
         """Run full pipeline on a grayscale eye frame."""
         pr = self._pupil_det.detect(gray)
@@ -78,12 +95,22 @@ class EyePipeline:
         pccr = None
         pccr_side = 0.0
         glint_pos = None
-        if pr.center and gr.primary is not None:
+        labeled: list[tuple[float, float, float]] = []
+
+        if pr.center and gr.glints:
+            pcx, pcy = float(pr.center[0]), float(pr.center[1])
+            for gx, gy in gr.glints:
+                dx = pcx - gx
+                dy = pcy - gy
+                side = self._label_side(dx)
+                labeled.append((gx, gy, side))
+
+            # Primary = first glint (already sorted closest-to-pupil in detector)
             gx, gy = gr.primary
-            dx = pr.center[0] - gx
-            dy = pr.center[1] - gy
+            dx = pcx - gx
+            dy = pcy - gy
             pccr = (float(dx), float(dy))
-            pccr_side = 1.0 if gx >= float(pr.center[0]) else -1.0
+            pccr_side = self._label_side(dx)
             glint_pos = (int(round(gx)), int(round(gy)))
 
         intermediate = {**pr.intermediate_frames, **gr.intermediate_frames}
@@ -96,6 +123,7 @@ class EyePipeline:
             glint_pos=glint_pos,
             pccr_vector=pccr,
             pccr_side=pccr_side,
+            labeled_glints=labeled,
             intermediate_frames=intermediate,
         )
 

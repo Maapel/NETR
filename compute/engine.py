@@ -66,8 +66,7 @@ except Exception:
 _pipe = EyePipeline()
 _pipe_lock = threading.Lock()
 
-# Load persisted settings on startup
-def _load_settings():
+def _load_settings() -> dict:
     try:
         with open(EYE_SETTINGS_PATH) as f:
             return json.load(f)
@@ -75,11 +74,20 @@ def _load_settings():
         return {}
 
 def _save_settings():
+    data = _pipe.get_params()
+    data["glint_switch_dx"] = _pipe.switch_dx
     with open(EYE_SETTINGS_PATH, "w") as f:
-        json.dump(_pipe.get_params(), f, indent=2)
+        json.dump(data, f, indent=2)
 
+_boot_settings = _load_settings()
 with _pipe_lock:
-    _pipe.update_params(_load_settings())
+    _pipe.update_params(_boot_settings)
+    _pipe.switch_dx = float(_boot_settings.get("glint_switch_dx", 0.0))
+
+# ── Glint sweep state ─────────────────────────────────────────────────────────
+_sweep_lock    = threading.Lock()
+_sweep_samples: list[dict] = []   # {"dx": float, "glint_offset": float}
+_sweep_active  = False
 
 # ── Gaze model ────────────────────────────────────────────────────────────────
 _gaze_model = GazeModel()
@@ -129,6 +137,17 @@ def _process(jpeg: bytes) -> bytes:
 
     _, enc = cv2.imencode(".jpg", out, [cv2.IMWRITE_JPEG_QUALITY, 85])
     annotated = enc.tobytes()
+
+    # Collect sweep samples while active
+    with _sweep_lock:
+        collecting = _sweep_active
+    if collecting and result.pccr_vector is not None:
+        dx = result.pccr_vector[0]
+        # glint_offset = glint_x - pupil_x (positive = glint right of pupil)
+        if result.glint_pos and result.pupil_center:
+            glint_offset = float(result.glint_pos[0]) - float(result.pupil_center[0])
+            with _sweep_lock:
+                _sweep_samples.append({"dx": dx, "glint_offset": glint_offset})
 
     with _latest_lock:
         _latest_result = result
@@ -358,6 +377,68 @@ class Handler(BaseHTTPRequestHandler):
         ok = _gaze_model.load(target)
         self._send(200, json.dumps({"ok": ok, "path": str(target)}).encode())
 
+    # ── GET /glint_sweep/status ───────────────────────────────────────────────
+    def _handle_sweep_status(self):
+        with _sweep_lock:
+            active  = _sweep_active
+            n       = len(_sweep_samples)
+        self._send(200, json.dumps({
+            "active": active,
+            "n_samples": n,
+            "switch_dx": _pipe.switch_dx,
+        }).encode())
+
+    # ── POST /glint_sweep/start ───────────────────────────────────────────────
+    def _handle_sweep_start(self):
+        global _sweep_active, _sweep_samples
+        with _sweep_lock:
+            _sweep_samples = []
+            _sweep_active  = True
+        self._send(200, json.dumps({"ok": True, "msg": "sweep started — look left→right slowly"}).encode())
+
+    # ── POST /glint_sweep/stop ────────────────────────────────────────────────
+    def _handle_sweep_stop(self):
+        """Stop collection, fit switch_dx from observations, save to settings."""
+        global _sweep_active
+        with _sweep_lock:
+            _sweep_active = False
+            samples = list(_sweep_samples)
+
+        if len(samples) < 10:
+            self._send(200, json.dumps({
+                "ok": False, "reason": f"too few samples ({len(samples)}, need ≥10)",
+            }).encode())
+            return
+
+        import numpy as _np
+        dx_arr     = _np.array([s["dx"]           for s in samples], dtype=float)
+        offset_arr = _np.array([s["glint_offset"] for s in samples], dtype=float)
+
+        # Fit linear: glint_offset = m * dx + b  → switch at dx = -b/m
+        coeffs = _np.polyfit(dx_arr, offset_arr, 1)
+        m, b   = float(coeffs[0]), float(coeffs[1])
+
+        if abs(m) < 1e-6:
+            self._send(200, json.dumps({
+                "ok": False, "reason": "no slope detected — glint_offset constant across dx range",
+            }).encode())
+            return
+
+        switch_dx = float(-b / m)
+
+        with _pipe_lock:
+            _pipe.switch_dx = switch_dx
+        _save_settings()
+
+        self._send(200, json.dumps({
+            "ok": True,
+            "switch_dx":  round(switch_dx, 3),
+            "slope":      round(m, 4),
+            "intercept":  round(b, 4),
+            "n_samples":  len(samples),
+            "dx_range":   [round(float(dx_arr.min()), 2), round(float(dx_arr.max()), 2)],
+        }).encode())
+
     # ── Router ────────────────────────────────────────────────────────────────
     def do_POST(self):
         if self.path == "/process":
@@ -368,6 +449,10 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(length) if length > 0 else b""
             self._handle_gaze_model_load(body)
+        elif self.path == "/glint_sweep/start":
+            self._handle_sweep_start()
+        elif self.path == "/glint_sweep/stop":
+            self._handle_sweep_stop()
         else:
             self._send(404, b'{"error":"not found"}')
 
@@ -390,6 +475,8 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_frame()
         elif path == "/gaze_model":
             self._handle_gaze_model()
+        elif path == "/glint_sweep/status":
+            self._handle_sweep_status()
         else:
             self._send(404, b'{"error":"not found"}')
 
