@@ -1649,8 +1649,6 @@ button.trace-on   { background: #1a1a33; color: #88ccff; border-color: #6699cc; 
 </head>
 <body>
 <div id="hud">
-  <button id="btnSweep" class="mode" disabled style="display:none">SWEEP</button>
-  <button id="btnSaccade" class="mode">SACCADE</button>
   <button id="btnStart"  title="Start calibration [Enter]">START</button>
   <button id="btnStop"   title="Stop calibration [Esc]" disabled>STOP</button>
   <button id="btnLive"   title="Toggle live gaze cursor [L]" disabled>LIVE OFF</button>
@@ -1704,8 +1702,8 @@ button.trace-on   { background: #1a1a33; color: #88ccff; border-color: #6699cc; 
 <div id="cam-container">
   <div id="cam-drag-handle">📷 Cam ↕↔</div>
   <div id="cam-switch">
-    <button id="btnWorld" class="active">🌍 World (ArUco)</button>
-    <button id="btnEye">👁 Eye (PCCR)</button>
+    <button id="btnWorld" class="active" title="World cam [C]">🌍 World</button>
+    <button id="btnEye" title="Eye cam [C]">👁 Eye</button>
   </div>
   <img id="scene-view" alt="cam feed">
 </div>
@@ -1721,8 +1719,6 @@ const statusEl  = document.getElementById('status');
 const btnStart  = document.getElementById('btnStart');
 const btnStop   = document.getElementById('btnStop');
 const btnLive   = document.getElementById('btnLive');
-const btnSweep  = document.getElementById('btnSweep');
-const btnSaccade= document.getElementById('btnSaccade');
 const btnRecord = document.getElementById('btnRecord');
 const btnTrace  = document.getElementById('btnTrace');
 
@@ -1776,12 +1772,7 @@ resize();
 window.addEventListener('resize', resize);
 initPanelPositions();
 
-let mode = 'saccade';  // sweep deprecated
-btnSaccade.classList.add('active');
-btnSaccade.onclick = () => {
-  if (running) return;
-  mode = 'saccade';
-};
+const mode = 'saccade';
 
 // ── WebSocket ────────────────────────────────────────────────────────────────
 const ws = new WebSocket(`ws://${location.host}/ws`);
@@ -2362,16 +2353,14 @@ btnStart.onclick = () => {
   running = true;
   btnStart.disabled  = true;
   btnStop.disabled   = false;
-  btnSweep.disabled  = true;
-  btnSaccade.disabled= true;
+
 };
 btnStop.onclick = () => {
   running     = false;
   sweepPhase  = false;
   btnStop.disabled    = true;
   btnStart.disabled   = false;
-  btnSweep.disabled   = false;
-  btnSaccade.disabled = false;
+
   statusEl.textContent = 'Processing…';
   ws.send(JSON.stringify({type:'stop'}));
 };
@@ -2426,6 +2415,9 @@ document.addEventListener('keydown', e => {
       break;
     case 'h': case 'H':
       togglePanels();
+      break;
+    case 'c': case 'C':
+      startCamStream(camView === 'world' ? 'eye' : 'world');
       break;
   }
 });
