@@ -58,9 +58,10 @@ class EyePipeline:
                       "hough_param2", "gradient_downscale",
                       "seed_flood_tolerance"):
             d["p_" + attr] = getattr(self._pupil_det, attr)
-        for attr in ("brightness_thresh", "min_area", "max_area",
-                      "search_radius_factor", "circularity_min",
-                      "iris_radius_factor", "ellipse_slack"):
+        for attr in ("glint_margin", "brightness_thresh", "min_area", "max_area",
+                      "circularity_min", "iris_radius_factor",
+                      "limbus_n_rays", "limbus_max_factor", "limbus_min_gradient",
+                      "search_radius_factor", "ellipse_slack"):
             d["g_" + attr] = getattr(self._glint_det, attr)
         return d
 
@@ -115,6 +116,9 @@ class EyePipeline:
             cv2.circle(out, (cx, cy), 3, (0, 255, 0), -1)
             cv2.line(out, (cx - r, cy), (cx + r, cy), (0, 255, 0), 1)
             cv2.line(out, (cx, cy - r), (cx, cy + r), (0, 255, 0), 1)
+            # Limbus boundary (green dashed-look: thin circle)
+            if gr.limbus_radius is not None:
+                cv2.circle(out, (cx, cy), int(gr.limbus_radius), (0, 180, 0), 1)
 
         for i, (gx, gy) in enumerate(gr.glints):
             color = (0, 255, 255) if i == 0 else (200, 200, 0)

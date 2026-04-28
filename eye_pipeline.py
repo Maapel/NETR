@@ -58,9 +58,10 @@ class EyePipeline:
                       "hough_param2", "gradient_downscale",
                       "seed_flood_tolerance"):
             d["p_" + attr] = getattr(self._pupil_det, attr)
-        for attr in ("brightness_thresh", "min_area", "max_area",
-                      "search_radius_factor", "circularity_min",
-                      "iris_radius_factor", "ellipse_slack"):
+        for attr in ("glint_margin", "brightness_thresh", "min_area", "max_area",
+                      "circularity_min", "iris_radius_factor",
+                      "limbus_n_rays", "limbus_max_factor", "limbus_min_gradient",
+                      "search_radius_factor", "ellipse_slack"):
             d["g_" + attr] = getattr(self._glint_det, attr)
         return d
 
@@ -106,8 +107,8 @@ class EyePipeline:
         gr = result.glint
 
         if pr.center:
-            cx, cy = pr.center
-            r = pr.radius or 20
+            cx, cy = int(pr.center[0]), int(pr.center[1])
+            r = int(pr.radius or 20)
             if pr.ellipse:
                 cv2.ellipse(out, pr.ellipse, (0, 200, 255), 2)
             else:
@@ -115,6 +116,9 @@ class EyePipeline:
             cv2.circle(out, (cx, cy), 3, (0, 255, 0), -1)
             cv2.line(out, (cx - r, cy), (cx + r, cy), (0, 255, 0), 1)
             cv2.line(out, (cx, cy - r), (cx, cy + r), (0, 255, 0), 1)
+            # Limbus boundary (green dashed-look: thin circle)
+            if gr.limbus_radius is not None:
+                cv2.circle(out, (cx, cy), int(gr.limbus_radius), (0, 180, 0), 1)
 
         for i, (gx, gy) in enumerate(gr.glints):
             color = (0, 255, 255) if i == 0 else (200, 200, 0)
@@ -123,14 +127,15 @@ class EyePipeline:
             cv2.circle(out, (igx, igy), 2, color, -1)
 
         if result.pccr_vector and result.glint_pos and result.pupil_center:
-            cv2.arrowedLine(out, result.glint_pos, result.pupil_center,
-                            (255, 0, 255), 2, tipLength=0.15)
+            gp = (int(result.glint_pos[0]), int(result.glint_pos[1]))
+            pp = (int(result.pupil_center[0]), int(result.pupil_center[1]))
+            cv2.arrowedLine(out, gp, pp, (255, 0, 255), 2, tipLength=0.15)
 
         if pr.center:
-            cv2.putText(out, f"Pupil ({pr.center[0]},{pr.center[1]}) r={pr.radius}",
+            cv2.putText(out, f"Pupil ({pr.center[0]:.1f},{pr.center[1]:.1f}) r={pr.radius:.1f}",
                         (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
         if gr.primary:
-            cv2.putText(out, f"Glint ({gr.primary[0]:.0f},{gr.primary[1]:.0f})",
+            cv2.putText(out, f"Glint ({gr.primary[0]:.1f},{gr.primary[1]:.1f})",
                         (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
         if result.pccr_vector:
             dx, dy = result.pccr_vector
