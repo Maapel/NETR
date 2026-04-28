@@ -1550,6 +1550,18 @@ canvas { display: block; }
   position: fixed; top: 12px; left: 50%; transform: translateX(-50%);
   display: flex; gap: 12px; align-items: center; z-index: 10;
 }
+#bottom-bar {
+  position: fixed; bottom: 12px; left: 50%; transform: translateX(-50%);
+  display: flex; gap: 8px; align-items: center; z-index: 10;
+  background: rgba(0,0,0,0.55); border-radius: 6px;
+  padding: 5px 12px; border: 1px solid #333;
+}
+#bottom-bar button {
+  padding: 5px 12px; font-size: 12px;
+}
+#bottom-bar span {
+  font-size: 11px; color: #aef;
+}
 button {
   padding: 8px 20px; font-size: 14px; cursor: pointer;
   border: 1px solid #555; border-radius: 4px; background: #111; color: #eee;
@@ -1641,14 +1653,16 @@ button.trace-on   { background: #1a1a33; color: #88ccff; border-color: #6699cc; 
   <button id="btnStart">START</button>
   <button id="btnStop" disabled>STOP</button>
   <button id="btnLive" disabled>LIVE OFF</button>
-  <button onclick="window.open('/viz','_blank')">📊 Viz</button>
   <button id="btnRecord" style="display:none" title="Manual session (optional)">⏺ Record</button>
-  <button id="btnGlintSweepStart" title="Glint switch calibration: look left→right slowly">🔦 Glint Sweep</button>
-  <button id="btnGlintSweepStop" disabled>⏹ Stop Sweep</button>
-  <button id="btnPause">⏸ Pause Streams</button>
-  <button id="btnTrace" type="button">Trace OFF</button>
-  <span id="glintSweepStatus" style="font-size:12px;color:#aef;"></span>
   <span id="status">Connecting…</span>
+</div>
+<div id="bottom-bar">
+  <button onclick="window.open('/viz','_blank')">📊 Viz</button>
+  <button id="btnTrace" type="button">Trace OFF</button>
+  <button id="btnPause">⏸ Pause</button>
+  <button id="btnGlintSweepStart" title="Manual glint sweep (legacy)">🔦 Sweep</button>
+  <button id="btnGlintSweepStop" disabled>⏹</button>
+  <span id="glintSweepStatus"></span>
 </div>
 <div id="debug-panel">
   <h4>DEBUG <button id="close-debug">✕</button></h4>
