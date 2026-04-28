@@ -25,5 +25,6 @@
   "g_limbus_max_factor": 4.0,
   "g_limbus_min_gradient": 4.0,
   "g_search_radius_factor": 2.5,
-  "g_ellipse_slack": 0.12
+  "g_ellipse_slack": 0.12,
+  "glint_switch_dx": 0.0
 }
