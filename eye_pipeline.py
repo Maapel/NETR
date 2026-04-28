@@ -31,12 +31,16 @@ class EyeResult:
 class EyePipeline:
     """Full eye analysis: pupil detection → glint detection → PCCR vector."""
 
-    def __init__(self, pupil_kwargs=None, glint_kwargs=None, switch_dx: float = 0.0):
+    def __init__(self, pupil_kwargs=None, glint_kwargs=None, switch_dx: float = 0.0,
+                 preferred_side: float = 1.0):
         self._pupil_det = PupilDetector(**(pupil_kwargs or {}))
         self._glint_det = GlintDetector(**(glint_kwargs or {}))
         # dx threshold for glint labeling: side=+1 if dx>switch_dx else -1
         # dx = pupil_cx - glint_x (PCCR convention); 0.0 = use sign of (glint_x - pupil_x)
         self.switch_dx: float = float(switch_dx)
+        # When both LED glints are visible, always use this side as primary.
+        # Convention: +1 (right LED). Makes prediction deterministic near crossover.
+        self.preferred_side: float = 1.0 if float(preferred_side) >= 0 else -1.0
 
     def update_params(self, params: dict):
         """Update detector parameters at runtime. Keys prefixed with 'p_' go to
@@ -101,12 +105,19 @@ class EyePipeline:
             pcx, pcy = float(pr.center[0]), float(pr.center[1])
             for gx, gy in gr.glints:
                 dx = pcx - gx
-                dy = pcy - gy
                 side = self._label_side(dx)
                 labeled.append((gx, gy, side))
 
-            # Primary = first glint (already sorted closest-to-pupil in detector)
-            gx, gy = gr.primary
+            # Primary glint selection:
+            # When both LED sides are visible, always pick the preferred_side glint
+            # (not just the closest) so the gaze model gets a consistent side.
+            sides_seen = {s for _, _, s in labeled}
+            if len(sides_seen) == 2:
+                preferred = [(gx, gy) for gx, gy, s in labeled if s == self.preferred_side]
+                gx, gy = preferred[0] if preferred else (gr.primary[0], gr.primary[1])
+            else:
+                gx, gy = gr.primary
+
             dx = pcx - gx
             dy = pcy - gy
             pccr = (float(dx), float(dy))

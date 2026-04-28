@@ -32,7 +32,7 @@ from socketserver import ThreadingMixIn
 import cv2
 import numpy as np
 
-from gaze_model import GazeModel
+from gaze_model import GazeModel, DualGazeModel
 
 # ── Rig config ────────────────────────────────────────────────────────────────
 import sys as _sys
@@ -222,14 +222,13 @@ def _wait_async_flushes(timeout_s: float = 120.0):
             _flush_inflight_cv.wait(timeout=remaining)
         _calib_trace("wait_async_flushes: done inflight=%d", _flush_inflight)
 
-_model = GazeModel()                          # scene-space model (saved to disk)
-_screen_model = GazeModel()                   # screen-space model (for live cursor)
+_model = DualGazeModel()                      # scene-space model (saved to disk)
+_screen_model = DualGazeModel()               # screen-space model (for live cursor)
 SCREEN_MODEL_PATH = pathlib.Path(__file__).parent / "screen_model.json"
 _model_ok = _model.load(MODEL_PATH)
 _screen_ok = _screen_model.load(SCREEN_MODEL_PATH)
 print(f"[calib] gaze_model loaded={_model_ok} trained={_model.trained}  "
       f"screen_model loaded={_screen_ok} trained={_screen_model.trained}")
-print(f"[calib] screen_model A={_screen_model.A}  B={_screen_model.B}" if _screen_ok else "")
 
 # ── Recording ─────────────────────────────────────────────────────────────────
 # Per calibration session (START → STOP): raw sensor videos + aligned timestamps.
@@ -2770,13 +2769,16 @@ class Handler(BaseHTTPRequestHandler):
             _handle_ws(self.rfile, self.wfile)
 
         elif self.path == "/model":
-            # Return current model coefficients
+            # Return current model coefficients (fallback polynomial)
             if _model.trained:
+                fb = _model.fallback
                 body = json.dumps({
-                    "trained": True,
-                    "n_terms": _model.n_terms,
-                    "A": _model.A.tolist(),
-                    "B": _model.B.tolist(),
+                    "trained": True, "type": "dual",
+                    "pos_ok": _model.model_pos.trained,
+                    "neg_ok": _model.model_neg.trained,
+                    "n_terms": 6,
+                    "A": fb.A.tolist() if fb.trained else None,
+                    "B": fb.B.tolist() if fb.trained else None,
                 }).encode()
             else:
                 body = json.dumps({"trained": False}).encode()
@@ -2998,10 +3000,7 @@ class Handler(BaseHTTPRequestHandler):
                         try:
                             for s in samples:
                                 sd = float(s.get("side", 1.0))
-                                if _model.n_terms == 7:
-                                    px, py = _model.predict(s["dx"], s["dy"], sd)
-                                else:
-                                    px, py = _model.predict(s["dx"], s["dy"])
+                                px, py = _model.predict(s["dx"], s["dy"], sd)
                                 preds.append({"px": round(px, 1), "py": round(py, 1)})
                         except Exception:
                             preds = []
