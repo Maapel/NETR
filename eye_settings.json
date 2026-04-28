@@ -2,8 +2,8 @@
   "p_algorithm": "threshold",
   "p_glint_thresh": 200,
   "p_blur_ksize": 7,
-  "p_thresh_offset": 5,
-  "p_dark_percentile": 0.4,
+  "p_thresh_offset": 8,
+  "p_dark_percentile": 0.0,
   "p_morph_ksize": 5,
   "p_min_radius": 15,
   "p_max_radius": 150,
@@ -15,9 +15,15 @@
   "p_hough_param2": 30,
   "p_gradient_downscale": 2,
   "p_seed_flood_tolerance": 40,
-  "g_brightness_thresh": 230,
+  "g_glint_margin": 30,
+  "g_brightness_thresh": 150,
   "g_min_area": 5,
   "g_max_area": 800,
+  "g_circularity_min": 0.3,
+  "g_iris_radius_factor": 2.2,
+  "g_limbus_n_rays": 16,
+  "g_limbus_max_factor": 4.0,
+  "g_limbus_min_gradient": 4.0,
   "g_search_radius_factor": 2.5,
-  "g_circularity_min": 0.3
+  "g_ellipse_slack": 0.12
 }
