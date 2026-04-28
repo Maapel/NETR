@@ -1573,7 +1573,6 @@ button:disabled { opacity: 0.4; cursor: default; }
 button.mode { background: #1a1a1a; }
 button.mode.active { background: #333; color: #ffcc00; border-color: #ffcc00; }
 button.live-on    { background: #1a3320; color: #44ff88; border-color: #44ff88; }
-button.paused-on  { background: #2a1a0a; color: #ffaa44; border-color: #ffaa44; }
 button.rec-on     { background: #2a0a0a; color: #ff4444; border-color: #ff4444; }
 @keyframes recblink { 0%,100%{opacity:1} 50%{opacity:0.4} }
 button.rec-on     { animation: recblink 1.2s infinite; }
@@ -1661,7 +1660,6 @@ button.trace-on   { background: #1a1a33; color: #88ccff; border-color: #6699cc; 
 <div id="bottom-bar">
   <button onclick="window.open('/viz','_blank')">📊 Viz</button>
   <button id="btnTrace" type="button">Trace OFF</button>
-  <button id="btnPause">⏸ Pause</button>
   <button id="btnGlintSweepStart" title="Manual glint sweep (legacy)">🔦 Sweep</button>
   <button id="btnGlintSweepStop" disabled>⏹</button>
   <span id="glintSweepStatus"></span>
@@ -1726,7 +1724,6 @@ const btnStop   = document.getElementById('btnStop');
 const btnLive   = document.getElementById('btnLive');
 const btnSweep  = document.getElementById('btnSweep');
 const btnSaccade= document.getElementById('btnSaccade');
-const btnPause  = document.getElementById('btnPause');
 const btnRecord = document.getElementById('btnRecord');
 const btnTrace  = document.getElementById('btnTrace');
 
@@ -1767,23 +1764,6 @@ function handleRecordAck(m) {
   }
 }
 
-let streamsPaused = false;
-function setStreamsPaused(val) {
-  streamsPaused = val;
-  // Proxy through calibration server to avoid CORS (8090→8080)
-  fetch(`/pause_receiver?v=${val ? 1 : 0}`).catch(() => {});
-  if (val) {
-    btnPause.textContent = '▶ Resume Streams';
-    btnPause.classList.add('paused-on');
-  } else {
-    btnPause.textContent = '⏸ Pause Streams';
-    btnPause.classList.remove('paused-on');
-  }
-}
-// Auto-pause receiver MJPEG when calibration opens; resume on close
-setStreamsPaused(true);
-window.addEventListener('beforeunload', () => setStreamsPaused(false));
-btnPause.onclick = () => setStreamsPaused(!streamsPaused);
 
 // ── Glint sweep calibration ──────────────────────────────────────────────────
 const ENGINE_URL = 'http://localhost:8081';
@@ -2840,19 +2820,6 @@ class Handler(BaseHTTPRequestHandler):
                 body = json.dumps({"ok": True, "on": on}).encode()
             else:
                 body = json.dumps({"on": _calib_trace_enabled}).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-        elif self.path.startswith("/pause_receiver"):
-            val = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("v", ["1"])[0]
-            try:
-                urllib.request.urlopen(f"{RECEIVER_URL}/set?pause_streams={val}", timeout=1).close()
-                body = b'{"ok":true}'
-            except Exception as e:
-                body = json.dumps({"ok": False, "error": str(e)}).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
