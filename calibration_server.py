@@ -574,7 +574,8 @@ def _flush_pending_target(eyes: list | None = None, target: dict | None = None):
     # When both LED sides are observed in this fixation, emit one sample per
     # side — doubles training data and preserves per-LED geometry.
     new_samples: list[dict] = []
-    sides_present = set(int(s[2]) for s in synced[mask] if len(synced) > 0 and mask.sum() > 0) if mask.sum() >= 2 else {int(avg_side)}
+    synced_clean = [s for s, m in zip(synced, mask) if m]
+    sides_present = set(int(s[2]) for s in synced_clean) if len(synced_clean) >= 2 else {int(avg_side)}
 
     if len(sides_present) == 2:
         # Both sides represented — emit one averaged sample per side
