@@ -1656,6 +1656,7 @@ button.trace-on   { background: #1a1a33; color: #88ccff; border-color: #6699cc; 
   <span id="status">Connecting…</span>
 </div>
 <div id="bottom-bar">
+  <button id="btnGrid" title="Toggle grid mode — systematic 6×7 coverage [G]">GRID OFF</button>
   <button onclick="window.open('/viz','_blank')" title="Open visualiser [V]">📊 Viz</button>
   <button id="btnTrace" type="button" title="Toggle pipeline trace [T]">Trace OFF</button>
   <span id="glintSweepStatus"></span>
@@ -2180,16 +2181,58 @@ function pollArucoGate(now) {
   }).catch(() => { arucoGateOk = false; });
 }
 
-function nextSaccadePoint() {
-  if (zoneSeqIdx >= zoneSeq.length) {
-    // All 9 zones visited — generate a new sequence for the next round
-    // (but skip re-centering: start from farthest zone from current position)
-    zoneSeq    = buildZoneSequence().slice(1); // skip center on repeats
-    zoneSeqIdx = 0;
+// ── Grid mode ─────────────────────────────────────────────────────────────────
+let gridMode = false;
+let gridPts  = [];   // [{x,y}] — built at initSaccade time when W/H known
+let gridIdx  = 0;
+
+const btnGrid = document.getElementById('btnGrid');
+btnGrid.onclick = () => {
+  if (running) return;
+  gridMode = !gridMode;
+  btnGrid.textContent = gridMode ? 'GRID ON' : 'GRID OFF';
+  btnGrid.classList.toggle('mode active', gridMode);
+  btnGrid.style.background    = gridMode ? '#1a331a' : '';
+  btnGrid.style.color         = gridMode ? '#88ff88' : '';
+  btnGrid.style.borderColor   = gridMode ? '#44cc44' : '';
+};
+
+function buildGridPoints() {
+  const cols = 6, rows = 7;
+  const padX = W * 0.10, padY = H * 0.12;
+  const pts = [];
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      pts.push({
+        x: padX + (W - 2 * padX) * c / (cols - 1),
+        y: padY + (H - 2 * padY) * r / (rows - 1),
+      });
+    }
   }
-  const zone   = zoneSeq[zoneSeqIdx++];
-  saccadePos   = randomInZone(zone);
-  saccadeStart = performance.now();
+  // Shuffle so coverage is less predictable within one pass
+  for (let i = pts.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [pts[i], pts[j]] = [pts[j], pts[i]];
+  }
+  return pts;
+}
+
+function nextSaccadePoint() {
+  if (gridMode) {
+    if (gridIdx >= gridPts.length) {
+      gridPts = buildGridPoints();   // new shuffle each pass
+      gridIdx = 0;
+    }
+    saccadePos = gridPts[gridIdx++];
+  } else {
+    if (zoneSeqIdx >= zoneSeq.length) {
+      zoneSeq    = buildZoneSequence().slice(1);
+      zoneSeqIdx = 0;
+    }
+    const zone = zoneSeq[zoneSeqIdx++];
+    saccadePos = randomInZone(zone);
+  }
+  saccadeStart   = performance.now();
   saccadeSampled = false;
   fixationSentAt = null;
 }
@@ -2197,10 +2240,12 @@ function nextSaccadePoint() {
 function initSaccade() {
   zoneSeq    = buildZoneSequence();
   zoneSeqIdx = 0;
-  saccadeCount = 0;
+  gridPts    = buildGridPoints();
+  gridIdx    = 0;
+  saccadeCount  = 0;
   arucoGateOk   = false;
   lastArucoPoll = 0;
-  nextSaccadePoint();  // first point = center zone
+  nextSaccadePoint();
 }
 
 function tickSaccade(now) {
@@ -2221,15 +2266,19 @@ function tickSaccade(now) {
     fixationSentAt = now;
     saccadeSampled = true;
     saccadeCount++;
-    const round = Math.ceil(saccadeCount / 9);
-    const inRound = ((saccadeCount - 1) % 9) + 1;
-    statusEl.textContent = `Saccade: ${saccadeCount} pts  (round ${round}, point ${inRound}/9)`;
+    if (gridMode) {
+      const total = gridPts.length;
+      const pass  = Math.ceil(saccadeCount / total);
+      statusEl.textContent = `Grid: ${saccadeCount} pts  (pass ${pass}, point ${gridIdx}/${total})`;
+    } else {
+      const round   = Math.ceil(saccadeCount / 9);
+      const inRound = ((saccadeCount - 1) % 9) + 1;
+      statusEl.textContent = `Saccade: ${saccadeCount} pts  (round ${round}, point ${inRound}/9)`;
+    }
   } else if (settled && !saccadeSampled) {
-    const nextIdx = saccadeCount + 1;
-    const round = Math.ceil(nextIdx / 9);
-    const inRound = ((nextIdx - 1) % 9) + 1;
-    statusEl.textContent =
-      `Saccade: ${saccadeCount} pts  (round ${round}, point ${inRound}/9) — waiting for 4 ArUco markers`;
+    statusEl.textContent = gridMode
+      ? `Grid: ${saccadeCount} pts  (point ${gridIdx}/${gridPts.length}) — waiting for ArUco`
+      : `Saccade: ${saccadeCount} pts — waiting for 4 ArUco markers`;
   }
 
   if (saccadeSampled && fixationSentAt !== null && (now - fixationSentAt) >= FIXATE_MS) {
@@ -2412,6 +2461,9 @@ document.addEventListener('keydown', e => {
       break;
     case 't': case 'T':
       btnTrace.click();
+      break;
+    case 'g': case 'G':
+      if (!running) btnGrid.click();
       break;
     case 'h': case 'H':
       togglePanels();
