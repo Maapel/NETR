@@ -1504,22 +1504,25 @@ def _handle_ws(rfile, wfile):
                     _rec_stop()
 
             elif mtype == "sweep_end":
-                # Flush the last pending sweep fixation, then compute switch_dx
-                _flush_pending_target()
-                _wait_async_flushes()
-                with _sweep_calib_lock:
-                    sw_samples = list(_sweep_calib_samples)
-                    _sweep_calib_samples.clear()
-                switch_dx = _compute_sweep_switch_dx(sw_samples)
-                if switch_dx is None:
-                    switch_dx = 0.0
-                _push_switch_dx_to_engine(switch_dx)
-                _calib_trace("WS sweep_end: n=%d switch_dx=%.3f", len(sw_samples), switch_dx)
-                _ws_send_frame(wfile, json.dumps({
-                    "type": "sweep_calibrated",
-                    "switch_dx": round(switch_dx, 3),
-                    "n_samples": len(sw_samples),
-                }))
+                # Flush last pending sweep fixation + wait for async flushes in
+                # background — _wait_async_flushes can take seconds and must not
+                # block the WS thread (that would drop the connection).
+                def _finish_sweep():
+                    _flush_pending_target()
+                    _wait_async_flushes()
+                    with _sweep_calib_lock:
+                        sw_samples = list(_sweep_calib_samples)
+                        _sweep_calib_samples.clear()
+                    switch_dx = _compute_sweep_switch_dx(sw_samples) or 0.0
+                    _push_switch_dx_to_engine(switch_dx)
+                    _calib_trace("sweep_end done: n=%d switch_dx=%.3f",
+                                 len(sw_samples), switch_dx)
+                    _broadcast(json.dumps({
+                        "type": "sweep_calibrated",
+                        "switch_dx": round(switch_dx, 3),
+                        "n_samples": len(sw_samples),
+                    }))
+                threading.Thread(target=_finish_sweep, daemon=True).start()
 
             elif mtype == "status":
                 with _homography_lock:
