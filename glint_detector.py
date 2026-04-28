@@ -1,10 +1,8 @@
 """
 Corneal reflection (glint) detection for IR eye images.
 
-Detects the bright spots created by NIR LEDs on the cornea surface.
-With two LEDs, two glints may appear when gaze is forward; at lateral extremes
-often only one is visible. A validated pair yields a virtual reference (midpoint)
-and inter-glint separation for extended gaze models.
+Bright blobs are filtered to those lying on the pupil/iris (not sclera), then
+the best candidate (closest to pupil center, tie-break peak brightness) is primary.
 """
 
 from __future__ import annotations
@@ -14,15 +12,53 @@ import numpy as np
 from dataclasses import dataclass, field
 
 
+def _point_in_ellipse(px: float, py: float, ellipse: tuple, slack: float) -> bool:
+    """True if (px,py) lies inside the pupil ellipse expanded by slack (fraction of semi-axes)."""
+    (cx, cy), (w, h), ang_deg = ellipse
+    if w < 1e-6 or h < 1e-6:
+        return False
+    a = (w / 2.0) * (1.0 + slack)
+    b = (h / 2.0) * (1.0 + slack)
+    rad = np.radians(float(ang_deg))
+    ca, sa = np.cos(rad), np.sin(rad)
+    dx, dy = float(px) - float(cx), float(py) - float(cy)
+    xr = ca * dx + sa * dy
+    yr = -sa * dx + ca * dy
+    return (xr / a) ** 2 + (yr / b) ** 2 <= 1.0 + 1e-9
+
+
+def _point_in_iris_disk(
+    px: float, py: float,
+    pcx: float, pcy: float,
+    pupil_radius: float,
+    iris_radius_factor: float,
+) -> bool:
+    """True if glint lies inside limbus-sized disk around pupil center."""
+    r = max(pupil_radius, 1.0) * iris_radius_factor
+    return np.hypot(px - pcx, py - pcy) <= r + 1e-9
+
+
+def _glint_on_pupil_iris(
+    gx: float, gy: float,
+    pupil_center: tuple[float, float] | None,
+    pupil_radius: int | None,
+    pupil_ellipse: tuple | None,
+    iris_radius_factor: float,
+    ellipse_slack: float,
+) -> bool:
+    if pupil_center is None or pupil_radius is None:
+        return True
+    pcx, pcy = float(pupil_center[0]), float(pupil_center[1])
+    r = float(pupil_radius)
+    if pupil_ellipse is not None:
+        return _point_in_ellipse(gx, gy, pupil_ellipse, ellipse_slack)
+    return _point_in_iris_disk(gx, gy, pcx, pcy, r, iris_radius_factor)
+
+
 @dataclass
 class GlintResult:
     glints: list[tuple[float, float]] = field(default_factory=list)
     primary: tuple[float, float] | None = None
-    reference_point: tuple[float, float] | None = None
-    pair_valid: bool = False
-    glint_a: tuple[float, float] | None = None
-    glint_b: tuple[float, float] | None = None
-    inter_glint_sep: float | None = None
     debug_mask: np.ndarray | None = None
     intermediate_frames: dict = field(default_factory=dict)
 
@@ -37,24 +73,23 @@ class GlintDetector:
         max_area: int = 800,
         search_radius_factor: float = 2.5,
         circularity_min: float = 0.3,
-        pair_min_sep_factor: float = 0.35,
-        pair_max_sep_factor: float = 3.5,
-        pair_search_top: int = 4,
+        iris_radius_factor: float = 2.15,
+        ellipse_slack: float = 0.12,
     ):
         self.brightness_thresh = brightness_thresh
         self.min_area = min_area
         self.max_area = max_area
         self.search_radius_factor = search_radius_factor
         self.circularity_min = circularity_min
-        self.pair_min_sep_factor = pair_min_sep_factor
-        self.pair_max_sep_factor = pair_max_sep_factor
-        self.pair_search_top = max(2, int(pair_search_top))
+        self.iris_radius_factor = iris_radius_factor
+        self.ellipse_slack = ellipse_slack
 
     def detect(
         self,
         gray: np.ndarray,
-        pupil_center: tuple[int, int] | None = None,
+        pupil_center: tuple[float, float] | None = None,
         pupil_radius: int | None = None,
+        pupil_ellipse: tuple | None = None,
     ) -> GlintResult:
         intermediate = {}
 
@@ -90,70 +125,42 @@ class GlintDetector:
             candidates.append((gx, gy, area, circ, peak))
 
         if pupil_center is not None and pupil_radius is not None:
-            px, py = pupil_center
-            max_dist = pupil_radius * self.search_radius_factor
+            px, py = float(pupil_center[0]), float(pupil_center[1])
+            max_dist = float(pupil_radius) * self.search_radius_factor
             candidates = [
                 c for c in candidates
                 if np.hypot(c[0] - px, c[1] - py) <= max_dist
             ]
 
-        if not candidates:
+        valid = [
+            c for c in candidates
+            if _glint_on_pupil_iris(
+                c[0], c[1],
+                pupil_center, pupil_radius, pupil_ellipse,
+                self.iris_radius_factor, self.ellipse_slack,
+            )
+        ]
+
+        if not valid:
             return GlintResult(debug_mask=mask, intermediate_frames=intermediate)
 
         if pupil_center is not None:
-            px, py = pupil_center
-            candidates.sort(key=lambda c: np.hypot(c[0] - px, c[1] - py))
-        else:
-            candidates.sort(key=lambda c: -c[4])
-
-        glints = [(c[0], c[1]) for c in candidates]
-        primary = glints[0]
-
-        pair_valid = False
-        glint_a = glint_b = None
-        inter_sep = None
-        ref = primary
-
-        r = float(pupil_radius) if pupil_radius and pupil_radius > 0 else 20.0
-        dmin = self.pair_min_sep_factor * r
-        dmax = self.pair_max_sep_factor * r
-
-        if len(candidates) >= 2 and pupil_center is not None:
-            top = min(self.pair_search_top, len(candidates))
-            best: tuple[float, int, int] | None = None
-            for i in range(top):
-                for j in range(i + 1, top):
-                    xi, yi, _, _, pi = candidates[i][:5]
-                    xj, yj, _, _, pj = candidates[j][:5]
-                    sep = float(np.hypot(xi - xj, yi - yj))
-                    if not (dmin <= sep <= dmax):
-                        continue
-                    score = pi + pj
-                    if best is None or score > best[0]:
-                        best = (score, i, j)
-            if best is not None:
-                _, i, j = best
-                ga = (candidates[i][0], candidates[i][1])
-                gb = (candidates[j][0], candidates[j][1])
-                if ga[0] <= gb[0]:
-                    glint_a, glint_b = ga, gb
-                else:
-                    glint_a, glint_b = gb, ga
-                pair_valid = True
-                inter_sep = float(np.hypot(glint_a[0] - glint_b[0], glint_a[1] - glint_b[1]))
-                ref = (
-                    0.5 * (glint_a[0] + glint_b[0]),
-                    0.5 * (glint_a[1] + glint_b[1]),
+            px, py = float(pupil_center[0]), float(pupil_center[1])
+            valid.sort(
+                key=lambda c: (
+                    np.hypot(c[0] - px, c[1] - py),
+                    -c[4],
                 )
+            )
+        else:
+            valid.sort(key=lambda c: -c[4])
+
+        glints = [(c[0], c[1]) for c in valid]
+        primary = glints[0]
 
         return GlintResult(
             glints=glints,
             primary=primary,
-            reference_point=ref,
-            pair_valid=pair_valid,
-            glint_a=glint_a,
-            glint_b=glint_b,
-            inter_glint_sep=inter_sep,
             debug_mask=mask,
             intermediate_frames=intermediate,
         )

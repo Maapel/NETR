@@ -164,7 +164,7 @@ _saccade_samples: list[dict] = []
 _saccade_lock = threading.Lock()
 
 # Push-based capture: frames received from receiver during the active capture window
-_pending_eye: list[dict] = []   # [{ts, dx, dy, sep?}] for the current target
+_pending_eye: list[dict] = []   # [{ts, dx, dy, side?}] for the current target
 _pending_target: dict | None = None  # {x, y} of the target being captured
 _pending_lock = threading.Lock()
 FIXATE_MS = 300   # capture window duration (matches JS FIXATE_MS)
@@ -448,7 +448,7 @@ def _flush_pending_target(eyes: list | None = None, target: dict | None = None):
     )
 
     # Build per-sample synced tuples: fetch world frame at each eye timestamp
-    synced: list[tuple] = []   # (dx, dy, sep, X, Y, r|nan)
+    synced: list[tuple] = []   # (dx, dy, side, X, Y, r|nan)
     # Cache the global homography once as fallback for frames where per-frame
     # ArUco fails (transient occlusion, motion blur).  If it's also None the
     # session never had a valid homography — samples will still be 0.
@@ -477,9 +477,9 @@ def _flush_pending_target(eyes: list | None = None, target: dict | None = None):
             continue
         pt = np.array([[[sx, sy]]], dtype=np.float32)
         sc = cv2.perspectiveTransform(pt, H_use)[0][0]
-        r   = e.get("r", float("nan"))
-        sep = float(e.get("sep", 0.0))
-        synced.append((e["dx"], e["dy"], sep, float(sc[0]), float(sc[1]), r))
+        r    = e.get("r", float("nan"))
+        side = float(e.get("side", 1.0))
+        synced.append((e["dx"], e["dy"], side, float(sc[0]), float(sc[1]), r))
 
     n_synced = len(synced)
     print(f"[calib] Target ({sx:.0f},{sy:.0f}) n={len(eyes)} synced={n_synced} "
@@ -496,7 +496,7 @@ def _flush_pending_target(eyes: list | None = None, target: dict | None = None):
 
     dxs  = _np.array([s[0] for s in synced])
     dys  = _np.array([s[1] for s in synced])
-    seps = _np.array([s[2] for s in synced])
+    sides = _np.array([s[2] for s in synced])
     Xs   = _np.array([s[3] for s in synced])
     Ys   = _np.array([s[4] for s in synced])
 
@@ -518,7 +518,7 @@ def _flush_pending_target(eyes: list | None = None, target: dict | None = None):
                 return
             dxs  = dxs[blink_mask]
             dys  = dys[blink_mask]
-            seps = seps[blink_mask]
+            sides = sides[blink_mask]
             Xs   = Xs[blink_mask]
             Ys   = Ys[blink_mask]
 
@@ -537,12 +537,13 @@ def _flush_pending_target(eyes: list | None = None, target: dict | None = None):
     n_clean = int(mask.sum())
     avg_dx  = float(dxs[mask].mean() if n_clean >= 2 else dxs.mean())
     avg_dy  = float(dys[mask].mean() if n_clean >= 2 else dys.mean())
-    avg_sep = float(seps[mask].mean() if n_clean >= 2 else seps.mean())
+    sm = float(sides[mask].mean() if n_clean >= 2 else sides.mean())
+    avg_side = 1.0 if sm >= 0.0 else -1.0
     avg_X   = float(Xs[mask].mean()  if n_clean >= 2 else Xs.mean())
     avg_Y   = float(Ys[mask].mean()  if n_clean >= 2 else Ys.mean())
 
     print(f"[calib] Target ({sx:.0f},{sy:.0f}) clean={n_clean} "
-          f"dx={avg_dx:.2f}±{dxs.std():.2f} dy={avg_dy:.2f}±{dys.std():.2f} sep={avg_sep:.1f} "
+          f"dx={avg_dx:.2f}±{dxs.std():.2f} dy={avg_dy:.2f}±{dys.std():.2f} side={avg_side:+.0f} "
           f"X={avg_X:.1f} Y={avg_Y:.1f}")
 
     # Record fixation
@@ -550,7 +551,7 @@ def _flush_pending_target(eyes: list | None = None, target: dict | None = None):
         try:
             _rec_fixation_f.write(json.dumps({
                 "ts": eyes[-1]["ts"], "x": sx, "y": sy,
-                "eye": {"dx": avg_dx, "dy": avg_dy, "sep": avg_sep, "n": n_synced,
+                "eye": {"dx": avg_dx, "dy": avg_dy, "side": avg_side, "n": n_synced,
                         "dx_std": float(dxs.std()), "dy_std": float(dys.std()),
                         "eye_ts": eyes[-1]["ts"]},
                 "scene": {"X": avg_X, "Y": avg_Y},
@@ -560,7 +561,7 @@ def _flush_pending_target(eyes: list | None = None, target: dict | None = None):
 
     # Add to calibration dataset — scene_xy is the temporally-matched average
     with _saccade_lock:
-        _saccade_samples.append({"dx": avg_dx, "dy": avg_dy, "sep": avg_sep,
+        _saccade_samples.append({"dx": avg_dx, "dy": avg_dy, "side": avg_side,
                                  "X": avg_X, "Y": avg_Y, "sx": sx, "sy": sy})
         n = len(_saccade_samples)
     _calib_trace(
@@ -586,7 +587,7 @@ def _refit_models():
     try:
         diag = _model.fit(samples)
         _screen_model.fit([{"dx": s["dx"], "dy": s["dy"],
-                            "sep": float(s.get("sep", 0.0)),
+                            "side": float(s.get("side", 1.0)),
                             "X": s["sx"], "Y": s["sy"]} for s in samples])
         _model.save(MODEL_PATH)
         _screen_model.save(SCREEN_MODEL_PATH)
@@ -1028,19 +1029,21 @@ def _eye_poll_thread():
             if vec and len(vec) == 2 and pccr_ts_ms is not None:
                 pccr_ts_ms = float(pccr_ts_ms)
                 _last_pccr_ts = pccr_ts_ms
-                sep = float(d.get("pccr_sep", 0.0) or 0.0)
+                side = float(d.get("pccr_side", 1.0) or 0.0)
+                if side == 0.0:
+                    side = 1.0
                 with _debug_lock:
                     _debug["eye_poll_ok"] = True
                     _debug["eye_poll_error"] = ""
                     _debug["pccr_vector"] = [round(vec[0], 3), round(vec[1], 3)]
                     _debug["pccr_age_ms"] = 0
                 if prev_vec_ok is not True:
-                    print(f"[eye] pccr_vector OK (camera ts_ms): {vec} sep={sep:.2f}")
+                    print(f"[eye] pccr_vector OK (camera ts_ms): {vec} side={side:+.0f}")
                     prev_vec_ok = True
 
                 if pccr_ts_ms > _last_pccr_ts_seen:
                     _last_pccr_ts_seen = pccr_ts_ms
-                    entry = {"ts": pccr_ts_ms, "dx": vec[0], "dy": vec[1], "sep": sep}
+                    entry = {"ts": pccr_ts_ms, "dx": vec[0], "dy": vec[1], "side": side}
                     with _eye_lock:
                         _eye_buf.append(entry)
                         cutoff = pccr_ts_ms - 10000
@@ -1080,7 +1083,7 @@ def _sync_and_build_dataset(screen_w: int, screen_h: int) -> list[dict]:
     """
     Match target coords with eye vectors within SYNC_WINDOW_MS.
     Map target screen coords → scene camera coords via homography.
-    Returns list of {"dx","dy","sep","X","Y"} training samples (sep may be 0).
+    Returns list of {"dx","dy","side","X","Y"} training samples.
     """
     with _target_lock:
         targets = list(_target_buf)
@@ -1130,7 +1133,7 @@ def _sync_and_build_dataset(screen_w: int, screen_h: int) -> list[dict]:
         X, Y = scene_xy
         samples.append({
             "dx": best["dx"], "dy": best["dy"],
-            "sep": float(best.get("sep", 0.0)),
+            "side": float(best.get("side", 1.0)),
             "X": X, "Y": Y,
         })
 
@@ -2518,8 +2521,8 @@ class Handler(BaseHTTPRequestHandler):
             params = dict(urllib.parse.parse_qsl(urllib.parse.urlparse(self.path).query))
             try:
                 dx, dy = float(params["dx"]), float(params["dy"])
-                sp = float(params.get("sep", 0.0))
-                X, Y = _model.predict(dx, dy, sp)
+                sd = float(params.get("side", 1.0))
+                X, Y = _model.predict(dx, dy, sd)
                 body = json.dumps({"X": X, "Y": Y}).encode()
                 code = 200
             except Exception as e:
@@ -2659,18 +2662,23 @@ class Handler(BaseHTTPRequestHandler):
                 with urllib.request.urlopen(f"{RECEIVER_URL}/stats", timeout=1) as r:
                     d = json.loads(r.read())
                 vec = d.get("pccr_vector")
-                sp = float(d.get("pccr_sep") or 0.0)
+                sd = float(d.get("pccr_side") or 1.0)
+                if sd == 0.0:
+                    sd = 1.0
                 if not vec:
                     body = json.dumps({"ok": False, "reason": "no pccr vector"}).encode()
                 elif _screen_model.trained:
                     if _screen_model.n_terms == 7:
-                        sx, sy = _screen_model.predict(vec[0], vec[1], sp)
+                        sx, sy = _screen_model.predict(vec[0], vec[1], sd)
                     else:
                         sx, sy = _screen_model.predict(vec[0], vec[1])
                     body = json.dumps({"ok": True, "x": sx, "y": sy,
-                                       "dx": vec[0], "dy": vec[1], "sep": sp}).encode()
+                                       "dx": vec[0], "dy": vec[1], "side": sd}).encode()
                 else:
-                    scene_x, scene_y = _model.predict(vec[0], vec[1])
+                    if _model.n_terms == 7:
+                        scene_x, scene_y = _model.predict(vec[0], vec[1], sd)
+                    else:
+                        scene_x, scene_y = _model.predict(vec[0], vec[1])
                     with _homography_lock:
                         H = _homography
                     if H is None:
@@ -2726,9 +2734,9 @@ class Handler(BaseHTTPRequestHandler):
                     if _model.trained:
                         try:
                             for s in samples:
-                                sp = float(s.get("sep", 0.0))
+                                sd = float(s.get("side", 1.0))
                                 if _model.n_terms == 7:
-                                    px, py = _model.predict(s["dx"], s["dy"], sp)
+                                    px, py = _model.predict(s["dx"], s["dy"], sd)
                                 else:
                                     px, py = _model.predict(s["dx"], s["dy"])
                                 preds.append({"px": round(px, 1), "py": round(py, 1)})
@@ -2761,7 +2769,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if self.path == "/push_eye":
             # Receiver pushes PCCR for a single eye frame during the capture window.
-            # Body: {ts, dx, dy, x, y, r?, sep?}
+            # Body: {ts, dx, dy, x, y, r?, side?}
             # ts is the camera's own capture timestamp (synced to laptop clock).
             try:
                 d = json.loads(body)
@@ -2769,7 +2777,7 @@ class Handler(BaseHTTPRequestHandler):
                     "ts": float(d["ts"]),
                     "dx": float(d["dx"]),
                     "dy": float(d["dy"]),
-                    "sep": float(d.get("sep", 0.0)),
+                    "side": float(d.get("side", d.get("sep", 1.0))),
                 }
                 if "r" in d:
                     entry["r"] = float(d["r"])

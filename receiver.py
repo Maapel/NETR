@@ -92,7 +92,7 @@ g_calib_trace = False        # toggled via /set?calib_trace=1|0 — verbose cali
 import rig_config as _rig_cfg
 g_eye_cam = _rig_cfg.eye_cam()   # which cam runs the eye pipeline
 g_latest_pccr: tuple[float, float] | None = None  # cached from engine /result
-g_latest_pccr_sep: float = 0.0
+g_latest_pccr_side: float = 0.0
 g_latest_pccr_ts: float = 0.0                    # time.time()*1000 of last PCCR
 
 # Calibration capture window — set by calibration server via POST /calib_window
@@ -115,11 +115,11 @@ _calib_win_hit_ctr = 0
 
 
 def _push_to_calib(ts_ms: float, dx: float, dy: float, x: float, y: float, r: float | None = None,
-                   sep: float = 0.0):
+                   side: float = 1.0):
     """Fire-and-forget push of a single eye frame to the calibration server."""
     import urllib.request
     try:
-        payload: dict = {"ts": ts_ms, "dx": dx, "dy": dy, "x": x, "y": y, "sep": sep}
+        payload: dict = {"ts": ts_ms, "dx": dx, "dy": dy, "x": x, "y": y, "side": side}
         if r is not None:
             payload["r"] = r
         body = json.dumps(payload).encode()
@@ -140,7 +140,7 @@ ENGINE_URL = "http://localhost:8081"
 def _engine_push(jpeg: bytes) -> tuple[
     bytes | None, tuple[float, float] | None, float, float | None, float,
 ]:
-    """POST a JPEG frame to engine. Returns (annotated_jpeg, pccr, frame_ts_ms, pupil_radius, pccr_sep)."""
+    """POST a JPEG frame to engine. Returns (annotated_jpeg, pccr, frame_ts_ms, pupil_radius, pccr_side)."""
     import urllib.request
     try:
         req = urllib.request.Request(
@@ -155,12 +155,12 @@ def _engine_push(jpeg: bytes) -> tuple[
             dy_h    = hdrs.get("X-Pccr-Dy")
             ts_h    = hdrs.get("X-Pccr-Ts")
             rad_h   = hdrs.get("X-Pupil-Radius")
-            sep_h   = hdrs.get("X-Pccr-Sep")
+            side_h  = hdrs.get("X-Pccr-Side")
             pccr    = (float(dx_h), float(dy_h)) if dx_h and dy_h else None
             ts_ms   = float(ts_h) * 1000 if ts_h else time.time() * 1000
             radius  = float(rad_h) if rad_h else None
-            pccr_sep = float(sep_h) if sep_h is not None else 0.0
-            return r.read(), pccr, ts_ms, radius, pccr_sep
+            pccr_side = float(side_h) if side_h is not None else 0.0
+            return r.read(), pccr, ts_ms, radius, pccr_side
     except Exception:
         return None, None, time.time() * 1000, None, 0.0
 
@@ -288,7 +288,7 @@ def _apply_pupil_overlay(data: bytes, roi: list[float] = None,
     cam_ts_ms: camera capture timestamp (synced, ms). When provided, used as the
     authoritative timestamp for calibration sync — more accurate than engine processing time.
     If a calibration capture window is active, pushes PCCR to calibration server."""
-    global g_latest_pccr, g_latest_pccr_sep, g_latest_pccr_ts
+    global g_latest_pccr, g_latest_pccr_side, g_latest_pccr_ts
     if not data:
         return data
 
@@ -308,7 +308,7 @@ def _apply_pupil_overlay(data: bytes, roi: list[float] = None,
         except Exception:
             pass
 
-    annotated, pccr, engine_ts_ms, pupil_radius, pccr_sep = _engine_push(data)
+    annotated, pccr, engine_ts_ms, pupil_radius, pccr_side = _engine_push(data)
 
     # Use camera capture timestamp when available — it's when the frame was actually
     # taken, not when the engine finished processing it.
@@ -317,7 +317,7 @@ def _apply_pupil_overlay(data: bytes, roi: list[float] = None,
     if pccr is not None:
         global _calib_win_miss_ctr, _calib_win_hit_ctr
         g_latest_pccr     = pccr
-        g_latest_pccr_sep = pccr_sep
+        g_latest_pccr_side = pccr_side
         g_latest_pccr_ts  = ts_ms
         # Push to calibration server if within the active capture window
         with g_calib_lock:
@@ -334,7 +334,7 @@ def _apply_pupil_overlay(data: bytes, roi: list[float] = None,
                         )
                 threading.Thread(
                     target=_push_to_calib,
-                    args=(ts_ms, pccr[0], pccr[1], win["x"], win["y"], pupil_radius, pccr_sep),
+                    args=(ts_ms, pccr[0], pccr[1], win["x"], win["y"], pupil_radius, pccr_side),
                     daemon=True,
                 ).start()
             elif g_calib_trace:
@@ -657,7 +657,7 @@ class MJPEGHandler(BaseHTTPRequestHandler):
             "sync_offset_ms": round(sync_offset_ms, 1),
             "pccr_vector": list(g_latest_pccr) if g_latest_pccr else None,
             "pccr_ts_ms": round(g_latest_pccr_ts, 3) if g_latest_pccr else None,
-            "pccr_sep": g_latest_pccr_sep if g_latest_pccr else None,
+            "pccr_side": g_latest_pccr_side if g_latest_pccr else None,
             "eye_cam": g_eye_cam,
             "streams_paused": g_streams_paused,
             "analysis_enabled": g_analysis_enabled,
@@ -1037,9 +1037,8 @@ class MJPEGHandler(BaseHTTPRequestHandler):
         "g_max_area":        (50, 5000),
         "g_search_radius_factor": (1.0, 5.0),
         "g_circularity_min": (0.1, 1.0),
-        "g_pair_min_sep_factor": (0.05, 2.0),
-        "g_pair_max_sep_factor": (1.0, 10.0),
-        "g_pair_search_top": (2, 8),
+        "g_iris_radius_factor": (1.2, 3.0),
+        "g_ellipse_slack": (0.0, 0.5),
     }
 
     def _set_cmd(self, query: str):
@@ -1677,6 +1676,16 @@ class MJPEGHandler(BaseHTTPRequestHandler):
         <input type="range" min="10" max="100" value="30" id="g_circularity_min"
                oninput="document.getElementById('g_circularity_min_val').textContent=(this.value/100).toFixed(2)">
       </div>
+      <div class="ctrl-group">
+        <span style="color:#ff8">Glint -Iris radius x pupil: <b id="g_iris_radius_factor_val">2.15</b></span>
+        <input type="range" min="12" max="30" value="22" id="g_iris_radius_factor"
+               oninput="document.getElementById('g_iris_radius_factor_val').textContent=(this.value/10).toFixed(2)">
+      </div>
+      <div class="ctrl-group">
+        <span style="color:#ff8">Glint -Ellipse slack: <b id="g_ellipse_slack_val">0.12</b></span>
+        <input type="range" min="0" max="50" value="12" id="g_ellipse_slack"
+               oninput="document.getElementById('g_ellipse_slack_val').textContent=(this.value/100).toFixed(2)">
+      </div>
     </div>
     <div style="display:flex; gap:8px; padding:4px 0">
       <button onclick="applyEyeSettings()" style="background:#286">Apply Eye</button>
@@ -2023,11 +2032,13 @@ function saveRecording() {
 const EYE_KEYS = ['p_glint_thresh','p_blur_ksize','p_dark_percentile','p_thresh_offset','p_morph_ksize',
   'p_min_radius','p_max_radius','p_circularity_min',
   'p_canny_low','p_canny_high','p_hough_param1','p_hough_param2','p_gradient_downscale','p_seed_flood_tolerance',
-  'g_brightness_thresh','g_min_area','g_max_area','g_search_radius_factor','g_circularity_min'];
+  'g_brightness_thresh','g_min_area','g_max_area','g_search_radius_factor','g_circularity_min',
+  'g_iris_radius_factor','g_ellipse_slack'];
 
 // Float params use scaled integer sliders
 const EYE_FLOAT_SCALE = {
-  'p_dark_percentile': 10, 'p_circularity_min': 100, 'g_circularity_min': 100, 'g_search_radius_factor': 10
+  'p_dark_percentile': 10, 'p_circularity_min': 100, 'g_circularity_min': 100, 'g_search_radius_factor': 10,
+  'g_iris_radius_factor': 10, 'g_ellipse_slack': 100
 };
 
 function eyeSliderVal(key) {
@@ -2287,6 +2298,14 @@ fetch('/eye_settings').then(r => r.json()).then(s => {
         <span style="color:#ff8">Glint -Circ min: <b id="g_circularity_min_val">0.3</b></span>
         <input type="range" min="10" max="100" value="30" id="g_circularity_min" oninput="upd(this,100)">
       </div>
+      <div class="ctrl-group">
+        <span style="color:#ff8">Glint -Iris r x pupil: <b id="g_iris_radius_factor_val">2.15</b></span>
+        <input type="range" min="12" max="30" value="22" id="g_iris_radius_factor" oninput="upd(this,10)">
+      </div>
+      <div class="ctrl-group">
+        <span style="color:#ff8">Glint -Ellipse slack: <b id="g_ellipse_slack_val">0.12</b></span>
+        <input type="range" min="0" max="50" value="12" id="g_ellipse_slack" oninput="upd(this,100)">
+      </div>
     </div>
     <div style="display:flex; gap:8px; padding-top:6px">
       <button class="eye-btn" style="background:#862" onclick="saveEyeSettings()">Save Eye Settings</button>
@@ -2368,8 +2387,10 @@ setupROI(2, c2);
 const EYE_KEYS = ['p_glint_thresh','p_blur_ksize','p_dark_percentile','p_thresh_offset','p_morph_ksize',
   'p_min_radius','p_max_radius','p_circularity_min',
   'p_canny_low','p_canny_high','p_hough_param1','p_hough_param2','p_gradient_downscale','p_seed_flood_tolerance',
-  'g_brightness_thresh','g_min_area','g_max_area','g_search_radius_factor','g_circularity_min'];
-const EYE_FLOAT_SCALE = {'p_dark_percentile': 10, 'p_circularity_min': 100, 'g_circularity_min': 100, 'g_search_radius_factor': 10};
+  'g_brightness_thresh','g_min_area','g_max_area','g_search_radius_factor','g_circularity_min',
+  'g_iris_radius_factor','g_ellipse_slack'];
+const EYE_FLOAT_SCALE = {'p_dark_percentile': 10, 'p_circularity_min': 100, 'g_circularity_min': 100, 'g_search_radius_factor': 10,
+  'g_iris_radius_factor': 10, 'g_ellipse_slack': 100};
 
 function updateAlgoVisibility() {
   const algo = document.getElementById('p_algorithm').value;
