@@ -577,21 +577,20 @@ def _flush_pending_target(eyes: list | None = None, target: dict | None = None):
     sides_present = set(int(s[2]) for s in synced_clean) if len(synced_clean) >= 2 else {int(avg_side)}
 
     if len(sides_present) == 2:
-        # Both sides represented — emit one averaged sample per side
-        all_arr = _np.array(synced, dtype=object)
+        # Both sides represented — emit one averaged sample per side (from clean frames only)
         for side_val in (1.0, -1.0):
-            side_mask = _np.array([s[2] == side_val for s in synced])
-            if side_mask.sum() < 2:
+            side_frames = [s for s in synced_clean if s[2] == side_val]
+            if len(side_frames) < 2:
                 continue
-            s_dx  = float(_np.array([s[0] for s in synced])[side_mask].mean())
-            s_dy  = float(_np.array([s[1] for s in synced])[side_mask].mean())
-            s_X   = float(_np.array([s[3] for s in synced])[side_mask].mean())
-            s_Y   = float(_np.array([s[4] for s in synced])[side_mask].mean())
+            s_dx = float(_np.mean([s[0] for s in side_frames]))
+            s_dy = float(_np.mean([s[1] for s in side_frames]))
+            s_X  = float(_np.mean([s[3] for s in side_frames]))
+            s_Y  = float(_np.mean([s[4] for s in side_frames]))
             new_samples.append({"dx": s_dx, "dy": s_dy, "side": side_val,
                                 "X": s_X, "Y": s_Y, "sx": sx, "sy": sy})
             _calib_trace(
                 "flush_pending APPEND per-side sample side=%+.0f n=%d dx=%.3f dy=%.3f",
-                side_val, int(side_mask.sum()), s_dx, s_dy,
+                side_val, len(side_frames), s_dx, s_dy,
             )
     else:
         new_samples.append({"dx": avg_dx, "dy": avg_dy, "side": avg_side,
