@@ -74,7 +74,7 @@ class EyePipeline:
         for attr in ("glint_margin", "brightness_thresh", "min_area", "max_area",
                       "circularity_min", "iris_radius_factor",
                       "limbus_n_rays", "limbus_max_factor", "limbus_min_gradient",
-                      "search_radius_factor", "ellipse_slack"):
+                      "search_radius_factor", "ellipse_slack", "min_dist_factor"):
             d["g_" + attr] = getattr(self._glint_det, attr)
         return d
 

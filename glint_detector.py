@@ -165,6 +165,11 @@ class GlintDetector:
         # Legacy — still used for search_radius pre-filter
         search_radius_factor: float = 2.5,
         ellipse_slack: float = 0.12,
+        # Minimum glint distance from pupil center as a fraction of pupil radius.
+        # LED corneal reflections land on the cornea (outside the pupil), so any
+        # bright blob within this fraction of the pupil radius is a false positive.
+        # 0.0 = disabled (legacy); 0.7 = reject anything inside 0.7× pupil_radius.
+        min_dist_factor: float = 0.0,
     ):
         self.glint_margin = glint_margin
         self.brightness_thresh = brightness_thresh
@@ -177,6 +182,7 @@ class GlintDetector:
         self.iris_radius_factor = iris_radius_factor
         self.search_radius_factor = search_radius_factor
         self.ellipse_slack = ellipse_slack
+        self.min_dist_factor = min_dist_factor
 
     def detect(
         self,
@@ -256,6 +262,16 @@ class GlintDetector:
                 if np.hypot(c[0] - px, c[1] - py) <= max_dist
             ]
 
+        # Minimum-distance filter: LED corneal reflections sit on the cornea,
+        # outside the pupil.  Blobs closer than min_dist_factor × pupil_radius
+        # are iris texture / pupil-edge artefacts — reject them.
+        if self.min_dist_factor > 0 and pupil_center is not None and pupil_radius is not None:
+            px, py = float(pupil_center[0]), float(pupil_center[1])
+            min_dist = float(pupil_radius) * self.min_dist_factor
+            filtered = [c for c in candidates if np.hypot(c[0] - px, c[1] - py) >= min_dist]
+            if filtered:   # only apply if at least one candidate survives
+                candidates = filtered
+
         if not candidates:
             return GlintResult(
                 debug_mask=bin_mask,
@@ -264,9 +280,12 @@ class GlintDetector:
                 intermediate_frames=intermediate,
             )
 
+        # Sort by brightness first: IR LED reflections are distinctly the
+        # brightest spots in the image.  Distance is used only as a tiebreaker
+        # to prefer glints closer to the corneal surface when equally bright.
         if pupil_center is not None:
             px, py = float(pupil_center[0]), float(pupil_center[1])
-            candidates.sort(key=lambda c: (np.hypot(c[0] - px, c[1] - py), -c[4]))
+            candidates.sort(key=lambda c: (-c[4], np.hypot(c[0] - px, c[1] - py)))
         else:
             candidates.sort(key=lambda c: -c[4])
 
