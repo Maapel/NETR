@@ -32,7 +32,7 @@ class EyePipeline:
     """Full eye analysis: pupil detection → glint detection → PCCR vector."""
 
     def __init__(self, pupil_kwargs=None, glint_kwargs=None, switch_dx: float = 0.0,
-                 preferred_side: float = 1.0):
+                 preferred_side: float = 1.0, swap_pccr: bool = False):
         self._pupil_det = PupilDetector(**(pupil_kwargs or {}))
         self._glint_det = GlintDetector(**(glint_kwargs or {}))
         # dx threshold for glint labeling: side=+1 if dx>switch_dx else -1
@@ -41,6 +41,9 @@ class EyePipeline:
         # When both LED glints are visible, always use this side as primary.
         # Convention: +1 (right LED). Makes prediction deterministic near crossover.
         self.preferred_side: float = 1.0 if float(preferred_side) >= 0 else -1.0
+        # If eye camera is mounted rotated 90°, swap dx↔dy so the gaze model
+        # gets the correct axis mapping and side labeling uses the correct axis.
+        self.swap_pccr: bool = bool(swap_pccr)
 
     def update_params(self, params: dict):
         """Update detector parameters at runtime. Keys prefixed with 'p_' go to
@@ -104,8 +107,10 @@ class EyePipeline:
         if pr.center and gr.glints:
             pcx, pcy = float(pr.center[0]), float(pr.center[1])
             for gx, gy in gr.glints:
-                dx = pcx - gx
-                side = self._label_side(dx)
+                raw_dx = pcx - gx
+                # When swap_pccr: side labeling uses dy (camera vertical = real horizontal)
+                label_dx = (pcy - gy) if self.swap_pccr else raw_dx
+                side = self._label_side(label_dx)
                 labeled.append((gx, gy, side))
 
             # Primary glint selection:
@@ -118,10 +123,15 @@ class EyePipeline:
             else:
                 gx, gy = gr.primary
 
-            dx = pcx - gx
-            dy = pcy - gy
-            pccr = (float(dx), float(dy))
-            pccr_side = self._label_side(dx)
+            raw_dx = pcx - gx
+            raw_dy = pcy - gy
+            # swap_pccr: rotate 90° so dx→horizontal, dy→vertical in gaze-model space
+            if self.swap_pccr:
+                pccr = (float(raw_dy), float(raw_dx))
+                pccr_side = self._label_side(raw_dy)
+            else:
+                pccr = (float(raw_dx), float(raw_dy))
+                pccr_side = self._label_side(raw_dx)
             glint_pos = (int(round(gx)), int(round(gy)))
 
         intermediate = {**pr.intermediate_frames, **gr.intermediate_frames}

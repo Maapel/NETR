@@ -115,13 +115,15 @@ _calib_win_hit_ctr = 0
 
 
 def _push_to_calib(ts_ms: float, dx: float, dy: float, x: float, y: float, r: float | None = None,
-                   side: float = 1.0):
+                   side: float = 1.0, extra: dict | None = None):
     """Fire-and-forget push of a single eye frame to the calibration server."""
     import urllib.request
     try:
         payload: dict = {"ts": ts_ms, "dx": dx, "dy": dy, "x": x, "y": y, "side": side}
         if r is not None:
             payload["r"] = r
+        if extra:
+            payload.update(extra)   # pupil_cx, pupil_cy, limbus_radius, labeled_glints
         body = json.dumps(payload).encode()
         req  = urllib.request.Request(
             CALIB_URL + "/push_eye",
@@ -137,10 +139,11 @@ def _push_to_calib(ts_ms: float, dx: float, dy: float, x: float, y: float, r: fl
 # ── Compute engine client ─────────────────────────────────────────────────────
 ENGINE_URL = "http://localhost:8081"
 
-def _engine_push(jpeg: bytes) -> tuple[
-    bytes | None, tuple[float, float] | None, float, float | None, float,
-]:
-    """POST a JPEG frame to engine. Returns (annotated_jpeg, pccr, frame_ts_ms, pupil_radius, pccr_side)."""
+def _engine_push(jpeg: bytes) -> tuple:
+    """POST frame to engine. Returns (annotated_jpeg, pccr, ts_ms, pupil_radius, pccr_side, extra).
+
+    extra = {pupil_cx, pupil_cy, limbus_radius, labeled_glints: [[gx,gy,side],...]}
+    """
     import urllib.request
     try:
         req = urllib.request.Request(
@@ -150,19 +153,38 @@ def _engine_push(jpeg: bytes) -> tuple[
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=0.5) as r:
-            hdrs    = r.headers
-            dx_h    = hdrs.get("X-Pccr-Dx")
-            dy_h    = hdrs.get("X-Pccr-Dy")
-            ts_h    = hdrs.get("X-Pccr-Ts")
-            rad_h   = hdrs.get("X-Pupil-Radius")
-            side_h  = hdrs.get("X-Pccr-Side")
-            pccr    = (float(dx_h), float(dy_h)) if dx_h and dy_h else None
-            ts_ms   = float(ts_h) * 1000 if ts_h else time.time() * 1000
-            radius  = float(rad_h) if rad_h else None
+            hdrs      = r.headers
+            dx_h      = hdrs.get("X-Pccr-Dx")
+            dy_h      = hdrs.get("X-Pccr-Dy")
+            ts_h      = hdrs.get("X-Pccr-Ts")
+            rad_h     = hdrs.get("X-Pupil-Radius")
+            side_h    = hdrs.get("X-Pccr-Side")
+            cx_h      = hdrs.get("X-Pupil-Cx")
+            cy_h      = hdrs.get("X-Pupil-Cy")
+            limbus_h  = hdrs.get("X-Limbus-Radius")
+            glints_h  = hdrs.get("X-Labeled-Glints")
+            pccr      = (float(dx_h), float(dy_h)) if dx_h and dy_h else None
+            ts_ms     = float(ts_h) * 1000 if ts_h else time.time() * 1000
+            radius    = float(rad_h) if rad_h else None
             pccr_side = float(side_h) if side_h is not None else 0.0
-            return r.read(), pccr, ts_ms, radius, pccr_side
+            extra: dict = {}
+            if cx_h and cy_h:
+                extra["pupil_cx"] = float(cx_h)
+                extra["pupil_cy"] = float(cy_h)
+            if limbus_h:
+                extra["limbus_radius"] = float(limbus_h)
+            if glints_h:
+                parsed = []
+                for part in glints_h.split(";"):
+                    try:
+                        gx, gy, s = part.split(",")
+                        parsed.append([float(gx), float(gy), float(s)])
+                    except ValueError:
+                        pass
+                extra["labeled_glints"] = parsed
+            return r.read(), pccr, ts_ms, radius, pccr_side, extra
     except Exception:
-        return None, None, time.time() * 1000, None, 0.0
+        return None, None, time.time() * 1000, None, 0.0, {}
 
 def _engine_get_result() -> dict | None:
     import urllib.request
@@ -308,7 +330,7 @@ def _apply_pupil_overlay(data: bytes, roi: list[float] = None,
         except Exception:
             pass
 
-    annotated, pccr, engine_ts_ms, pupil_radius, pccr_side = _engine_push(data)
+    annotated, pccr, engine_ts_ms, pupil_radius, pccr_side, eye_extra = _engine_push(data)
 
     # Use camera capture timestamp when available — it's when the frame was actually
     # taken, not when the engine finished processing it.
@@ -335,6 +357,7 @@ def _apply_pupil_overlay(data: bytes, roi: list[float] = None,
                 threading.Thread(
                     target=_push_to_calib,
                     args=(ts_ms, pccr[0], pccr[1], win["x"], win["y"], pupil_radius, pccr_side),
+                    kwargs={"extra": eye_extra},
                     daemon=True,
                 ).start()
             elif g_calib_trace:
@@ -2176,7 +2199,7 @@ fetch('/eye_settings').then(r => r.json()).then(s => {
     <button class="btn-speed" data-speed="0.5">0.5x</button>
     <button class="btn-speed active" data-speed="1">1x</button>
     <button class="btn-speed" data-speed="2">2x</button>
-    <label><input type="checkbox" id="analysis" checked onchange="render()"> Analysis</label>
+    <label><input type="checkbox" id="analysis" checked onchange="render()"> Eye overlay</label>
     <span class="info" id="info">No recording loaded</span>
   </div>
 
@@ -2763,24 +2786,24 @@ def _eye_analysis_thread():
         if not fired:
             continue
         cam.frame_event.clear()
-        if not g_analysis_enabled:
-            continue
         with cam.frame_lock:
             jpeg    = cam.latest_frame
             cam_ts  = cam.latest_frame_ts_ms   # camera capture time, synced ms
         if not jpeg:
             continue
+        # Always run engine (PCCR always computed and pushed to calibration).
+        # g_analysis_enabled only controls whether the visual overlay is shown.
         annotated = _apply_pupil_overlay(jpeg, cam.roi, cam_ts_ms=cam_ts)
-        # Cache annotated frame so MJPEG/JPEG handlers can serve it without re-processing
-        with cam.frame_lock:
-            cam.annotated_frame = annotated
-
-        # Patch the most recent rec_buf entry with the annotated eye frame
-        cam_ts_us = int(cam_ts * 1000)
-        if annotated and cam.rec_buf:
-            last = cam.rec_buf[-1]
-            if last[0] == cam_ts_us or abs(last[0] - cam_ts_us) < 50_000:
-                cam.rec_buf[-1] = (last[0], last[1], annotated)
+        if g_analysis_enabled:
+            # Cache annotated frame so MJPEG/JPEG handlers can serve it without re-processing
+            with cam.frame_lock:
+                cam.annotated_frame = annotated
+            # Patch the most recent rec_buf entry with the annotated eye frame
+            cam_ts_us = int(cam_ts * 1000)
+            if annotated and cam.rec_buf:
+                last = cam.rec_buf[-1]
+                if last[0] == cam_ts_us or abs(last[0] - cam_ts_us) < 50_000:
+                    cam.rec_buf[-1] = (last[0], last[1], annotated)
 
         # Store gaze data on the world cam's gaze_buf for annotation at save time
         world_cam = CAMS.get(3 - g_eye_cam)

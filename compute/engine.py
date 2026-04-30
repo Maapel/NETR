@@ -77,6 +77,7 @@ def _save_settings():
     data = _pipe.get_params()
     data["glint_switch_dx"] = _pipe.switch_dx
     data["preferred_side"]  = _pipe.preferred_side
+    data["swap_pccr"]       = _pipe.swap_pccr
     with open(EYE_SETTINGS_PATH, "w") as f:
         json.dump(data, f, indent=2)
 
@@ -85,6 +86,7 @@ with _pipe_lock:
     _pipe.update_params(_boot_settings)
     _pipe.switch_dx    = float(_boot_settings.get("glint_switch_dx", 0.0))
     _pipe.preferred_side = float(_boot_settings.get("preferred_side", 1.0))
+    _pipe.swap_pccr    = bool(_boot_settings.get("swap_pccr", False))
 
 # ── Glint sweep state ─────────────────────────────────────────────────────────
 _sweep_lock    = threading.Lock()
@@ -261,11 +263,21 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("X-Pccr-Ts", f"{ts:.6f}")
             if res and res.pccr_vector:
-                self.send_header("X-Pccr-Dx", f"{res.pccr_vector[0]:.4f}")
-                self.send_header("X-Pccr-Dy", f"{res.pccr_vector[1]:.4f}")
-                self.send_header("X-Pccr-Side", f"{res.pccr_side:.4f}")
+                self.send_header("X-Pccr-Dx",   f"{res.pccr_vector[0]:.4f}")
+                self.send_header("X-Pccr-Dy",   f"{res.pccr_vector[1]:.4f}")
+                self.send_header("X-Pccr-Side",  f"{res.pccr_side:.4f}")
+            if res and res.pupil_center is not None:
+                self.send_header("X-Pupil-Cx",  f"{res.pupil_center[0]:.2f}")
+                self.send_header("X-Pupil-Cy",  f"{res.pupil_center[1]:.2f}")
             if res and res.pupil_radius is not None:
                 self.send_header("X-Pupil-Radius", f"{res.pupil_radius:.2f}")
+            if res and res.glint.limbus_radius is not None:
+                self.send_header("X-Limbus-Radius", f"{res.glint.limbus_radius:.2f}")
+            if res and res.labeled_glints:
+                # compact: "gx,gy,side;gx,gy,side;..."
+                glint_str = ";".join(f"{gx:.1f},{gy:.1f},{s:.0f}"
+                                     for gx, gy, s in res.labeled_glints)
+                self.send_header("X-Labeled-Glints", glint_str)
             self.end_headers()
             self.wfile.write(annotated)
         except BrokenPipeError:
@@ -477,6 +489,18 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_sweep_stop()
         elif self.path == "/set_switch_dx":
             self._handle_set_switch_dx()
+        elif self.path == "/set_swap_pccr":
+            length = int(self.headers.get("Content-Length", 0))
+            body   = self.rfile.read(length) if length > 0 else b""
+            try:
+                val = bool(json.loads(body).get("swap_pccr", False))
+            except (ValueError, json.JSONDecodeError):
+                self._send(400, b'{"error":"bad body"}'); return
+            with _pipe_lock:
+                _pipe.swap_pccr = val
+            _save_settings()
+            print(f"[engine] swap_pccr={val}", flush=True)
+            self._send(200, json.dumps({"ok": True, "swap_pccr": val}).encode())
         else:
             self._send(404, b'{"error":"not found"}')
 

@@ -171,7 +171,7 @@ _sweep_calib_lock = threading.Lock()
 _pending_eye: list[dict] = []   # [{ts, dx, dy, side?}] for the current target
 _pending_target: dict | None = None  # {x, y} of the target being captured
 _pending_lock = threading.Lock()
-FIXATE_MS = 300   # capture window duration (matches JS FIXATE_MS)
+FIXATE_MS = 500   # capture window duration (matches JS FIXATE_MS)
 
 # Saccade: each fixation flushes the *previous* target in a background thread
 # (_flush_pending_target does many HTTP fetches). STOP must wait for them or
@@ -242,6 +242,7 @@ _rec_dir: pathlib.Path | None = None
 _rec_eye_f         = None   # eye.jsonl
 _rec_target_f      = None   # targets.jsonl (legacy mirror of stimulus rows)
 _rec_fixation_f    = None   # fixations.jsonl
+_rec_raw_f         = None   # raw_frames.jsonl — every push_eye frame (full detail)
 _rec_screen_f      = None   # screen_events.jsonl (canonical stimulus log)
 _rec_frame_n       = 0
 _rec_lock          = threading.Lock()
@@ -274,7 +275,7 @@ def _append_screen_event(obj: dict):
 
 
 def _rec_start(screen_w: int, screen_h: int, mode: str):
-    global _recording, _rec_dir, _rec_eye_f, _rec_target_f, _rec_fixation_f, _rec_screen_f
+    global _recording, _rec_dir, _rec_eye_f, _rec_target_f, _rec_fixation_f, _rec_raw_f, _rec_screen_f
     global _rec_frame_n, _rec_world_writer, _rec_eye_writer, _rec_homo_writer
     global _rec_world_ts_f, _rec_eye_ts_f, _rec_homo_ts_f
     ts = time.strftime("%Y%m%d_%H%M%S")
@@ -305,6 +306,7 @@ def _rec_start(screen_w: int, screen_h: int, mode: str):
             "homography_debug_video": "homography_debug.avi",
             "homography_debug_timestamps": "homography_debug_capture_ts_ms.txt",
             "aggregated_fixations": "fixations.jsonl",
+            "raw_eye_frames": "raw_frames.jsonl",
             "training_samples": "samples.json",
         },
         "started_wall": ts,
@@ -315,9 +317,10 @@ def _rec_start(screen_w: int, screen_h: int, mode: str):
     _rec_world_writer = None
     _rec_eye_writer   = None
     _rec_homo_writer  = None
-    _rec_eye_f      = open(d / "eye.jsonl",      "w")
-    _rec_target_f   = open(d / "targets.jsonl",  "w")
-    _rec_fixation_f = open(d / "fixations.jsonl", "w")
+    _rec_eye_f      = open(d / "eye.jsonl",        "w")
+    _rec_target_f   = open(d / "targets.jsonl",    "w")
+    _rec_fixation_f = open(d / "fixations.jsonl",  "w")
+    _rec_raw_f      = open(d / "raw_frames.jsonl", "w")
     _rec_screen_f   = open(d / "screen_events.jsonl", "w")
     _rec_world_ts_f = open(d / "world_raw_capture_ts_ms.txt", "w")
     _rec_eye_ts_f   = open(d / "eye_raw_capture_ts_ms.txt",   "w")
@@ -331,7 +334,7 @@ def _rec_start(screen_w: int, screen_h: int, mode: str):
 
 def _rec_stop() -> str:
     global _recording, _rec_dir
-    global _rec_eye_f, _rec_target_f, _rec_fixation_f, _rec_screen_f
+    global _rec_eye_f, _rec_target_f, _rec_fixation_f, _rec_raw_f, _rec_screen_f
     global _rec_world_writer, _rec_eye_writer, _rec_homo_writer
     global _rec_world_ts_f, _rec_eye_ts_f, _rec_homo_ts_f
     _recording = False
@@ -340,12 +343,12 @@ def _rec_stop() -> str:
             if w: w.release()
         except Exception: pass
     _rec_world_writer = _rec_eye_writer = _rec_homo_writer = None
-    for f in (_rec_eye_f, _rec_target_f, _rec_fixation_f, _rec_screen_f,
+    for f in (_rec_eye_f, _rec_target_f, _rec_fixation_f, _rec_raw_f, _rec_screen_f,
               _rec_world_ts_f, _rec_eye_ts_f, _rec_homo_ts_f):
         try:
             if f: f.close()
         except Exception: pass
-    _rec_eye_f = _rec_target_f = _rec_fixation_f = _rec_screen_f = None
+    _rec_eye_f = _rec_target_f = _rec_fixation_f = _rec_raw_f = _rec_screen_f = None
     _rec_world_ts_f = _rec_eye_ts_f = _rec_homo_ts_f = None
     d = _rec_dir
     path = str(d) if d else ""
@@ -450,8 +453,22 @@ def _flush_pending_target(eyes: list | None = None, target: dict | None = None):
         sx, sy, len(eyes), min(tss), max(tss),
     )
 
+    # Sweep: collect dx/side from raw eye frames immediately — no homography needed.
+    # Must happen before any early-return so sweep data survives homography failures.
+    if target.get("is_sweep"):
+        import numpy as _np_sw
+        raw_dxs   = [e["dx"]                    for e in eyes]
+        raw_sides = [float(e.get("side", 1.0))  for e in eyes]
+        avg_sw_dx   = float(_np_sw.mean(raw_dxs))
+        avg_sw_side = 1.0 if _np_sw.mean(raw_sides) >= 0 else -1.0
+        with _sweep_calib_lock:
+            _sweep_calib_samples.append({"dx": avg_sw_dx, "side": avg_sw_side})
+            n_sw = len(_sweep_calib_samples)
+        print(f"[sweep] point {n_sw}: dx={avg_sw_dx:.2f} side={avg_sw_side:+.0f}", flush=True)
+
     # Build per-sample synced tuples: fetch world frame at each eye timestamp
-    synced: list[tuple] = []   # (dx, dy, side, X, Y, r|nan)
+    synced: list[tuple] = []       # (dx, dy, side, X, Y, r|nan)
+    synced_eye_entries: list[dict] = []  # parallel: original eye entry per synced frame
     # Cache the global homography once as fallback for frames where per-frame
     # ArUco fails (transient occlusion, motion blur).  If it's also None the
     # session never had a valid homography — samples will still be 0.
@@ -483,6 +500,7 @@ def _flush_pending_target(eyes: list | None = None, target: dict | None = None):
         r    = e.get("r", float("nan"))
         side = float(e.get("side", 1.0))
         synced.append((e["dx"], e["dy"], side, float(sc[0]), float(sc[1]), r))
+        synced_eye_entries.append(e)
 
     n_synced = len(synced)
     print(f"[calib] Target ({sx:.0f},{sy:.0f}) n={len(eyes)} synced={n_synced} "
@@ -545,6 +563,36 @@ def _flush_pending_target(eyes: list | None = None, target: dict | None = None):
     avg_X   = float(Xs[mask].mean()  if n_clean >= 2 else Xs.mean())
     avg_Y   = float(Ys[mask].mean()  if n_clean >= 2 else Ys.mean())
 
+    # Extract secondary-glint PCCR from raw eye entries (labeled_glints field).
+    # This allows us to train a dedicated model for each LED side even when the
+    # pipeline always selects the preferred glint as primary.
+    _sec_dxs: list[float] = []
+    _sec_dys: list[float] = []
+    for _e in synced_eye_entries:
+        _glints = _e.get("labeled_glints") or []
+        _pcx = _e.get("pupil_cx")
+        _pcy = _e.get("pupil_cy")
+        if _pcx is None or _pcy is None or len(_glints) < 2:
+            continue
+        _by_side: dict = {float(_g[2]): (_g[0], _g[1]) for _g in _glints}
+        if -1.0 not in _by_side:
+            continue
+        _g2x, _g2y = _by_side[-1.0]
+        # Detect whether engine applied swap_pccr by checking primary glint
+        _use_swap = False
+        if 1.0 in _by_side:
+            _g1x, _g1y = _by_side[1.0]
+            _use_swap = abs(_e["dx"] - (_pcy - _g1y)) < abs(_e["dx"] - (_pcx - _g1x))
+        if _use_swap:
+            _sec_dxs.append(_pcy - _g2y)
+            _sec_dys.append(_pcx - _g2x)
+        else:
+            _sec_dxs.append(_pcx - _g2x)
+            _sec_dys.append(_pcy - _g2y)
+    _sec_mask = _iqr_mask(_np.array(_sec_dxs)) & _iqr_mask(_np.array(_sec_dys)) if len(_sec_dxs) >= 4 else _np.ones(len(_sec_dxs), dtype=bool)
+    avg_sec_dx = float(_np.array(_sec_dxs)[_sec_mask].mean()) if _sec_dxs else None
+    avg_sec_dy = float(_np.array(_sec_dys)[_sec_mask].mean()) if _sec_dys else None
+
     print(f"[calib] Target ({sx:.0f},{sy:.0f}) clean={n_clean} "
           f"dx={avg_dx:.2f}±{dxs.std():.2f} dy={avg_dy:.2f}±{dys.std():.2f} side={avg_side:+.0f} "
           f"X={avg_X:.1f} Y={avg_Y:.1f}")
@@ -552,52 +600,48 @@ def _flush_pending_target(eyes: list | None = None, target: dict | None = None):
     # Record fixation
     if _recording and _rec_fixation_f:
         try:
+            raw_frames_list = []
+            for s, ee in zip(synced, synced_eye_entries):
+                rec = {
+                    "ts": ee.get("ts"),
+                    "dx": s[0], "dy": s[1], "side": s[2],
+                    "world_X": s[3], "world_Y": s[4],
+                    "r": None if _np.isnan(s[5]) else s[5],
+                }
+                for k in ("pupil_cx", "pupil_cy", "limbus_radius", "labeled_glints"):
+                    if k in ee:
+                        rec[k] = ee[k]
+                raw_frames_list.append(rec)
             _rec_fixation_f.write(json.dumps({
                 "ts": eyes[-1]["ts"], "x": sx, "y": sy,
                 "eye": {"dx": avg_dx, "dy": avg_dy, "side": avg_side, "n": n_synced,
+                        "n_clean": n_clean,
                         "dx_std": float(dxs.std()), "dy_std": float(dys.std()),
                         "eye_ts": eyes[-1]["ts"]},
                 "scene": {"X": avg_X, "Y": avg_Y},
+                "raw_frames": raw_frames_list,
             }) + "\n")
             _rec_fixation_f.flush()
         except Exception: pass
 
-    # Sweep phase: collect (dx, side) for switch_dx computation
-    if target.get("is_sweep"):
-        with _sweep_calib_lock:
-            _sweep_calib_samples.append({"dx": avg_dx, "side": avg_side})
-            n_sw = len(_sweep_calib_samples)
-        print(f"[sweep] point {n_sw}: dx={avg_dx:.2f} side={avg_side:+.0f}", flush=True)
-
     # Add to calibration dataset.
-    # When both LED sides are observed in this fixation, emit one sample per
-    # side — doubles training data and preserves per-LED geometry.
+    # Always emit primary-glint sample (avg_side), plus a secondary-side sample
+    # derived from the other LED's glint position in labeled_glints.
+    # Training both models ensures robustness when one LED is occluded.
     new_samples: list[dict] = []
-    synced_clean = [s for s, m in zip(synced, mask) if m]
-    sides_present = set(int(s[2]) for s in synced_clean) if len(synced_clean) >= 2 else {int(avg_side)}
-
-    if len(sides_present) == 2:
-        # Both sides represented — emit one averaged sample per side (from clean frames only)
-        for side_val in (1.0, -1.0):
-            side_frames = [s for s in synced_clean if s[2] == side_val]
-            if len(side_frames) < 2:
-                continue
-            s_dx = float(_np.mean([s[0] for s in side_frames]))
-            s_dy = float(_np.mean([s[1] for s in side_frames]))
-            s_X  = float(_np.mean([s[3] for s in side_frames]))
-            s_Y  = float(_np.mean([s[4] for s in side_frames]))
-            new_samples.append({"dx": s_dx, "dy": s_dy, "side": side_val,
-                                "X": s_X, "Y": s_Y, "sx": sx, "sy": sy})
-            _calib_trace(
-                "flush_pending APPEND per-side sample side=%+.0f n=%d dx=%.3f dy=%.3f",
-                side_val, len(side_frames), s_dx, s_dy,
-            )
-    else:
-        new_samples.append({"dx": avg_dx, "dy": avg_dy, "side": avg_side,
+    new_samples.append({"dx": avg_dx, "dy": avg_dy, "side": avg_side,
+                        "X": avg_X, "Y": avg_Y, "sx": sx, "sy": sy})
+    _calib_trace(
+        "flush_pending APPEND primary sample side=%+.0f clean=%d dx=%.3f dy=%.3f",
+        avg_side, n_clean, avg_dx, avg_dy,
+    )
+    if avg_sec_dx is not None and len(_sec_dxs) >= 2:
+        sec_side = -avg_side  # opposite LED
+        new_samples.append({"dx": avg_sec_dx, "dy": avg_sec_dy, "side": sec_side,
                             "X": avg_X, "Y": avg_Y, "sx": sx, "sy": sy})
         _calib_trace(
-            "flush_pending APPEND sample clean=%d avg dx=%.3f dy=%.3f scene X=%.1f Y=%.1f",
-            n_clean, avg_dx, avg_dy, avg_X, avg_Y,
+            "flush_pending APPEND secondary sample side=%+.0f n=%d dx=%.3f dy=%.3f",
+            sec_side, len(_sec_dxs), avg_sec_dx, avg_sec_dy,
         )
 
     with _saccade_lock:
@@ -1687,7 +1731,7 @@ button.trace-on   { background: #1a1a33; color: #88ccff; border-color: #6699cc; 
   </div>
   <div class="slider-row">
     <label>Capture time (fixate): <span id="fixate-ms-val">300</span> ms</label>
-    <input type="range" id="fixate-ms" min="100" max="1500" value="300" step="50">
+    <input type="range" id="fixate-ms" min="100" max="1500" value="500" step="50">
   </div>
   <div class="slider-row">
     <label>ArUco dictionary: <span id="d-dict">4x4</span></label>
@@ -1800,11 +1844,15 @@ ws.onmessage = e => {
     if (m.model_trained && m.homography) btnLive.disabled = false;
   }
   if (m.type === 'sweep_calibrated') {
-    const note = m.n_samples > 0
-      ? `switch_dx=${m.switch_dx.toFixed(1)} (${m.n_samples} pts)`
-      : 'sweep: no data — check eye pipeline';
-    statusEl.textContent = `Sweep done — ${note} — starting calibration…`;
-    // Kick off main saccade phase
+    if (m.n_samples === 0) {
+      statusEl.textContent = 'Sweep failed — no eye data received. Check eye camera / engine. Press START to retry.';
+      btnStart.disabled = false;
+      return;
+    }
+    const flipNote = m.switch_dx !== 0
+      ? `switch_dx=${m.switch_dx.toFixed(1)}`
+      : `no side flip detected (switch_dx=0, using sign convention)`;
+    statusEl.textContent = `Sweep done — ${flipNote} (${m.n_samples} pts) — starting calibration…`;
     initSaccade();
     return;
   }
@@ -2008,7 +2056,7 @@ function readingPos(t) {
 
 // ── Saccade mode — stratified 9-zone grid, max-distance sequencing ───────────
 let SETTLE_MS = 700;   // eye settling time after jump (ms) — live-tunable via slider
-let FIXATE_MS = 300;   // sample window after gated fixation (ms) — live-tunable via slider
+let FIXATE_MS = 500;   // sample window after gated fixation (ms) — live-tunable via slider
 const ARUCO_POLL_MS = 80;  // /debug poll rate during saccade (homography + IDs)
 
 // 3×3 zone grid — (row, col) for distance math
@@ -2197,16 +2245,31 @@ btnGrid.onclick = () => {
   btnGrid.style.borderColor   = gridMode ? '#44cc44' : '';
 };
 
+function markerExclusionSize() {
+  // Returns the pixel distance from each screen edge that is occupied by a marker
+  // (including quiet zone + a 20px safety margin so dots never overlap the QR).
+  const S = Math.min(W, H) * markerPct / 100;
+  return EDGE_PX + S + 2 * QUIET_PX + 20;
+}
+
+function isOverMarker(x, y) {
+  const excl = markerExclusionSize();
+  const inH  = x < excl || x > W - excl;  // near left or right edge
+  const inV  = y < excl || y > H - excl;  // near top or bottom edge
+  return inH && inV;                        // corner overlap — both axes
+}
+
 function buildGridPoints() {
   const cols = 6, rows = 7;
   const padX = W * 0.10, padY = H * 0.12;
   const pts = [];
   for (let r = 0; r < rows; r++) {
     for (let c = 0; c < cols; c++) {
-      pts.push({
+      const p = {
         x: padX + (W - 2 * padX) * c / (cols - 1),
         y: padY + (H - 2 * padY) * r / (rows - 1),
-      });
+      };
+      if (!isOverMarker(p.x, p.y)) pts.push(p);
     }
   }
   // Shuffle so coverage is less predictable within one pass
@@ -3053,7 +3116,8 @@ class Handler(BaseHTTPRequestHandler):
 
         if self.path == "/push_eye":
             # Receiver pushes PCCR for a single eye frame during the capture window.
-            # Body: {ts, dx, dy, x, y, r?, side?}
+            # Body: {ts, dx, dy, x, y, r?, side?, pupil_cx?, pupil_cy?,
+            #        limbus_radius?, labeled_glints?}
             # ts is the camera's own capture timestamp (synced to laptop clock).
             try:
                 d = json.loads(body)
@@ -3065,6 +3129,12 @@ class Handler(BaseHTTPRequestHandler):
                 }
                 if "r" in d:
                     entry["r"] = float(d["r"])
+                # Rich eye data from engine (when available)
+                for key in ("pupil_cx", "pupil_cy", "limbus_radius"):
+                    if key in d:
+                        entry[key] = float(d[key])
+                if "labeled_glints" in d:
+                    entry["labeled_glints"] = d["labeled_glints"]
                 # Also buffer for display/debug
                 with _eye_lock:
                     _eye_buf.append(entry)
@@ -3078,6 +3148,16 @@ class Handler(BaseHTTPRequestHandler):
                     if _pending_target is not None:
                         _pending_eye.append(entry)
                         appended = True
+                        # Write raw frame to raw_frames.jsonl (full detail)
+                        if _recording and _rec_raw_f:
+                            raw_rec = dict(entry)
+                            raw_rec["screen_x"] = _pending_target.get("x")
+                            raw_rec["screen_y"] = _pending_target.get("y")
+                            try:
+                                _rec_raw_f.write(json.dumps(raw_rec) + "\n")
+                                _rec_raw_f.flush()
+                            except Exception:
+                                pass
                 _trace_record_push_eye(appended)
                 self.send_response(200)
                 self.send_header("Content-Length", "0")
