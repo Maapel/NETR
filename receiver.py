@@ -84,6 +84,24 @@ def _get_text_detector():
         print(f"text_detector unavailable: {_e}")
     return _text_detector
 
+# Line-based gaze snapper (lazy-init)
+_line_snapper      = None
+_line_snapper_lock = threading.Lock()
+
+def _get_line_snapper():
+    global _line_snapper
+    if _line_snapper is not None:
+        return _line_snapper
+    try:
+        import sys as _sys
+        if "compute" not in " ".join(_sys.path):
+            _sys.path.insert(0, ".")
+        from compute.line_snapper import LineSnapper
+        _line_snapper = LineSnapper(scene_w=1280, scene_h=720)
+    except Exception as _e:
+        print(f"line_snapper unavailable: {_e}")
+    return _line_snapper
+
 g_analysis_enabled = False   # toggled via /set?analysis=1|0
 g_debug_view = "original"    # passed through to engine
 g_streams_paused = False     # toggled via /set?pause_streams=1|0 — stops MJPEG pushes
@@ -559,6 +577,7 @@ class MJPEGHandler(BaseHTTPRequestHandler):
         elif path == "/jpeg/2":    self._jpeg(CAMS[2])
         elif path == "/text_lines/1": self._text_lines(CAMS[1])
         elif path == "/text_lines/2": self._text_lines(CAMS[2])
+        elif path == "/gaze_line":    self._gaze_line()
         elif path == "/stats":     self._stats()
         elif path == "/gaze_model_files": self._gaze_model_files()
         elif path == "/settings":  self._get_settings()
@@ -1283,6 +1302,102 @@ class MJPEGHandler(BaseHTTPRequestHandler):
         try: self.wfile.write(body)
         except BrokenPipeError: pass
 
+    # ── /gaze_line  snap gaze to nearest text baseline ────────────────────────
+    def _gaze_line(self):
+        """
+        Run LineSnapper on the current world-cam frame using the latest gaze.
+        Returns JSON with snapped gaze, line index, confidence, WPM, etc.
+        World cam is whichever cam is NOT the eye cam (cam1=eye → world=cam2, else cam1).
+        """
+        world_cam = CAMS[2] if g_eye_cam == 1 else CAMS[1]
+        det = _get_text_detector()
+        snapper = _get_line_snapper()
+
+        result = {
+            "ok": False,
+            "line_idx": None,
+            "line_count": 0,
+            "snap_xy": None,
+            "x_progress": 0.0,
+            "confidence": 0.0,
+            "is_regression": False,
+            "wpm": 0.0,
+            "dwell_ms": 0.0,
+            "raw_gaze_xy": None,
+        }
+
+        if det is None or snapper is None or not _PUPIL_OK:
+            body = json.dumps(result).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            try: self.wfile.write(body)
+            except BrokenPipeError: pass
+            return
+
+        # Get latest gaze from engine
+        eng = _engine_get_result()
+        gaze = None
+        if eng and eng.get("ready") and isinstance(eng.get("gaze"), list):
+            g = eng["gaze"]
+            if len(g) == 2:
+                gaze = (float(g[0]), float(g[1]))
+
+        if gaze is None:
+            body = json.dumps(result).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            try: self.wfile.write(body)
+            except BrokenPipeError: pass
+            return
+
+        # Get tracks from world cam frame
+        tracks = []
+        with world_cam.frame_lock:
+            frame_data = world_cam.latest_frame
+
+        if frame_data:
+            try:
+                buf = np.frombuffer(frame_data, dtype=np.uint8)
+                bgr = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+                if bgr is not None:
+                    det.detect_lines(bgr)
+                    tracks = det._last_debug.get("tracks", [])
+                    # Update snapper scene size in case it changed
+                    H, W = bgr.shape[:2]
+                    snapper.scene_w = W
+                    snapper.scene_h = H
+            except Exception:
+                pass
+
+        ts_ms = time.time() * 1000.0
+        with _line_snapper_lock:
+            snap = snapper.update(tracks, gaze, ts_ms)
+
+        result = {
+            "ok": True,
+            "line_idx": snap.line_idx,
+            "line_count": snap.line_count,
+            "snap_xy": list(snap.snap_xy) if snap.snap_xy else None,
+            "x_progress": snap.x_progress,
+            "confidence": snap.confidence,
+            "is_regression": snap.is_regression,
+            "wpm": round(snap.wpm, 1),
+            "dwell_ms": round(snap.dwell_ms, 1),
+            "raw_gaze_xy": list(snap.raw_gaze_xy),
+        }
+        body = json.dumps(result).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        try: self.wfile.write(body)
+        except BrokenPipeError: pass
+
     # ── /stream/<n>  MJPEG (fallback) ─────────────────────────────────────────
     def _mjpeg(self, cam: CamState):
         self.send_response(200)
@@ -1377,6 +1492,8 @@ class MJPEGHandler(BaseHTTPRequestHandler):
   <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center; font-size:12px; width:100%; justify-content:center">
     <label style="cursor:pointer; user-select:none"><input type="checkbox" id="gaze_overlay_world"> Show gaze on world cam (auto)</label>
     <label style="cursor:pointer; user-select:none"><input type="checkbox" id="text_lines_world"> Show text lines on world cam</label>
+    <label style="cursor:pointer; user-select:none"><input type="checkbox" id="line_snap_world"> Line snap gaze</label>
+    <span id="line_snap_hud" style="color:#8f8;font-size:11px;min-width:180px"></span>
     <span style="color:#888">Model</span>
     <select id="gaze_model_select" style="min-width:220px"></select>
     <button type="button" onclick="applyGazeModel()" style="padding:4px 12px;background:#257;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px">Apply model</button>
@@ -1738,8 +1855,22 @@ const ctx2 = c2.getContext('2d');
 let __lastStats = {};
 const gazeOverlayEl    = document.getElementById('gaze_overlay_world');
 const textLinesEl      = document.getElementById('text_lines_world');
+const lineSnapEl       = document.getElementById('line_snap_world');
+const lineSnapHud      = document.getElementById('line_snap_hud');
 let   _lastTextLines   = null;   // {lines, w, h} cached from last /text_lines fetch
 let   _textLinesFetching = false;
+let   _lastGazeLine    = null;   // cached /gaze_line response
+let   _gazeLineFetching = false;
+
+function _fetchGazeLine() {
+  if (_gazeLineFetching || !lineSnapEl || !lineSnapEl.checked) return;
+  _gazeLineFetching = true;
+  fetch('/gaze_line?t=' + Date.now())
+    .then(r => r.ok ? r.json() : null)
+    .then(j => { if (j && j.ok) _lastGazeLine = j; })
+    .catch(() => {})
+    .finally(() => { _gazeLineFetching = false; });
+}
 
 function _fetchTextLines() {
   if (_textLinesFetching || !textLinesEl || !textLinesEl.checked) return;
@@ -1948,20 +2079,65 @@ function drawGazeOnWorldCanvas() {
   const worldCam = 3 - eye;
   const ctx = worldCam === 1 ? ctx1 : ctx2;
   const cvs = worldCam === 1 ? c1 : c2;
-  let x = +d.gaze_scene[0], y = +d.gaze_scene[1];
   const sw = d.gaze_scene_width, sh = d.gaze_scene_height;
-  if (sw && sh && cvs.width > 0 && cvs.height > 0) {
-    x = x / sw * cvs.width;
-    y = y / sh * cvs.height;
+
+  function scaleXY(gx, gy) {
+    let x = +gx, y = +gy;
+    if (sw && sh && cvs.width > 0 && cvs.height > 0) {
+      x = x / sw * cvs.width;
+      y = y / sh * cvs.height;
+    }
+    return [x, y];
   }
+
+  // Raw gaze (cyan crosshair)
+  const [rx, ry] = scaleXY(d.gaze_scene[0], d.gaze_scene[1]);
   ctx.save();
   ctx.strokeStyle = '#0ff';
   ctx.lineWidth = 2;
   const r = 14;
   ctx.beginPath();
-  ctx.moveTo(x - r, y); ctx.lineTo(x + r, y);
-  ctx.moveTo(x, y - r); ctx.lineTo(x, y + r);
+  ctx.moveTo(rx - r, ry); ctx.lineTo(rx + r, ry);
+  ctx.moveTo(rx, ry - r); ctx.lineTo(rx, ry + r);
   ctx.stroke();
+
+  // Snapped gaze (yellow dot + horizontal rule to raw)
+  const snapOn = lineSnapEl && lineSnapEl.checked && _lastGazeLine && _lastGazeLine.snap_xy;
+  if (snapOn) {
+    const [sx, sy] = scaleXY(_lastGazeLine.snap_xy[0], _lastGazeLine.snap_xy[1]);
+    // Line from raw to snapped
+    ctx.strokeStyle = 'rgba(255,220,0,0.5)';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([3, 3]);
+    ctx.beginPath(); ctx.moveTo(rx, ry); ctx.lineTo(sx, sy); ctx.stroke();
+    ctx.setLineDash([]);
+    // Snapped crosshair (yellow)
+    ctx.strokeStyle = '#ff0';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(sx - r, sy); ctx.lineTo(sx + r, sy);
+    ctx.moveTo(sx, sy - r); ctx.lineTo(sx, sy + r);
+    ctx.stroke();
+    // Progress bar along baseline
+    const prog = _lastGazeLine.x_progress || 0;
+    const barW = cvs.width * 0.6;
+    const barX = cvs.width * 0.2;
+    const barY = sy + 14;
+    ctx.strokeStyle = 'rgba(255,255,0,0.3)';
+    ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.moveTo(barX, barY); ctx.lineTo(barX + barW, barY); ctx.stroke();
+    ctx.strokeStyle = '#ff0';
+    ctx.beginPath(); ctx.moveTo(barX, barY); ctx.lineTo(barX + barW * prog, barY); ctx.stroke();
+    // HUD text
+    const conf = (_lastGazeLine.confidence * 100).toFixed(0);
+    const wpm  = _lastGazeLine.wpm ? _lastGazeLine.wpm.toFixed(0) + ' WPM' : '';
+    const li   = _lastGazeLine.line_idx !== null ? `L${_lastGazeLine.line_idx + 1}/${_lastGazeLine.line_count}` : '';
+    const reg  = _lastGazeLine.is_regression ? ' ↩' : '';
+    if (lineSnapHud) lineSnapHud.textContent = `${li} conf:${conf}% ${wpm}${reg}`;
+  } else if (lineSnapHud) {
+    lineSnapHud.textContent = '';
+  }
+
   ctx.restore();
 }
 
@@ -1982,6 +2158,7 @@ async function loop() {
       drawTextLinesOnWorldCanvas();
     });
     _fetchTextLines();
+    _fetchGazeLine();
   } catch (_) {}
 
   const elapsed = performance.now() - start;
