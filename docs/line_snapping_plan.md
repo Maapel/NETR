@@ -1,300 +1,197 @@
-# Text Line Detection → Gaze Snapping Plan
+# Line-Based Gaze Snapping — Implementation Notes
 
-## Context
-
-The system (IoTitty / Gaze-Augmented Reading System) maps PCCR eye-tracker output
-to a physical book page via homography:
-
-```
-eye cam → pupil-glint vector → homography → world cam (x, y) → nearest text line
-```
-
-`curve_track` already detects curved text line polygons on the world cam frame.
-The gap is the **snapping layer**: given a gaze point in world cam coordinates,
-reliably assign it to a line index and derive reading analytics.
-
-Target metrics from the paper:
-- Line detection accuracy ≥ 85%
-- WPM estimation error ≤ 20%
-- End-to-end latency ≤ 400 ms
+Branch: `feature/gaze-line-snap`  
+Commit: `071c68d`
 
 ---
 
-## What We Have
+## Why
 
-| Component | Location | Output |
-|-----------|----------|--------|
-| `curve_track` detector | `compute/text_detector.py` | List of curved strip polygons + raw track points `[(x,y),…]` per line |
-| `book_mask` | same | Filters polygons outside Canny page quad |
-| `/text_lines/<n>` endpoint | `receiver.py` | JSON `{lines, w, h}` at ≤5 fps (200ms cache) |
-| Gaze point on world cam | `receiver.py` `drawGazeOnWorldCanvas()` | `(gx, gy)` in canvas pixels, from `__lastStats.gaze_scene` |
+Gaze model calibrated at screen distance D_s. Book sits at depth D_b.
+Parallax offset: `Δy ≈ gaze_y × (D_b/D_s − 1)` — zero at image centre, grows with
+eccentricity. Snapping `gaze_y` to the nearest detected text baseline absorbs this
+vertical error without needing ArUco on the book.
 
-The raw **track points** (`_last_debug["tracks"]`) are richer than the polygon output —
-each track is `[(x0,y0), (x1,y1), …]` sampled across vertical strips, giving
-the actual curve of the text baseline. This is the key input for snapping.
+Horizontal error not corrected by snapping — depth affects x similarly, but line
+snapping gives x_progress directly (relative position along the line), which is what
+matters for reading analytics.
 
 ---
 
-## Proposed Architecture
+## Files
 
-```
-world cam frame
-      │
-      ▼
-_detect_lines_curve_track()   ← already runs, 200ms cache
-      │  tracks[]  (raw strip samples + fitted poly coefficients)
-      │  book_quad  (Canny page boundary)
-      ▼
-LineSnapper.update(tracks, book_quad, gaze_xy)
-      │
-      ├─ snap_to_line()       → line_idx, snap_y (expected y on that line at gaze_x)
-      ├─ stability_filter()   → debounced line_idx (hysteresis + dwell)
-      ├─ x_progress()         → 0.0–1.0 position along the line
-      ├─ regression_detect()  → bool
-      └─ wpm_estimate()       → float
-      ▼
-/gaze_line  JSON endpoint   →  JS overlay (highlight current line, show analytics)
-```
+| File | Role |
+|------|------|
+| `compute/line_snapper.py` | `LineSnapper` class — all snapping logic |
+| `receiver.py` | `GET /gaze_line` endpoint + JS overlay |
+
+`compute/text_detector.py` unchanged — existing `_last_debug["tracks"]` output is
+sufficient.
 
 ---
 
-## Implementation Plan
+## LineSnapper (`compute/line_snapper.py`)
 
-### 1. Return track polylines from `/text_lines/<n>`
-
-Currently the endpoint only returns polygon corners. Add the fitted track data:
+### Input
 
 ```python
-# In receiver.py _text_lines handler, extend result:
-result = {
-    "lines": [q.tolist() for q in quads],
-    "tracks": [
-        {"pts": t, "coeff": np.polyfit(...).tolist(), "deg": deg}
-        for t in tracks
-    ],
-    "w": W, "h": H,
-}
+snapper.update(
+    tracks: list[list[tuple[int,int]]],  # curve_track raw strip samples per line
+    gaze_xy: tuple[float, float],        # raw gaze in scene/world cam pixel coords
+    ts_ms: float,                        # current time in milliseconds
+) -> SnapResult
 ```
 
-The JS stores `_lastTextLines.tracks` alongside polygons.
+`tracks` comes from `detector._last_debug["tracks"]` after `detect_lines()`.  
+Each track is `[(x0,y0), (x1,y1), …]` sorted left→right along the text baseline.
+
+### SnapResult fields
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `line_idx` | `int \| None` | 0-based index, sorted top→bottom |
+| `line_count` | `int` | total detected lines this frame |
+| `snap_xy` | `(float, float) \| None` | gaze after vertical snap |
+| `x_progress` | `float` | 0..1 left→right along locked line |
+| `confidence` | `float` | 0..1; drops when gaze far from all lines |
+| `is_regression` | `bool` | True on the frame line_idx decreases |
+| `wpm` | `float` | EMA-smoothed reading speed estimate |
+| `dwell_ms` | `float` | ms spent on current line since lock |
+| `raw_gaze_xy` | `(float, float)` | input before snap |
+
+### Three-layer snapping
+
+**Layer 1 — Spatial**  
+For each track, fit polynomial (degree = min(3, len(track)−1)) and evaluate at
+`gaze_x` → `baseline_y`. Distance = `|gaze_y − baseline_y|`. Nearest track wins.  
+If `gaze_x` is outside a track's x-range, use the closest endpoint y (no rejection —
+gaze can be slightly outside the page).
+
+**Layer 2 — Hysteresis (dwell)**  
+`DWELL_FRAMES = 4`. Gaze must stay near a new line for 4 consecutive frames before
+`locked_line` commits. Prevents jitter at line boundaries.
+
+**Layer 3 — Velocity gate (saccade detection)**  
+`SACCADE_PX_MS = 2.0`. If smoothed gaze moves >2 px/ms between consecutive frames,
+skip the hysteresis update for that frame. Suppresses false line-switches during
+inter-line saccades.
+
+### Gaze smoothing
+
+150ms rolling median window on raw gaze before any snapping.  
+Deque of `(ts_ms, x, y)`, keep entries within `[now − 150ms, now]`.
+
+### Confidence
+
+```python
+conf = 1 / (1 + (nearest_dist / SNAP_CONF_SCALE) ** 2)
+# SNAP_CONF_SCALE = 80px → conf = 0.5 at 80px distance
+```
+
+### WPM estimation
+
+Measures x_progress rate on the locked line:
+
+```python
+words = dx_progress × 10   # assume 10 words per full line width
+wpm_inst = words / dt_minutes
+wpm = 0.15 * wpm_inst + 0.85 * wpm_prev   # EMA
+```
+
+Crude but self-calibrating per session. Assumes roughly uniform word density.
+
+### Tuning knobs (class constants)
+
+| Constant | Default | Effect |
+|----------|---------|--------|
+| `SMOOTH_MS` | 150 | rolling median window |
+| `DWELL_FRAMES` | 4 | frames to commit line switch |
+| `SACCADE_PX_MS` | 2.0 | px/ms saccade threshold |
+| `SNAP_CONF_SCALE` | 80 | px distance for conf=0.5 |
+| `WPM_ALPHA` | 0.15 | EMA smoothing for WPM |
 
 ---
 
-### 2. `LineSnapper` — `compute/line_snapper.py`
+## `/gaze_line` endpoint (`receiver.py`)
 
-```python
-class LineSnapper:
-    def __init__(
-        self,
-        hysteresis_px: float = 8.0,    # must beat current line by this to switch
-        dwell_frames: int = 3,          # frames gaze must stay on new line to commit
-        regression_px: float = 30.0,   # x-drop on same line counts as regression
-        wpm_smoothing: float = 0.15,    # EMA alpha for WPM
-    ): ...
+`GET /gaze_line`
 
-    def update(
-        self,
-        tracks: list[list[tuple[int,int]]],   # raw track points per line
-        gaze_xy: tuple[float, float],
-        frame_ts_ms: float,
-    ) -> dict:
-        """Returns snapping result dict."""
-```
+1. Gets latest gaze from `_engine_get_result()["gaze"]`
+2. Decodes world cam latest frame → `detect_lines(bgr)` → `_last_debug["tracks"]`
+3. Calls `snapper.update(tracks, gaze, ts_ms)` under `_line_snapper_lock`
+4. Returns:
 
-**Core snapping — `_snap_to_line()`:**
-
-For each track, evaluate the fitted polynomial at `gaze_x` → `expected_y`.
-Distance = `|gaze_y - expected_y|`. Guard: only consider lines whose
-x-range contains `gaze_x` (±one strip width tolerance).
-
-```python
-def _curve_y_at(self, track_pts, gaze_x):
-    xs = [p[0] for p in track_pts]
-    ys = [p[1] for p in track_pts]
-    if gaze_x < min(xs) - STRIP_TOL or gaze_x > max(xs) + STRIP_TOL:
-        return None
-    deg = min(2, len(xs) - 1)
-    coeff = np.polyfit(xs, ys, deg)
-    return float(np.polyval(coeff, gaze_x))
-```
-
-**Hysteresis + dwell:**
-
-```
-candidate = argmin(distances)
-if candidate == current_line:
-    reset dwell counter
-elif distances[candidate] < distances[current_line] - hysteresis_px:
-    dwell_counter += 1
-    if dwell_counter >= dwell_frames:
-        commit → current_line = candidate; reset counter
-else:
-    reset dwell counter (gaze didn't stay)
-```
-
-This prevents jitter at line boundaries — the new line must win by a
-margin AND hold for multiple frames before committing.
-
-**x-progress:**
-
-```python
-x_lo = min(p[0] for p in track)
-x_hi = max(p[0] for p in track)
-x_progress = (gaze_x - x_lo) / max(1, x_hi - x_lo)   # 0.0 = line start, 1.0 = end
-```
-
-**Regression detection:**
-
-```python
-if line_idx == prev_line_idx:
-    if gaze_x < prev_gaze_x - regression_px:
-        is_regression = True   # backward jump on same line
-elif line_idx < prev_line_idx:
-    is_regression = True       # jumped up a line
-```
-
-**WPM estimation:**
-
-```python
-# Estimate word count per line from its pixel width
-line_width_px = x_hi - x_lo
-# Average word width ≈ 5 × inter-line gap (peak_min_dist gives approx char height)
-# Tune: ~6 chars/word × char_width_px, or calibrate from known text
-words_per_line = line_width_px / avg_word_width_px
-
-# Track time spent on each line
-line_dwell_ms = current_ts - line_entry_ts
-if line_dwell_ms > 500:   # ignore glances
-    wpm_raw = (words_per_line / line_dwell_ms) * 60_000
-    wpm_smoothed = alpha * wpm_raw + (1-alpha) * wpm_smoothed
-```
-
-`avg_word_width_px` is calibrated once at session start (known inter-line gap
-→ estimate char height → word width ≈ 5 × char_height). Or let user set WPM
-calibration mode (read a known passage).
-
----
-
-### 3. `/gaze_line` endpoint in `receiver.py`
-
-```python
-# Returns:
+```json
 {
-  "line_idx":    2,          # 0-based, top-to-bottom
-  "line_count":  18,         # total detected lines
-  "snap_y":      341,        # expected y of that line at gaze_x (for overlay)
-  "x_progress":  0.42,       # 0–1 left→right on current line
+  "ok": true,
+  "line_idx": 2,
+  "line_count": 14,
+  "snap_xy": [480.0, 341.2],
+  "x_progress": 0.42,
+  "confidence": 0.96,
   "is_regression": false,
-  "wpm":         220.5,
-  "dwell_ms":    1200,       # ms on current line
-  "gaze_xy":     [480, 338], # raw gaze in world cam px
+  "wpm": 218.4,
+  "dwell_ms": 1340.0,
+  "raw_gaze_xy": [481.0, 352.0]
 }
 ```
 
-Runs at world-cam frame rate but the snapper's `update()` call is cheap (<1ms)
-since the heavy detection is already cached.
+`ok: false` if engine gaze unavailable or text detector not loaded.
+
+World cam = `CAMS[2]` when `g_eye_cam == 1`, else `CAMS[1]`.
+
+Note: `detect_lines()` here shares no cache with `/text_lines/<n>` — runs its own
+detection on demand. Latency dominated by `curve_track` (~20–50ms). Could be unified
+with the existing 200ms cache; left as future work.
 
 ---
 
-### 4. JS overlay in `receiver.py`
+## JS overlay
 
-**Highlight current line:**
+Checkbox: **"Line snap gaze"** (`id=line_snap_world`)
 
-```js
-// After drawTextLinesOnWorldCanvas(), add:
-function drawLineHighlight() {
-  if (!__lastGazeLine || !_lastTextLines) return;
-  const idx = __lastGazeLine.line_idx;
-  const poly = _lastTextLines.lines[idx];
-  if (!poly) return;
-  ctx.save();
-  ctx.fillStyle = 'rgba(255, 255, 0, 0.18)';
-  ctx.beginPath();
-  // scale poly to canvas, fill the strip
-  ...
-  ctx.fill();
-  ctx.restore();
-}
-```
-
-**HUD overlay (optional):**
-
-```
-Line 3 / 18   WPM: 223   Progress: ██░░░░  ← regression indicator
-```
-
-**Poll rate:** `/gaze_line` fetched every frame (cheap endpoint, no detection work).
+When checked:
+- `_fetchGazeLine()` called each display loop frame (fire-and-forget, deduped)
+- Raw gaze: **cyan crosshair** (unchanged)
+- Snapped gaze: **yellow crosshair** + dashed yellow line from raw to snapped
+- Progress bar: thin yellow line along `snap_y` height, filled to `x_progress`
+- HUD text (`id=line_snap_hud`): `L3/14 conf:96% 218 WPM ↩` (↩ = regression)
 
 ---
 
-### 5. Calibration hook — `avg_word_width_px`
-
-One-time calibration mode:
-1. User reads a passage of known word count aloud or for a known duration
-2. System records total lines traversed × words_per_line estimate
-3. Fits `avg_word_width_px` to match measured WPM
-
-Stored in `eye_settings.json` alongside existing calibration data.
-
----
-
-## Data Flow Summary
+## Data Flow
 
 ```
-World cam JPEG (every frame)
-  → _detect_lines_curve_track()  [200ms cache]
-      → tracks[], book_quad
-
-Gaze point from PCCR pipeline
-  → /stats → gaze_scene [x, y]
-
-LineSnapper.update(tracks, gaze_xy, ts)
-  → /gaze_line JSON  [every frame, <1ms]
-
-JS:
-  drawBitmap()                 ← world cam frame
-  drawTextLinesOnWorldCanvas() ← yellow line outlines
-  drawLineHighlight()          ← filled highlight on current line
-  drawGazeOnWorldCanvas()      ← crosshair
-  updateReadingHUD()           ← line index, WPM, regression flag
+World cam frame (every display tick)
+      │
+      ▼
+detect_lines(bgr)             → tracks[] (curve_track baselines)
+      │
+Engine latest result          → gaze_xy (scene px)
+      │
+LineSnapper.update()          → SnapResult
+      │
+/gaze_line JSON response
+      │
+JS: drawGazeOnWorldCanvas()   → cyan raw + yellow snapped overlays
+    line_snap_hud              → L3/14 conf:96% 218 WPM
 ```
 
 ---
 
-## Accuracy Improvements Over Naive Centroid Snapping
+## Limitations / Open Issues
 
-| Issue | Naive approach | This plan |
-|-------|---------------|-----------|
-| Curved page | Uses polygon centroid → wrong y on curved lines | Evaluates fitted polynomial at gaze_x → correct y |
-| Jitter at line boundary | Snaps on every frame | Hysteresis + dwell filter |
-| Partial-line gaze | Matches all lines | Guards on x-range before computing distance |
-| Line count drift | Detects on every call | 200ms cache + stability across frames |
-| WPM on dense/sparse text | Fixed word assumption | Width-based estimate, calibratable |
+1. **Horizontal parallax** not corrected. Line snap only fixes vertical.
+   Full correction needs page homography (fit perspective transform from
+   detected line layout → flat grid). Not implemented yet.
 
----
+2. **`/gaze_line` detection not cached** — runs `detect_lines()` every call,
+   separate from the `/text_lines` 200ms cache. Should be unified.
 
-## Files to Create / Modify
+3. **WPM assumes uniform word density.** Dense (small font) vs sparse (large font)
+   lines give wrong estimates. Calibration mode (read known passage) not yet built.
 
-| File | Change |
-|------|--------|
-| `compute/line_snapper.py` | New — `LineSnapper` class |
-| `receiver.py` | Add `/gaze_line` endpoint, instantiate `LineSnapper`, extend `/text_lines` to include track data, add JS overlay |
-| `eye_settings.json` | Add `avg_word_width_px` calibration field |
+4. **Two-page spread with `split_pages=True`**: line indices are interleaved.
+   Snapper needs to filter to the page containing the gaze x before sorting.
 
-No changes needed to `compute/text_detector.py` — existing track output is sufficient.
-
----
-
-## Open Questions
-
-1. **Page homography vs pixel coords**: gaze_scene is in world cam pixel coords —
-   does it need to be corrected for perspective before distance comparison, or is
-   pixel-distance snapping accurate enough given the narrow depth-of-field of a
-   flat book? (Likely fine for flat/near-flat books; revisit for curved pages.)
-
-2. **Multi-column layout**: curve_track on a two-page spread with `split_pages=True`
-   gives interleaved line indices. The snapper needs to know which page (left/right)
-   the gaze is on before indexing.
-
-3. **Line re-reading**: same line visited twice in a session = valid re-read or
-   calibration drift? Needs a session-level state machine.
+5. **Saccade threshold (2 px/ms)** is fixed. Should adapt to per-session noise floor.
