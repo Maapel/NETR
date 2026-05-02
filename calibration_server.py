@@ -987,13 +987,19 @@ def _flush_calib_video_buf():
 
 
 # ── Scene cam poller ──────────────────────────────────────────────────────────
-def _scene_cam_thread():
-    """Periodically grab a frame from the receiver MJPEG stream and update homography."""
-    global _homography, _last_scene_jpeg
-    global _rec_world_writer, _rec_homo_writer
-    global _calib_video_tgt, _calib_video_tgt_id
+# Two-thread design:
+#   _scene_record_thread  — polls receiver at full rate, writes world cam AVI
+#   _scene_aruco_thread   — processes queued frames for ArUco/homography (can be slower)
+# Recording fps = camera fps; ArUco fps = limited by detection speed, independent.
+
+import queue as _queue
+_scene_aruco_q: "_queue.Queue[tuple[np.ndarray, float]]" = _queue.Queue(maxsize=2)
+
+def _scene_record_thread():
+    """High-rate loop: grab world cam frames, write to AVI, enqueue for ArUco."""
+    global _rec_world_writer
     snap_url = f"{RECEIVER_URL}/jpeg/{SCENE_CAM_ID}?raw=1"
-    prev_aruco_count = -1
+    last_ts  = -1.0   # avoid duplicate frames (receiver serves latest until new one arrives)
     while True:
         try:
             capture_ms = time.time() * 1000.0
@@ -1005,111 +1011,138 @@ def _scene_cam_thread():
                     except ValueError:
                         pass
                 data = resp.read()
-            arr = np.frombuffer(data, dtype=np.uint8)
+            if capture_ms == last_ts:
+                # Receiver has no new frame yet — avoid writing duplicate to AVI
+                time.sleep(0.01)
+                continue
+            last_ts = capture_ms
+            arr   = np.frombuffer(data, dtype=np.uint8)
             frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-            if frame is not None:
-                h_px, w_px = frame.shape[:2]
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                mean_brightness = float(gray.mean())
-                detected, all_ids, _corners, _ids_arr = _detect_aruco_corners(frame)
-                # Store annotated frame — pass pre-computed corners to avoid second detection
-                _last_scene_jpeg = _annotate_scene_frame(frame, detected, all_ids,
-                                                          corners=_corners, ids_arr=_ids_arr)
-                n = len(all_ids)
+            if frame is None:
                 with _debug_lock:
-                    _debug["scene_cam_ok"] = True
-                    _debug["scene_cam_error"] = ""
-                    _debug["aruco_detected"] = n
-                    _debug["aruco_ids"] = all_ids
-                    _debug["aruco_expected_met"] = detected is not None
-                    _debug["frame_size"] = [w_px, h_px]
-                    _debug["brightness"] = round(mean_brightness, 1)
-                if n != prev_aruco_count:
-                    print(f"[scene] frame={w_px}×{h_px}  brightness={mean_brightness:.0f}/255"
-                          f"  ArUco: {n} found IDs={all_ids}" +
-                          (f"  MISSING={sorted(set(ARUCO_IDS)-set(all_ids))}" if n < 4 else "  → homography OK"))
-                    prev_aruco_count = n
-                # World cam recording — raw frames + ESP32 capture timestamps
-                if _recording and _rec_dir:
-                    with _rec_lock:
-                        if _rec_world_writer is None:
-                            _h, _w = frame.shape[:2]
-                            _rec_world_writer = cv2.VideoWriter(
-                                str(_rec_dir / "world_cam_raw.avi"),
-                                cv2.VideoWriter_fourcc(*"MJPG"),
-                                20.0, (_w, _h))
-                        _rec_world_writer.write(frame)
-                        if _rec_world_ts_f:
-                            _rec_world_ts_f.write(f"{capture_ms:.3f}\n")
-
-                if detected:
-                    H = _compute_homography(detected)
-                    if H is not None:
-                        with _homography_lock:
-                            _homography = H
-                        with _debug_lock:
-                            _debug["homography_ok"] = True
-                        global _last_homography_debug_jpeg, _last_homography_debug_save_ts
-                        with _pending_lock:
-                            tgt = _pending_target
-                        debug_bgr = _render_homography_debug(frame, H, tgt)
-                        _, _jpg = cv2.imencode(".jpg", debug_bgr,
-                                              [cv2.IMWRITE_JPEG_QUALITY, 90])
-                        _last_homography_debug_jpeg = _jpg.tobytes()
-                        # Accumulate into per-target shutter video (id() for change detection)
-                        with _calib_video_lock:
-                            cur_id = id(tgt) if tgt is not None else -1
-                            if tgt is not None:
-                                if cur_id != _calib_video_tgt_id:
-                                    if _calib_video_buf and _calib_video_tgt:
-                                        _prev = (_calib_video_buf[:], _calib_video_tgt)
-                                        threading.Thread(
-                                            target=_write_calib_video,
-                                            args=_prev, daemon=True).start()
-                                    _calib_video_buf.clear()
-                                    _calib_video_tgt    = tgt
-                                    _calib_video_tgt_id = cur_id
-                                _calib_video_buf.append(debug_bgr.copy())
-                            else:
-                                now = time.time()
-                                if now - _last_homography_debug_save_ts >= 1.0:
-                                    _last_homography_debug_save_ts = now
-                                    fname = HOMOGRAPHY_DEBUG_DIR / f"{time.strftime('%Y%m%d_%H%M%S')}.jpg"
-                                    fname.write_bytes(_last_homography_debug_jpeg)
-                        # Homography debug recording — same capture time as world frame
-                        if _recording and _rec_dir:
-                            with _rec_lock:
-                                if _rec_homo_writer is None:
-                                    _h, _w = debug_bgr.shape[:2]
-                                    _rec_homo_writer = cv2.VideoWriter(
-                                        str(_rec_dir / "homography_debug.avi"),
-                                        cv2.VideoWriter_fourcc(*"MJPG"),
-                                        20.0, (_w, _h))
-                                _rec_homo_writer.write(debug_bgr)
-                                if _rec_homo_ts_f:
-                                    _rec_homo_ts_f.write(f"{capture_ms:.3f}\n")
-                    else:
-                        print("[scene] Waiting for marker positions from browser (resize the window or move slider)…")
-                else:
-                    with _homography_lock:
-                        _homography = None
-                    with _debug_lock:
-                        _debug["homography_ok"] = False
-            else:
-                print(f"[scene] Frame decode failed (empty response from {snap_url})")
-                with _debug_lock:
-                    _debug["scene_cam_ok"] = False
+                    _debug["scene_cam_ok"]    = False
                     _debug["scene_cam_error"] = "frame decode failed"
                     _debug["aruco_expected_met"] = False
+                time.sleep(0.05)
+                continue
+
+            # ── Record raw world cam frame at camera fps ──────────────────────
+            if _recording and _rec_dir:
+                with _rec_lock:
+                    if _rec_world_writer is None:
+                        _h, _w = frame.shape[:2]
+                        _rec_world_writer = cv2.VideoWriter(
+                            str(_rec_dir / "world_cam_raw.avi"),
+                            cv2.VideoWriter_fourcc(*"MJPG"),
+                            20.0, (_w, _h))
+                    _rec_world_writer.write(frame)
+                    if _rec_world_ts_f:
+                        _rec_world_ts_f.write(f"{capture_ms:.3f}\n")
+
+            # Enqueue for ArUco (drop oldest if queue full — ArUco is still busy)
+            try:
+                _scene_aruco_q.put_nowait((frame, capture_ms))
+            except _queue.Full:
+                pass  # ArUco can't keep up; homography update is just delayed
+
         except Exception as e:
-            err = str(e)
             with _debug_lock:
-                _debug["scene_cam_ok"] = False
-                _debug["scene_cam_error"] = err
-                _debug["homography_ok"] = False
+                _debug["scene_cam_ok"]    = False
+                _debug["scene_cam_error"] = str(e)
+                _debug["homography_ok"]   = False
                 _debug["aruco_expected_met"] = False
-            print(f"[scene] Error fetching {snap_url}: {err}")
-        time.sleep(0.05)  # ~20 fps
+            time.sleep(0.1)
+
+
+def _scene_aruco_thread():
+    """Low-rate loop: run ArUco on queued frames, update homography."""
+    global _homography, _last_scene_jpeg
+    global _rec_homo_writer
+    global _calib_video_tgt, _calib_video_tgt_id
+    prev_aruco_count = -1
+    while True:
+        try:
+            frame, capture_ms = _scene_aruco_q.get(timeout=1.0)
+        except _queue.Empty:
+            continue
+        try:
+            h_px, w_px = frame.shape[:2]
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            mean_brightness = float(gray.mean())
+            detected, all_ids, _corners, _ids_arr = _detect_aruco_corners(frame)
+            # Store annotated frame — pass pre-computed corners to avoid second detection
+            _last_scene_jpeg = _annotate_scene_frame(frame, detected, all_ids,
+                                                      corners=_corners, ids_arr=_ids_arr)
+            n = len(all_ids)
+            with _debug_lock:
+                _debug["scene_cam_ok"]        = True
+                _debug["scene_cam_error"]     = ""
+                _debug["aruco_detected"]      = n
+                _debug["aruco_ids"]           = all_ids
+                _debug["aruco_expected_met"]  = detected is not None
+                _debug["frame_size"]          = [w_px, h_px]
+                _debug["brightness"]          = round(mean_brightness, 1)
+            if n != prev_aruco_count:
+                print(f"[scene] frame={w_px}×{h_px}  brightness={mean_brightness:.0f}/255"
+                      f"  ArUco: {n} found IDs={all_ids}" +
+                      (f"  MISSING={sorted(set(ARUCO_IDS)-set(all_ids))}" if n < 4 else "  → homography OK"))
+                prev_aruco_count = n
+
+            if detected:
+                H = _compute_homography(detected)
+                if H is not None:
+                    with _homography_lock:
+                        _homography = H
+                    with _debug_lock:
+                        _debug["homography_ok"] = True
+                    global _last_homography_debug_jpeg, _last_homography_debug_save_ts
+                    with _pending_lock:
+                        tgt = _pending_target
+                    debug_bgr = _render_homography_debug(frame, H, tgt)
+                    _, _jpg = cv2.imencode(".jpg", debug_bgr,
+                                          [cv2.IMWRITE_JPEG_QUALITY, 90])
+                    _last_homography_debug_jpeg = _jpg.tobytes()
+                    # Accumulate into per-target shutter video
+                    with _calib_video_lock:
+                        cur_id = id(tgt) if tgt is not None else -1
+                        if tgt is not None:
+                            if cur_id != _calib_video_tgt_id:
+                                if _calib_video_buf and _calib_video_tgt:
+                                    _prev = (_calib_video_buf[:], _calib_video_tgt)
+                                    threading.Thread(
+                                        target=_write_calib_video,
+                                        args=_prev, daemon=True).start()
+                                _calib_video_buf.clear()
+                                _calib_video_tgt    = tgt
+                                _calib_video_tgt_id = cur_id
+                            _calib_video_buf.append(debug_bgr.copy())
+                        else:
+                            now = time.time()
+                            if now - _last_homography_debug_save_ts >= 1.0:
+                                _last_homography_debug_save_ts = now
+                                fname = HOMOGRAPHY_DEBUG_DIR / f"{time.strftime('%Y%m%d_%H%M%S')}.jpg"
+                                fname.write_bytes(_last_homography_debug_jpeg)
+                    # Homography debug recording — same capture time as world frame
+                    if _recording and _rec_dir:
+                        with _rec_lock:
+                            if _rec_homo_writer is None:
+                                _h, _w = debug_bgr.shape[:2]
+                                _rec_homo_writer = cv2.VideoWriter(
+                                    str(_rec_dir / "homography_debug.avi"),
+                                    cv2.VideoWriter_fourcc(*"MJPG"),
+                                    20.0, (_w, _h))
+                            _rec_homo_writer.write(debug_bgr)
+                            if _rec_homo_ts_f:
+                                _rec_homo_ts_f.write(f"{capture_ms:.3f}\n")
+                else:
+                    print("[scene] Waiting for marker positions from browser (resize the window or move slider)…")
+            else:
+                with _homography_lock:
+                    _homography = None
+                with _debug_lock:
+                    _debug["homography_ok"] = False
+        except Exception as e:
+            print(f"[scene] ArUco error: {e}")
 
 # ── Eye cam poller (receiver /jpeg — annotated preview + raw session video) ─
 def _eye_cam_thread():
@@ -3218,7 +3251,8 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 
 def main():
-    threading.Thread(target=_scene_cam_thread, daemon=True).start()
+    threading.Thread(target=_scene_record_thread, daemon=True).start()
+    threading.Thread(target=_scene_aruco_thread,  daemon=True).start()
     threading.Thread(target=_eye_cam_thread,   daemon=True).start()
     threading.Thread(target=_eye_poll_thread,  daemon=True).start()
 
