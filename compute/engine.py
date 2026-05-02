@@ -33,7 +33,7 @@ import cv2
 import numpy as np
 
 from eye_pipeline import EyePipeline, EyeResult
-from gaze_model import GazeModel, DualGazeModel
+from gaze_model import GazeModel, DualGazeModel, TwoGlintGazeModel
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 _DIR = pathlib.Path(__file__).parent
@@ -94,8 +94,11 @@ _sweep_samples: list[dict] = []   # {"dx": float, "glint_offset": float}
 _sweep_active  = False
 
 # ── Gaze model ────────────────────────────────────────────────────────────────
-_gaze_model = DualGazeModel()
-_gaze_model.load(GAZE_MODEL_PATH)
+# Try TwoGlintGazeModel first; fall back to DualGazeModel for legacy files.
+_gaze_model: TwoGlintGazeModel | DualGazeModel = TwoGlintGazeModel()
+if not _gaze_model.load(GAZE_MODEL_PATH):
+    _gaze_model = DualGazeModel()
+    _gaze_model.load(GAZE_MODEL_PATH)
 
 # ── Latest result ─────────────────────────────────────────────────────────────
 _latest_lock   = threading.Lock()
@@ -122,11 +125,17 @@ def _process(jpeg: bytes) -> bytes:
     with _pipe_lock:
         result = _pipe.process(gray)
 
-    # Gaze mapping
+    # Gaze mapping — use dual-glint PCCR when available
     gaze = None
     if result.pccr_vector and _gaze_model.trained:
         try:
-            gaze = _gaze_model.predict(*result.pccr_vector, result.pccr_side)
+            if isinstance(_gaze_model, TwoGlintGazeModel) and result.pccr2_vector is not None:
+                gaze = _gaze_model.predict(
+                    result.pccr_vector[0], result.pccr_vector[1], result.pccr_side,
+                    dx2=result.pccr2_vector[0], dy2=result.pccr2_vector[1],
+                )
+            else:
+                gaze = _gaze_model.predict(*result.pccr_vector, result.pccr_side)
         except Exception:
             pass
 
@@ -266,6 +275,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("X-Pccr-Dx",   f"{res.pccr_vector[0]:.4f}")
                 self.send_header("X-Pccr-Dy",   f"{res.pccr_vector[1]:.4f}")
                 self.send_header("X-Pccr-Side",  f"{res.pccr_side:.4f}")
+            if res and res.pccr2_vector:
+                self.send_header("X-Pccr2-Dx",  f"{res.pccr2_vector[0]:.4f}")
+                self.send_header("X-Pccr2-Dy",  f"{res.pccr2_vector[1]:.4f}")
             if res and res.pupil_center is not None:
                 self.send_header("X-Pupil-Cx",  f"{res.pupil_center[0]:.2f}")
                 self.send_header("X-Pupil-Cy",  f"{res.pupil_center[1]:.2f}")
@@ -392,7 +404,17 @@ class Handler(BaseHTTPRequestHandler):
         if target is None:
             self._send(400, json.dumps({"ok": False, "error": "path outside project root"}).encode())
             return
-        ok = _gaze_model.load(target)
+        # Try TwoGlintGazeModel first, fall back to DualGazeModel for legacy files.
+        global _gaze_model
+        m = TwoGlintGazeModel()
+        if m.load(target):
+            _gaze_model = m
+            ok = True
+        else:
+            m2 = DualGazeModel()
+            ok = m2.load(target)
+            if ok:
+                _gaze_model = m2
         self._send(200, json.dumps({"ok": ok, "path": str(target)}).encode())
 
     # ── GET /glint_sweep/status ───────────────────────────────────────────────

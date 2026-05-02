@@ -91,9 +91,10 @@ g_calib_trace = False        # toggled via /set?calib_trace=1|0 — verbose cali
 
 import rig_config as _rig_cfg
 g_eye_cam = _rig_cfg.eye_cam()   # which cam runs the eye pipeline
-g_latest_pccr: tuple[float, float] | None = None  # cached from engine /result
+g_latest_pccr: tuple[float, float] | None = None   # cached from engine /result
 g_latest_pccr_side: float = 0.0
-g_latest_pccr_ts: float = 0.0                    # time.time()*1000 of last PCCR
+g_latest_pccr_ts: float = 0.0                     # time.time()*1000 of last PCCR
+g_latest_pccr2: tuple[float, float] | None = None  # secondary LED PCCR (other side)
 
 # Calibration capture window — set by calibration server via POST /calib_window
 # {x, y, from_ms, until_ms} or None when not capturing
@@ -163,6 +164,8 @@ def _engine_push(jpeg: bytes) -> tuple:
             cy_h      = hdrs.get("X-Pupil-Cy")
             limbus_h  = hdrs.get("X-Limbus-Radius")
             glints_h  = hdrs.get("X-Labeled-Glints")
+            dx2_h     = hdrs.get("X-Pccr2-Dx")
+            dy2_h     = hdrs.get("X-Pccr2-Dy")
             pccr      = (float(dx_h), float(dy_h)) if dx_h and dy_h else None
             ts_ms     = float(ts_h) * 1000 if ts_h else time.time() * 1000
             radius    = float(rad_h) if rad_h else None
@@ -182,6 +185,8 @@ def _engine_push(jpeg: bytes) -> tuple:
                     except ValueError:
                         pass
                 extra["labeled_glints"] = parsed
+            if dx2_h and dy2_h:
+                extra["pccr2"] = (float(dx2_h), float(dy2_h))
             return r.read(), pccr, ts_ms, radius, pccr_side, extra
     except Exception:
         return None, None, time.time() * 1000, None, 0.0, {}
@@ -310,7 +315,7 @@ def _apply_pupil_overlay(data: bytes, roi: list[float] = None,
     cam_ts_ms: camera capture timestamp (synced, ms). When provided, used as the
     authoritative timestamp for calibration sync — more accurate than engine processing time.
     If a calibration capture window is active, pushes PCCR to calibration server."""
-    global g_latest_pccr, g_latest_pccr_side, g_latest_pccr_ts
+    global g_latest_pccr, g_latest_pccr_side, g_latest_pccr_ts, g_latest_pccr2
     if not data:
         return data
 
@@ -338,9 +343,10 @@ def _apply_pupil_overlay(data: bytes, roi: list[float] = None,
 
     if pccr is not None:
         global _calib_win_miss_ctr, _calib_win_hit_ctr
-        g_latest_pccr     = pccr
+        g_latest_pccr      = pccr
         g_latest_pccr_side = pccr_side
-        g_latest_pccr_ts  = ts_ms
+        g_latest_pccr_ts   = ts_ms
+        g_latest_pccr2     = eye_extra.get("pccr2")
         # Push to calibration server if within the active capture window
         with g_calib_lock:
             win = g_calib_window
@@ -681,6 +687,7 @@ class MJPEGHandler(BaseHTTPRequestHandler):
             "pccr_vector": list(g_latest_pccr) if g_latest_pccr else None,
             "pccr_ts_ms": round(g_latest_pccr_ts, 3) if g_latest_pccr else None,
             "pccr_side": g_latest_pccr_side if g_latest_pccr else None,
+            "pccr2_vector": list(g_latest_pccr2) if g_latest_pccr2 else None,
             "eye_cam": g_eye_cam,
             "streams_paused": g_streams_paused,
             "analysis_enabled": g_analysis_enabled,

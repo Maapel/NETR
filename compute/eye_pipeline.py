@@ -22,6 +22,8 @@ class EyeResult:
     glint_pos: tuple[int, int] | None = None
     pccr_vector: tuple[float, float] | None = None
     pccr_side: float = 0.0
+    # Secondary LED PCCR — set when both LED glints detected, None otherwise.
+    pccr2_vector: tuple[float, float] | None = None
     # labeled_glints: list of (gx, gy, side) for all detected glints this frame
     # side ∈ {-1, +1} — derived from switch_dx calibration or sign(gx - pupil_cx)
     labeled_glints: list[tuple[float, float, float]] = field(default_factory=list)
@@ -100,6 +102,7 @@ class EyePipeline:
         )
 
         pccr = None
+        pccr2 = None
         pccr_side = 0.0
         glint_pos = None
         labeled: list[tuple[float, float, float]] = []
@@ -120,6 +123,16 @@ class EyePipeline:
             if len(sides_seen) == 2:
                 preferred = [(gx, gy) for gx, gy, s in labeled if s == self.preferred_side]
                 gx, gy = preferred[0] if preferred else (gr.primary[0], gr.primary[1])
+                # Compute secondary PCCR from the other LED glint
+                sec_side = -self.preferred_side
+                sec = [(gx2, gy2) for gx2, gy2, s in labeled if s == sec_side]
+                if sec:
+                    sgx, sgy = sec[0]
+                    s_raw_dx = pcx - sgx; s_raw_dy = pcy - sgy
+                    if self.swap_pccr:
+                        pccr2 = (float(s_raw_dy), float(s_raw_dx))
+                    else:
+                        pccr2 = (float(s_raw_dx), float(s_raw_dy))
             else:
                 gx, gy = gr.primary
 
@@ -144,6 +157,7 @@ class EyePipeline:
             glint_pos=glint_pos,
             pccr_vector=pccr,
             pccr_side=pccr_side,
+            pccr2_vector=pccr2,
             labeled_glints=labeled,
             intermediate_frames=intermediate,
         )

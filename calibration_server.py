@@ -32,7 +32,7 @@ from socketserver import ThreadingMixIn
 import cv2
 import numpy as np
 
-from gaze_model import GazeModel, DualGazeModel
+from gaze_model import GazeModel, DualGazeModel, TwoGlintGazeModel
 
 # ── Rig config ────────────────────────────────────────────────────────────────
 import sys as _sys
@@ -222,8 +222,8 @@ def _wait_async_flushes(timeout_s: float = 120.0):
             _flush_inflight_cv.wait(timeout=remaining)
         _calib_trace("wait_async_flushes: done inflight=%d", _flush_inflight)
 
-_model = DualGazeModel()                      # scene-space model (saved to disk)
-_screen_model = DualGazeModel()               # screen-space model (for live cursor)
+_model = TwoGlintGazeModel()                   # scene-space model (saved to disk)
+_screen_model = TwoGlintGazeModel()           # screen-space model (for live cursor)
 SCREEN_MODEL_PATH = pathlib.Path(__file__).parent / "screen_model.json"
 _model_ok = _model.load(MODEL_PATH)
 _screen_ok = _screen_model.load(SCREEN_MODEL_PATH)
@@ -483,7 +483,7 @@ def _flush_pending_target(eyes: list | None = None, target: dict | None = None):
             miss_no_frame += 1
             H_use = cached_H   # frame gone from buffer — use cached homography
         else:
-            detected, _ = _detect_aruco_corners(frame)
+            detected, _, _corners, _ids_arr = _detect_aruco_corners(frame)
             if not detected:
                 miss_no_aruco += 1
                 H_use = cached_H
@@ -625,24 +625,26 @@ def _flush_pending_target(eyes: list | None = None, target: dict | None = None):
         except Exception: pass
 
     # Add to calibration dataset.
-    # Always emit primary-glint sample (avg_side), plus a secondary-side sample
-    # derived from the other LED's glint position in labeled_glints.
-    # Training both models ensures robustness when one LED is occluded.
+    # Primary sample includes both LED PCCR vectors (dx1/dy1 = right LED, dx2/dy2 = left LED)
+    # when both glints were detected — enables TwoGlintGazeModel training.
+    # dx/dy/side remain as the preferred-side PCCR for DualGazeModel fallback compatibility.
     new_samples: list[dict] = []
-    new_samples.append({"dx": avg_dx, "dy": avg_dy, "side": avg_side,
-                        "X": avg_X, "Y": avg_Y, "sx": sx, "sy": sy})
+    primary = {"dx": avg_dx, "dy": avg_dy, "side": avg_side,
+               "X": avg_X, "Y": avg_Y, "sx": sx, "sy": sy}
+    has_secondary = avg_sec_dx is not None and len(_sec_dxs) >= 2
+    if has_secondary:
+        # Assign dx1/dy1 = right LED (+1), dx2/dy2 = left LED (-1)
+        if avg_side >= 0:
+            primary["dx1"] = avg_dx;     primary["dy1"] = avg_dy
+            primary["dx2"] = avg_sec_dx; primary["dy2"] = avg_sec_dy
+        else:
+            primary["dx1"] = avg_sec_dx; primary["dy1"] = avg_sec_dy
+            primary["dx2"] = avg_dx;     primary["dy2"] = avg_sec_dy
+    new_samples.append(primary)
     _calib_trace(
-        "flush_pending APPEND primary sample side=%+.0f clean=%d dx=%.3f dy=%.3f",
-        avg_side, n_clean, avg_dx, avg_dy,
+        "flush_pending APPEND sample side=%+.0f clean=%d dx=%.3f dy=%.3f two_glint=%s",
+        avg_side, n_clean, avg_dx, avg_dy, str(has_secondary),
     )
-    if avg_sec_dx is not None and len(_sec_dxs) >= 2:
-        sec_side = -avg_side  # opposite LED
-        new_samples.append({"dx": avg_sec_dx, "dy": avg_sec_dy, "side": sec_side,
-                            "X": avg_X, "Y": avg_Y, "sx": sx, "sy": sy})
-        _calib_trace(
-            "flush_pending APPEND secondary sample side=%+.0f n=%d dx=%.3f dy=%.3f",
-            sec_side, len(_sec_dxs), avg_sec_dx, avg_sec_dy,
-        )
 
     with _saccade_lock:
         _saccade_samples.extend(new_samples)
@@ -664,10 +666,22 @@ def _refit_models():
     if len(samples) < 6:
         return None
     try:
-        diag = _model.fit(samples)
-        _screen_model.fit([{"dx": s["dx"], "dy": s["dy"],
-                            "side": float(s.get("side", 1.0)),
-                            "X": s["sx"], "Y": s["sy"]} for s in samples])
+        screen_samples = [{"dx": s["dx"], "dy": s["dy"],
+                           "side": float(s.get("side", 1.0)),
+                           "X": s["sx"], "Y": s["sy"],
+                           **({k: s[k] for k in ("dx1","dy1","dx2","dy2") if k in s})}
+                          for s in samples]
+        # Try TwoGlintGazeModel first; fall back to DualGazeModel if too few two-glint samples.
+        n_two = sum(1 for s in samples if "dx1" in s and "dx2" in s)
+        if n_two >= TwoGlintGazeModel.MIN_SAMPLES:
+            diag = _model.fit(samples)
+            _screen_model.fit(screen_samples)
+        else:
+            fallback_m = DualGazeModel(); fallback_s = DualGazeModel()
+            diag = fallback_m.fit(samples)
+            fallback_s.fit(screen_samples)
+            fallback_m.save(MODEL_PATH); fallback_s.save(SCREEN_MODEL_PATH)
+            return diag
         _model.save(MODEL_PATH)
         _screen_model.save(SCREEN_MODEL_PATH)
         return diag
@@ -766,37 +780,52 @@ _screen_markers_lock = threading.Lock()
 
 _clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
 
-def _detect_aruco_corners(frame_bgr: np.ndarray) -> tuple[dict[int, np.ndarray] | None, list[int]]:
+def _detect_aruco_corners(frame_bgr: np.ndarray) -> tuple[dict[int, np.ndarray] | None, list[int], list, "np.ndarray | None"]:
     """Detect ArUco markers. Returns (dict id->center, list of all found ids). dict is None if <4 required found."""
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
     gray = _clahe.apply(gray)   # boost contrast before detection (handles dark/low-exposure frames)
+    # Downscale to 640x360 for detection — 7× faster, markers are large enough.
+    h0, w0 = gray.shape[:2]
+    scale = 640 / w0
+    if scale < 1.0:
+        small = cv2.resize(gray, (int(w0 * scale), int(h0 * scale)))
+    else:
+        small = gray; scale = 1.0
     with _aruco_lock:
         det = _aruco_detector
-    corners, ids, _ = det.detectMarkers(gray)
+    corners_small, ids, _ = det.detectMarkers(small)
     all_ids = ids.flatten().tolist() if ids is not None else []
     if ids is None or len(ids) < 4:
-        return None, all_ids
+        return None, all_ids, [], None
+    # Scale corners back to full-res coordinates
+    corners = [c / scale for c in corners_small]
     result = {}
     for i, mid in enumerate(ids.flatten()):
         if mid in ARUCO_IDS:
             c = corners[i][0]
             result[int(mid)] = c.mean(axis=0)
     if len(result) < 4:
-        return None, all_ids
-    return result, all_ids
+        return None, all_ids, corners, ids
+    return result, all_ids, corners, ids
 
 
-def _annotate_scene_frame(frame_bgr: np.ndarray, detected: dict | None, all_ids: list[int]) -> bytes:
-    """Draw ArUco detection results onto frame, return JPEG bytes."""
+def _annotate_scene_frame(frame_bgr: np.ndarray, detected: dict | None, all_ids: list[int],
+                          corners=None, ids_arr=None) -> bytes:
+    """Draw ArUco detection results onto frame, return JPEG bytes.
+    Pass corners/ids_arr from _detect_aruco_corners to skip second detection.
+    """
     out = frame_bgr.copy()
     h, w = out.shape[:2]
-    # Draw all detected markers
-    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-    with _aruco_lock:
-        det = _aruco_detector
-    corners, ids, _ = det.detectMarkers(gray)
-    if ids is not None:
-        cv2.aruco.drawDetectedMarkers(out, corners, ids)
+    # Draw detected markers — use pre-computed corners when available
+    if corners is not None and ids_arr is not None:
+        cv2.aruco.drawDetectedMarkers(out, corners, ids_arr)
+    elif all_ids:
+        gray2 = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        with _aruco_lock:
+            det = _aruco_detector
+        corners2, ids2, _ = det.detectMarkers(gray2)
+        if ids2 is not None:
+            cv2.aruco.drawDetectedMarkers(out, corners2, ids2)
     # Status overlay
     status_color = (0, 220, 0) if detected else (0, 80, 255)
     status_text  = f"ArUco: {len(all_ids)} found  IDs={all_ids}" if all_ids else "ArUco: none detected"
@@ -982,9 +1011,10 @@ def _scene_cam_thread():
                 h_px, w_px = frame.shape[:2]
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 mean_brightness = float(gray.mean())
-                detected, all_ids = _detect_aruco_corners(frame)
-                # Store annotated frame for /scene_frame endpoint
-                _last_scene_jpeg = _annotate_scene_frame(frame, detected, all_ids)
+                detected, all_ids, _corners, _ids_arr = _detect_aruco_corners(frame)
+                # Store annotated frame — pass pre-computed corners to avoid second detection
+                _last_scene_jpeg = _annotate_scene_frame(frame, detected, all_ids,
+                                                          corners=_corners, ids_arr=_ids_arr)
                 n = len(all_ids)
                 with _debug_lock:
                     _debug["scene_cam_ok"] = True
@@ -2869,15 +2899,25 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/model":
             # Return current model coefficients (fallback polynomial)
             if _model.trained:
-                fb = _model.fallback
-                body = json.dumps({
-                    "trained": True, "type": "dual",
-                    "pos_ok": _model.model_pos.trained,
-                    "neg_ok": _model.model_neg.trained,
-                    "n_terms": 6,
-                    "A": fb.A.tolist() if fb.trained else None,
-                    "B": fb.B.tolist() if fb.trained else None,
-                }).encode()
+                if isinstance(_model, TwoGlintGazeModel):
+                    body = json.dumps({
+                        "trained": True, "type": "two_glint",
+                        "pos_ok": _model.fallback_pos.trained,
+                        "neg_ok": _model.fallback_neg.trained,
+                        "n_terms": 11,
+                        "A": _model.A.tolist() if _model.A is not None else None,
+                        "B": _model.B.tolist() if _model.B is not None else None,
+                    }).encode()
+                else:
+                    fb = _model.fallback
+                    body = json.dumps({
+                        "trained": True, "type": "dual",
+                        "pos_ok": _model.model_pos.trained,
+                        "neg_ok": _model.model_neg.trained,
+                        "n_terms": 6,
+                        "A": fb.A.tolist() if fb.trained else None,
+                        "B": fb.B.tolist() if fb.trained else None,
+                    }).encode()
             else:
                 body = json.dumps({"trained": False}).encode()
             self.send_response(200)
@@ -3018,17 +3058,19 @@ class Handler(BaseHTTPRequestHandler):
                 with urllib.request.urlopen(f"{RECEIVER_URL}/stats", timeout=1) as r:
                     d = json.loads(r.read())
                 vec = d.get("pccr_vector")
+                vec2 = d.get("pccr2_vector")
                 sd = float(d.get("pccr_side") or 1.0)
                 if sd == 0.0:
                     sd = 1.0
+                kw2 = {"dx2": vec2[0], "dy2": vec2[1]} if vec2 else {}
                 if not vec:
                     body = json.dumps({"ok": False, "reason": "no pccr vector"}).encode()
                 elif _screen_model.trained:
-                    sx, sy = _screen_model.predict(vec[0], vec[1], sd)
+                    sx, sy = _screen_model.predict(vec[0], vec[1], sd, **kw2)
                     body = json.dumps({"ok": True, "x": sx, "y": sy,
                                        "dx": vec[0], "dy": vec[1], "side": sd}).encode()
                 else:
-                    scene_x, scene_y = _model.predict(vec[0], vec[1], sd)
+                    scene_x, scene_y = _model.predict(vec[0], vec[1], sd, **kw2)
                     with _homography_lock:
                         H = _homography
                     if H is None:
