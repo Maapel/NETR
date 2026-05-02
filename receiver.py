@@ -1318,10 +1318,9 @@ class MJPEGHandler(BaseHTTPRequestHandler):
             "line_idx": None,
             "line_count": 0,
             "snap_xy": None,
-            "x_progress": 0.0,
             "confidence": 0.0,
+            "is_new_line": False,
             "is_regression": False,
-            "wpm": 0.0,
             "dwell_ms": 0.0,
             "raw_gaze_xy": None,
         }
@@ -1382,10 +1381,9 @@ class MJPEGHandler(BaseHTTPRequestHandler):
             "line_idx": snap.line_idx,
             "line_count": snap.line_count,
             "snap_xy": list(snap.snap_xy) if snap.snap_xy else None,
-            "x_progress": snap.x_progress,
             "confidence": snap.confidence,
+            "is_new_line": snap.is_new_line,
             "is_regression": snap.is_regression,
-            "wpm": round(snap.wpm, 1),
             "dwell_ms": round(snap.dwell_ms, 1),
             "raw_gaze_xy": list(snap.raw_gaze_xy),
         }
@@ -2105,35 +2103,25 @@ function drawGazeOnWorldCanvas() {
   const snapOn = lineSnapEl && lineSnapEl.checked && _lastGazeLine && _lastGazeLine.snap_xy;
   if (snapOn) {
     const [sx, sy] = scaleXY(_lastGazeLine.snap_xy[0], _lastGazeLine.snap_xy[1]);
-    // Line from raw to snapped
+    // Dashed line from raw to snapped
     ctx.strokeStyle = 'rgba(255,220,0,0.5)';
     ctx.lineWidth = 1;
     ctx.setLineDash([3, 3]);
     ctx.beginPath(); ctx.moveTo(rx, ry); ctx.lineTo(sx, sy); ctx.stroke();
     ctx.setLineDash([]);
     // Snapped crosshair (yellow)
-    ctx.strokeStyle = '#ff0';
+    ctx.strokeStyle = _lastGazeLine.is_regression ? '#f80' : '#ff0';
     ctx.lineWidth = 2;
     ctx.beginPath();
     ctx.moveTo(sx - r, sy); ctx.lineTo(sx + r, sy);
     ctx.moveTo(sx, sy - r); ctx.lineTo(sx, sy + r);
     ctx.stroke();
-    // Progress bar along baseline
-    const prog = _lastGazeLine.x_progress || 0;
-    const barW = cvs.width * 0.6;
-    const barX = cvs.width * 0.2;
-    const barY = sy + 14;
-    ctx.strokeStyle = 'rgba(255,255,0,0.3)';
-    ctx.lineWidth = 3;
-    ctx.beginPath(); ctx.moveTo(barX, barY); ctx.lineTo(barX + barW, barY); ctx.stroke();
-    ctx.strokeStyle = '#ff0';
-    ctx.beginPath(); ctx.moveTo(barX, barY); ctx.lineTo(barX + barW * prog, barY); ctx.stroke();
     // HUD text
     const conf = (_lastGazeLine.confidence * 100).toFixed(0);
-    const wpm  = _lastGazeLine.wpm ? _lastGazeLine.wpm.toFixed(0) + ' WPM' : '';
     const li   = _lastGazeLine.line_idx !== null ? `L${_lastGazeLine.line_idx + 1}/${_lastGazeLine.line_count}` : '';
-    const reg  = _lastGazeLine.is_regression ? ' ↩' : '';
-    if (lineSnapHud) lineSnapHud.textContent = `${li} conf:${conf}% ${wpm}${reg}`;
+    const reg  = _lastGazeLine.is_regression ? ' ↩re-read' : (_lastGazeLine.is_new_line ? ' →new' : '');
+    const dwell = _lastGazeLine.dwell_ms > 0 ? ` ${(_lastGazeLine.dwell_ms/1000).toFixed(1)}s` : '';
+    if (lineSnapHud) lineSnapHud.textContent = `${li} conf:${conf}%${dwell}${reg}`;
   } else if (lineSnapHud) {
     lineSnapHud.textContent = '';
   }
