@@ -238,7 +238,13 @@ def _engine_post_gaze_model_load(body: bytes) -> tuple[int, bytes]:
 def _is_gaze_model_file(p) -> bool:
     try:
         data = json.loads(p.read_text())
-        return isinstance(data.get("A"), list) and isinstance(data.get("B"), list)
+        # Legacy single-glint format: {A, B}
+        if isinstance(data.get("A"), list) and isinstance(data.get("B"), list):
+            return True
+        # Two-glint format: {type: "two_glint", two: {A, B}, ...}
+        if data.get("type") == "two_glint" and isinstance(data.get("two"), dict):
+            return True
+        return False
     except Exception:
         return False
 
