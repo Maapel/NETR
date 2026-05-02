@@ -37,15 +37,19 @@ from gaze_model import GazeModel, DualGazeModel, TwoGlintGazeModel
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 _DIR = pathlib.Path(__file__).parent
-GAZE_MODEL_PATH   = _DIR.parent / "gaze_model.json"
-EYE_SETTINGS_PATH = _DIR.parent / "eye_settings.json"
-_PROJECT_ROOT     = GAZE_MODEL_PATH.parent.resolve()
+GAZE_MODEL_SINGLE_PATH = _DIR.parent / "gaze_model_single.json"
+GAZE_MODEL_DUAL_PATH   = _DIR.parent / "gaze_model_dual.json"
+GAZE_MODEL_PATH        = _DIR.parent / "gaze_model.json"   # legacy fallback
+EYE_SETTINGS_PATH      = _DIR.parent / "eye_settings.json"
+_PROJECT_ROOT          = _DIR.parent.resolve()
 
 
 def _resolve_gaze_model_load_path(path_s: str | None) -> pathlib.Path | None:
     """Return path to load, or None if path escapes project root."""
     if path_s is None or not str(path_s).strip():
-        return GAZE_MODEL_PATH.resolve()
+        # Default: pick correct path for current glint_mode
+        p = GAZE_MODEL_SINGLE_PATH if _glint_mode == "single" else GAZE_MODEL_DUAL_PATH
+        return p.resolve()
     raw = pathlib.Path(str(path_s).strip())
     cand = raw.resolve() if raw.is_absolute() else (_PROJECT_ROOT / raw).resolve()
     try:
@@ -78,30 +82,48 @@ def _save_settings():
     data["glint_switch_dx"] = _pipe.switch_dx
     data["preferred_side"]  = _pipe.preferred_side
     data["swap_pccr"]       = _pipe.swap_pccr
+    data["glint_mode"]      = _glint_mode
     with open(EYE_SETTINGS_PATH, "w") as f:
         json.dump(data, f, indent=2)
 
 _boot_settings = _load_settings()
 with _pipe_lock:
     _pipe.update_params(_boot_settings)
-    _pipe.switch_dx    = float(_boot_settings.get("glint_switch_dx", 0.0))
+    _pipe.switch_dx      = float(_boot_settings.get("glint_switch_dx", 0.0))
     _pipe.preferred_side = float(_boot_settings.get("preferred_side", 1.0))
-    _pipe.swap_pccr    = bool(_boot_settings.get("swap_pccr", False))
+    _pipe.swap_pccr      = bool(_boot_settings.get("swap_pccr", False))
+
+# ── Glint mode ────────────────────────────────────────────────────────────────
+# "single" — GazeModel (6-term), one PCCR, calibrated with single-glint flow.
+# "dual"   — TwoGlintGazeModel (11-term), two PCCRs, calibrated with dual-glint flow.
+_glint_mode: str = _boot_settings.get("glint_mode", "dual")
+if _glint_mode not in ("single", "dual"):
+    _glint_mode = "dual"
 
 # ── Glint sweep state ─────────────────────────────────────────────────────────
 _sweep_lock    = threading.Lock()
-_sweep_samples: list[dict] = []   # {"dx": float, "glint_offset": float}
+_sweep_samples: list[dict] = []
 _sweep_active  = False
 
 # ── Gaze model ────────────────────────────────────────────────────────────────
-# Try TwoGlintGazeModel first; fall back to DualGazeModel for legacy files.
-_gaze_model: TwoGlintGazeModel | DualGazeModel = TwoGlintGazeModel()
-if not _gaze_model.load(GAZE_MODEL_PATH):
-    _gaze_model = DualGazeModel()
-    _gaze_model.load(GAZE_MODEL_PATH)
+def _load_gaze_model_for_mode(mode: str) -> "GazeModel | TwoGlintGazeModel":
+    """Load the correct model class + file for the given glint mode."""
+    if mode == "single":
+        m = GazeModel()
+        if not m.load(GAZE_MODEL_SINGLE_PATH):
+            m.load(GAZE_MODEL_PATH)   # legacy fallback
+        return m
+    else:
+        m = TwoGlintGazeModel()
+        if not m.load(GAZE_MODEL_DUAL_PATH):
+            # Try legacy gaze_model.json
+            if not m.load(GAZE_MODEL_PATH):
+                fb = DualGazeModel()
+                fb.load(GAZE_MODEL_PATH)
+                return fb
+        return m
 
-# When True: ignore second PCCR vector even if available — use single-glint path only.
-_force_single_glint: bool = bool(_boot_settings.get("force_single_glint", False))
+_gaze_model = _load_gaze_model_for_mode(_glint_mode)
 
 # ── Latest result ─────────────────────────────────────────────────────────────
 _latest_lock   = threading.Lock()
@@ -128,20 +150,19 @@ def _process(jpeg: bytes) -> bytes:
     with _pipe_lock:
         result = _pipe.process(gray)
 
-    # Gaze mapping — use dual-glint PCCR when available (unless forced single)
+    # Gaze mapping
     gaze = None
     if result.pccr_vector and _gaze_model.trained:
         try:
-            use_dual = (
-                not _force_single_glint
-                and isinstance(_gaze_model, TwoGlintGazeModel)
-                and result.pccr2_vector is not None
-            )
-            if use_dual:
+            if (_glint_mode == "dual"
+                    and isinstance(_gaze_model, TwoGlintGazeModel)
+                    and result.pccr2_vector is not None):
                 gaze = _gaze_model.predict(
                     result.pccr_vector[0], result.pccr_vector[1], result.pccr_side,
                     dx2=result.pccr2_vector[0], dy2=result.pccr2_vector[1],
                 )
+            elif _glint_mode == "single" and isinstance(_gaze_model, GazeModel):
+                gaze = _gaze_model.predict(*result.pccr_vector)
             else:
                 gaze = _gaze_model.predict(*result.pccr_vector, result.pccr_side)
         except Exception:
@@ -211,11 +232,13 @@ _VALID_DEBUG_VIEWS = ("original", "p_suppressed", "p_blurred", "p_thresh",
 
 def _apply_params(params: dict, save: bool = False) -> dict:
     """Validate and apply a flat params dict. Returns applied keys."""
-    global _debug_view, _force_single_glint
+    global _debug_view, _glint_mode, _gaze_model
     updates = {}
 
-    if "force_single_glint" in params:
-        _force_single_glint = params["force_single_glint"] not in (False, 0, "0", "false", "")
+    if "glint_mode" in params and params["glint_mode"] in ("single", "dual"):
+        if params["glint_mode"] != _glint_mode:
+            _glint_mode = params["glint_mode"]
+            _gaze_model = _load_gaze_model_for_mode(_glint_mode)
 
     if "debug_view" in params:
         v = params["debug_view"]
@@ -363,7 +386,7 @@ class Handler(BaseHTTPRequestHandler):
         with _pipe_lock:
             params = _pipe.get_params()
         params["debug_view"] = _debug_view
-        params["force_single_glint"] = _force_single_glint
+        params["glint_mode"] = _glint_mode
         self._send(200, json.dumps(params).encode())
 
     # ── POST /settings ────────────────────────────────────────────────────────

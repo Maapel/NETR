@@ -1882,9 +1882,11 @@ class MJPEGHandler(BaseHTTPRequestHandler):
     <div style="display:flex; gap:8px; padding:4px 0; align-items:center; flex-wrap:wrap">
       <button onclick="applyEyeSettings()" style="background:#286">Apply Eye</button>
       <button onclick="saveEyeSettings()" style="background:#862">Save Eye</button>
-      <label style="cursor:pointer;user-select:none;font-size:12px;display:flex;align-items:center;gap:4px">
-        <input type="checkbox" id="force_single_glint" onchange="setGlintMode(this.checked)">
-        Force single-glint
+      <label style="font-size:12px">Glint mode
+        <select id="glint_mode" onchange="setGlintMode(this.value)" style="margin-left:4px">
+          <option value="dual">Dual (11-term)</option>
+          <option value="single">Single (6-term)</option>
+        </select>
       </label>
     </div>
     <div id="eye-feedback" style="font-size:11px; color:#8df; min-height:14px"></div>
@@ -2426,19 +2428,19 @@ function applyDebugView(val) {
   fetch('/set?debug_view=' + val + '&analysis=1').then(r => r.json());
 }
 
-function setGlintMode(forceSingle) {
+function setGlintMode(mode) {
   fetch('/engine/settings', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({force_single_glint: forceSingle})
+    body: JSON.stringify({glint_mode: mode})
   }).catch(() => {});
 }
 
-// Load initial force_single_glint state from engine
+// Load initial glint_mode from engine
 fetch('/engine/settings').then(r => r.ok ? r.json() : null).then(s => {
   if (!s) return;
-  const el = document.getElementById('force_single_glint');
-  if (el) el.checked = !!s.force_single_glint;
+  const el = document.getElementById('glint_mode');
+  if (el && s.glint_mode) el.value = s.glint_mode;
 }).catch(() => {});
 
 function applyEyeSettings() {

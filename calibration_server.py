@@ -53,7 +53,9 @@ EYE_CAM_ID    = _EYE_CAM      # eye stream cam id (rig_config)
 ARUCO_DICT    = cv2.aruco.DICT_4X4_50
 ARUCO_IDS     = [0, 1, 2, 3]   # TL, TR, BL, BR order
 SYNC_WINDOW_MS = 150        # max ms between target coord and eye vector
-MODEL_PATH    = pathlib.Path(__file__).parent / "gaze_model.json"
+MODEL_PATH        = pathlib.Path(__file__).parent / "gaze_model.json"          # legacy
+MODEL_SINGLE_PATH = pathlib.Path(__file__).parent / "gaze_model_single.json"
+MODEL_DUAL_PATH   = pathlib.Path(__file__).parent / "gaze_model_dual.json"
 DATASET_PATH  = pathlib.Path(__file__).parent / "calib_dataset.json"
 
 # ── Global state ──────────────────────────────────────────────────────────────
@@ -222,12 +224,32 @@ def _wait_async_flushes(timeout_s: float = 120.0):
             _flush_inflight_cv.wait(timeout=remaining)
         _calib_trace("wait_async_flushes: done inflight=%d", _flush_inflight)
 
-_model = TwoGlintGazeModel()                   # scene-space model (saved to disk)
-_screen_model = TwoGlintGazeModel()           # screen-space model (for live cursor)
-SCREEN_MODEL_PATH = pathlib.Path(__file__).parent / "screen_model.json"
-_model_ok = _model.load(MODEL_PATH)
-_screen_ok = _screen_model.load(SCREEN_MODEL_PATH)
-print(f"[calib] gaze_model loaded={_model_ok} trained={_model.trained}  "
+SCREEN_MODEL_PATH      = pathlib.Path(__file__).parent / "screen_model.json"
+SCREEN_SINGLE_PATH     = pathlib.Path(__file__).parent / "screen_model_single.json"
+SCREEN_DUAL_PATH       = pathlib.Path(__file__).parent / "screen_model_dual.json"
+
+def _get_glint_mode() -> str:
+    """Fetch glint_mode from engine. Returns 'single' or 'dual'."""
+    try:
+        import urllib.request
+        with urllib.request.urlopen(ENGINE_URL + "/settings", timeout=1.0) as r:
+            return json.loads(r.read()).get("glint_mode", "dual")
+    except Exception:
+        return "dual"
+
+def _make_model(mode: str):
+    """Return a fresh unfitted model of the right class for the given mode."""
+    return GazeModel() if mode == "single" else TwoGlintGazeModel()
+
+_glint_mode_boot = _get_glint_mode()
+_model        = _make_model(_glint_mode_boot)
+_screen_model = _make_model(_glint_mode_boot)
+_mp = MODEL_SINGLE_PATH if _glint_mode_boot == "single" else MODEL_DUAL_PATH
+_sp = SCREEN_SINGLE_PATH if _glint_mode_boot == "single" else SCREEN_DUAL_PATH
+_model_ok  = _model.load(_mp)  or _model.load(MODEL_PATH)
+_screen_ok = _screen_model.load(_sp) or _screen_model.load(SCREEN_MODEL_PATH)
+print(f"[calib] glint_mode={_glint_mode_boot}  "
+      f"gaze_model loaded={_model_ok} trained={_model.trained}  "
       f"screen_model loaded={_screen_ok} trained={_screen_model.trained}")
 
 # ── Recording ─────────────────────────────────────────────────────────────────
@@ -666,26 +688,41 @@ def _refit_models():
     if len(samples) < 6:
         return None
     try:
+        mode = _get_glint_mode()
         screen_samples = [{"dx": s["dx"], "dy": s["dy"],
                            "side": float(s.get("side", 1.0)),
                            "X": s["sx"], "Y": s["sy"],
                            **({k: s[k] for k in ("dx1","dy1","dx2","dy2") if k in s})}
                           for s in samples]
-        # Try TwoGlintGazeModel first; fall back to DualGazeModel if too few two-glint samples.
-        n_two = sum(1 for s in samples if "dx1" in s and "dx2" in s)
-        if n_two >= TwoGlintGazeModel.MIN_SAMPLES:
-            diag = _model.fit(samples)
-            _screen_model.fit(screen_samples)
+
+        if mode == "single":
+            # Pure single-glint: GazeModel (6-term), uses only dx/dy
+            m  = GazeModel(); sm = GazeModel()
+            diag = m.fit(samples)
+            sm.fit(screen_samples)
+            m.save(MODEL_SINGLE_PATH); sm.save(SCREEN_SINGLE_PATH)
         else:
-            fallback_m = DualGazeModel(); fallback_s = DualGazeModel()
-            diag = fallback_m.fit(samples)
-            fallback_s.fit(screen_samples)
-            fallback_m.save(MODEL_PATH); fallback_s.save(SCREEN_MODEL_PATH)
-            return diag
-        _model.save(MODEL_PATH)
-        _screen_model.save(SCREEN_MODEL_PATH)
+            # Dual-glint: TwoGlintGazeModel (11-term), needs dx1/dy1/dx2/dy2
+            n_two = sum(1 for s in samples if "dx1" in s and "dx2" in s)
+            if n_two >= TwoGlintGazeModel.MIN_SAMPLES:
+                m  = TwoGlintGazeModel(); sm = TwoGlintGazeModel()
+                diag = m.fit(samples)
+                sm.fit(screen_samples)
+                m.save(MODEL_DUAL_PATH); sm.save(SCREEN_DUAL_PATH)
+            else:
+                # Not enough dual-glint samples — fall back to DualGazeModel
+                m  = DualGazeModel(); sm = DualGazeModel()
+                diag = m.fit(samples); sm.fit(screen_samples)
+                m.save(MODEL_DUAL_PATH); sm.save(SCREEN_DUAL_PATH)
+
+        # Keep _model/_screen_model in sync so live cursor works
+        _model.A = getattr(m, 'A', None); _model.B = getattr(m, 'B', None)
+        _model.trained = m.trained
+        _screen_model.A = getattr(sm, 'A', None); _screen_model.B = getattr(sm, 'B', None)
+        _screen_model.trained = sm.trained
         return diag
-    except Exception:
+    except Exception as e:
+        print(f"[calib] _refit_models error: {e}", flush=True)
         return None
 
 def _compute_sweep_switch_dx(samples: list[dict]) -> float | None:
