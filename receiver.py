@@ -1515,8 +1515,9 @@ class MJPEGHandler(BaseHTTPRequestHandler):
         <option value="2">Cam 2</option>
       </select>
     </div>
-    <label style="cursor:pointer; user-select:none; font-size:12px"><input type="checkbox" id="annotate_eye"> Annotate Eye</label>
-    <label style="cursor:pointer; user-select:none; font-size:12px"><input type="checkbox" id="annotate_world"> Annotate World</label>
+    <label style="cursor:pointer; user-select:none; font-size:12px"><input type="checkbox" id="annotate_eye"> Pin Eye</label>
+    <label style="cursor:pointer; user-select:none; font-size:12px"><input type="checkbox" id="annotate_world"> Pin World</label>
+    <button onclick="clearPins()" style="font-size:11px;padding:2px 8px;background:#533">Clear pins</button>
     <button onclick="saveRecording()" style="background:#c33">Save 40s Buffer</button>
     <button onclick="window.open('/player','_blank')" style="background:#669">Player</button>
   </div>
@@ -2038,6 +2039,104 @@ function applyROI(cid, x1, y1, x2, y2) {
 setupROI(1, c1);
 setupROI(2, c2);
 
+// ── Pin annotation ────────────────────────────────────────────────────────────
+// pins[cid] = [{nx, ny, label}]  nx/ny normalised 0..1
+const pins = {1: [], 2: []};
+let _pinCounter = 1;
+
+const annotateEyEl  = document.getElementById('annotate_eye');
+const annotateWoEl  = document.getElementById('annotate_world');
+
+function _pinModeActive(cid) {
+  const d = __lastStats || {};
+  const eyeCam = d.eye_cam || 2;
+  if (cid === eyeCam) return annotateEyEl && annotateEyEl.checked;
+  return annotateWoEl && annotateWoEl.checked;
+}
+
+function _addPin(cid, nx, ny) {
+  const d = __lastStats || {};
+  const sw = cid === (d.eye_cam || 2) ? 640 : (d.gaze_scene_width  || 1280);
+  const sh = cid === (d.eye_cam || 2) ? 480 : (d.gaze_scene_height || 720);
+  const px = Math.round(nx * sw);
+  const py = Math.round(ny * sh);
+  pins[cid].push({ nx, ny, label: `P${_pinCounter++} (${px},${py})` });
+}
+
+function _removeNearestPin(cid, nx, ny) {
+  if (!pins[cid].length) return;
+  let bi = 0, bd = Infinity;
+  pins[cid].forEach((p, i) => {
+    const d = (p.nx - nx) ** 2 + (p.ny - ny) ** 2;
+    if (d < bd) { bd = d; bi = i; }
+  });
+  if (bd < 0.02) pins[cid].splice(bi, 1);
+}
+
+function drawPins(cid, ctx, cvs) {
+  if (!pins[cid] || !pins[cid].length) return;
+  ctx.save();
+  pins[cid].forEach(p => {
+    const x = p.nx * cvs.width;
+    const y = p.ny * cvs.height;
+    // Drop shadow
+    ctx.strokeStyle = 'rgba(0,0,0,0.7)';
+    ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.arc(x, y, 6, 0, Math.PI * 2); ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(x, y - 12); ctx.lineTo(x, y + 12);
+    ctx.moveTo(x - 12, y); ctx.lineTo(x + 12, y);
+    ctx.stroke();
+    // Pin circle
+    ctx.fillStyle = 'rgba(255,80,80,0.25)';
+    ctx.strokeStyle = '#f55';
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(x, y, 6, 0, Math.PI * 2);
+    ctx.fill(); ctx.stroke();
+    // Crosshair
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(x, y - 12); ctx.lineTo(x, y + 12);
+    ctx.moveTo(x - 12, y); ctx.lineTo(x + 12, y);
+    ctx.stroke();
+    // Label
+    ctx.font = 'bold 11px monospace';
+    const tw = ctx.measureText(p.label).width;
+    ctx.fillStyle = 'rgba(0,0,0,0.65)';
+    ctx.fillRect(x + 9, y - 15, tw + 5, 15);
+    ctx.fillStyle = '#fcc';
+    ctx.fillText(p.label, x + 11, y - 3);
+  });
+  ctx.restore();
+}
+
+function _setupPinCanvas(cid, canvas) {
+  // Capture phase — fires before ROI mousedown, suppress ROI when pinning
+  canvas.addEventListener('click', e => {
+    if (!_pinModeActive(cid)) return;
+    e.stopImmediatePropagation();
+    const rect = canvas.getBoundingClientRect();
+    _addPin(cid, (e.clientX - rect.left) / rect.width,
+                 (e.clientY - rect.top)  / rect.height);
+  }, true);
+
+  canvas.addEventListener('contextmenu', e => {
+    if (!_pinModeActive(cid)) return;
+    e.preventDefault();
+    const rect = canvas.getBoundingClientRect();
+    _removeNearestPin(cid, (e.clientX - rect.left) / rect.width,
+                           (e.clientY - rect.top)  / rect.height);
+  });
+}
+
+_setupPinCanvas(1, c1);
+_setupPinCanvas(2, c2);
+
+function clearPins(cid) {
+  if (cid) pins[cid] = [];
+  else { pins[1] = []; pins[2] = []; }
+}
+
 let displayFps = 20;   // how often we poll for new frames (Hz)
 let running    = true;
 let camOnline  = {1: false, 2: false};
@@ -2172,6 +2271,8 @@ async function loop() {
       drawBitmap(c2, ctx2, bmp2, 2);
       drawGazeOnWorldCanvas();
       drawTextLinesOnWorldCanvas();
+      drawPins(1, ctx1, c1);
+      drawPins(2, ctx2, c2);
     });
     _fetchTextLines();
     _fetchGazeLine();
