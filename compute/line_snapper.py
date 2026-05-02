@@ -47,11 +47,13 @@ class LineSnapper:
     Book can be at any angle — all geometry is 2D track-relative.
     """
 
-    SMOOTH_MS       = 120.0   # rolling median window for raw gaze (ms)
-    DWELL_FRAMES    = 4       # frames near new line before committing
-    CONF_SCALE      = 60.0    # px; distance at which confidence = 0.5
-    JUMP_FRAC       = 0.5     # backward jump > 50% of track length = line-end wrap
-    SACCADE_PX_MS   = 1.5     # px/ms; above = saccade, skip hysteresis update
+    SMOOTH_MS           = 120.0   # rolling median window for raw gaze (ms)
+    DWELL_FRAMES        = 4       # frames near new line before committing
+    CONF_SCALE          = 60.0    # px; distance at which confidence = 0.5
+    JUMP_FRAC           = 0.5     # backward jump > 50% of track length = line-end wrap
+    SACCADE_PX_MS       = 1.5     # px/ms; above = saccade, skip hysteresis update
+    OFFSET_CALIB_FRAMES = 20      # high-conf frames to collect before applying offset
+    OFFSET_CONF_MIN     = 0.6     # minimum confidence to count a frame for offset calib
 
     def __init__(self):
         self._smooth_buf: collections.deque = collections.deque(maxlen=64)
@@ -61,6 +63,13 @@ class LineSnapper:
         self._line_enter_ts: float = 0.0
         self._prev_gaze: Optional[tuple[float, float, float]] = None  # (ts, x, y)
         self._prev_proj: Optional[float] = None  # projected position along last track
+
+        # Session offset correction: absorbs residual vertical bias from depth change.
+        # Collects (raw_gaze_y - nearest_snap_y) for high-confidence frames,
+        # then applies the median as a persistent gaze_y correction.
+        self._offset_samples: list[float] = []
+        self._offset: float = 0.0          # applied correction (px)
+        self.offset_ready: bool = False    # True once calibrated
 
     # ── Public ────────────────────────────────────────────────────────────────
 
@@ -86,8 +95,11 @@ class LineSnapper:
         n = len(sorted_tracks)
         gx, gy = smooth
 
+        # Apply session offset correction (corrects residual depth/parallax bias)
+        gy_corr = gy - self._offset
+
         # 2D distance from gaze to each track curve
-        dists, snaps = zip(*[_dist_to_track(gx, gy, t) for t in sorted_tracks])
+        dists, snaps = zip(*[_dist_to_track(gx, gy_corr, t) for t in sorted_tracks])
         nearest = int(np.argmin(dists))
         nearest_dist = dists[nearest]
 
@@ -141,6 +153,15 @@ class LineSnapper:
         dwell = ts_ms - self._line_enter_ts if self._line_enter_ts else 0.0
         self._prev_gaze = (ts_ms, gx, gy)
 
+        # Collect offset samples until calibrated.
+        # Sample = raw gy minus the y of the nearest snap point on the track.
+        if not self.offset_ready and conf >= self.OFFSET_CONF_MIN and not is_saccade:
+            snap_y = snaps[nearest][1]
+            self._offset_samples.append(gy - snap_y)
+            if len(self._offset_samples) >= self.OFFSET_CALIB_FRAMES:
+                self._offset = float(np.median(self._offset_samples))
+                self.offset_ready = True
+
         return SnapResult(
             line_idx=locked,
             line_count=n,
@@ -160,6 +181,9 @@ class LineSnapper:
         self._line_enter_ts = 0.0
         self._prev_gaze = None
         self._prev_proj = None
+        self._offset_samples = []
+        self._offset = 0.0
+        self.offset_ready = False
 
     # ── Internals ─────────────────────────────────────────────────────────────
 

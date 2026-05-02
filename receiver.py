@@ -1392,6 +1392,8 @@ class MJPEGHandler(BaseHTTPRequestHandler):
             "is_regression": snap.is_regression,
             "dwell_ms": round(snap.dwell_ms, 1),
             "raw_gaze_xy": list(snap.raw_gaze_xy),
+            "offset_px": round(snapper._offset, 1),
+            "offset_ready": snapper.offset_ready,
         }
         body = json.dumps(result).encode()
         self.send_response(200)
@@ -2122,12 +2124,32 @@ function drawGazeOnWorldCanvas() {
     ctx.moveTo(sx - r, sy); ctx.lineTo(sx + r, sy);
     ctx.moveTo(sx, sy - r); ctx.lineTo(sx, sy + r);
     ctx.stroke();
-    // HUD text
-    const conf = (_lastGazeLine.confidence * 100).toFixed(0);
-    const li   = _lastGazeLine.line_idx !== null ? `L${_lastGazeLine.line_idx + 1}/${_lastGazeLine.line_count}` : '';
-    const reg  = _lastGazeLine.is_regression ? ' ↩re-read' : (_lastGazeLine.is_new_line ? ' →new' : '');
+    // HUD text (sidebar span)
+    const conf  = (_lastGazeLine.confidence * 100).toFixed(0);
+    const li    = _lastGazeLine.line_idx !== null ? `L${_lastGazeLine.line_idx + 1}/${_lastGazeLine.line_count}` : '';
+    const reg   = _lastGazeLine.is_regression ? ' ↩re-read' : (_lastGazeLine.is_new_line ? ' →new' : '');
     const dwell = _lastGazeLine.dwell_ms > 0 ? ` ${(_lastGazeLine.dwell_ms/1000).toFixed(1)}s` : '';
-    if (lineSnapHud) lineSnapHud.textContent = `${li} conf:${conf}%${dwell}${reg}`;
+    const offTxt = _lastGazeLine.offset_ready
+      ? ` off:${_lastGazeLine.offset_px > 0 ? '+' : ''}${_lastGazeLine.offset_px}px`
+      : ' (calibrating…)';
+    if (lineSnapHud) lineSnapHud.textContent = `${li} conf:${conf}%${dwell}${reg}${offTxt}`;
+
+    // HUD drawn on canvas (top-left corner, always visible)
+    ctx.save();
+    ctx.font = 'bold 13px monospace';
+    const hudLines = [
+      `${li}  conf ${conf}%${dwell}`,
+      reg ? reg.trim() : '',
+      _lastGazeLine.offset_ready ? `depth offset ${_lastGazeLine.offset_px > 0 ? '+' : ''}${_lastGazeLine.offset_px}px` : 'calibrating depth offset…',
+    ].filter(Boolean);
+    const pad = 6;
+    hudLines.forEach((txt, i) => {
+      ctx.fillStyle = 'rgba(0,0,0,0.55)';
+      ctx.fillRect(8, 8 + i * 18, ctx.measureText(txt).width + pad * 2, 17);
+      ctx.fillStyle = i === 0 ? '#ff0' : (reg && i === 1 ? '#f80' : '#8f8');
+      ctx.fillText(txt, 8 + pad, 22 + i * 18);
+    });
+    ctx.restore();
   } else if (lineSnapHud) {
     lineSnapHud.textContent = '';
   }
