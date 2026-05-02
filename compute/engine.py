@@ -100,6 +100,9 @@ if not _gaze_model.load(GAZE_MODEL_PATH):
     _gaze_model = DualGazeModel()
     _gaze_model.load(GAZE_MODEL_PATH)
 
+# When True: ignore second PCCR vector even if available — use single-glint path only.
+_force_single_glint: bool = bool(_boot_settings.get("force_single_glint", False))
+
 # ── Latest result ─────────────────────────────────────────────────────────────
 _latest_lock   = threading.Lock()
 _latest_result: EyeResult | None = None
@@ -125,11 +128,16 @@ def _process(jpeg: bytes) -> bytes:
     with _pipe_lock:
         result = _pipe.process(gray)
 
-    # Gaze mapping — use dual-glint PCCR when available
+    # Gaze mapping — use dual-glint PCCR when available (unless forced single)
     gaze = None
     if result.pccr_vector and _gaze_model.trained:
         try:
-            if isinstance(_gaze_model, TwoGlintGazeModel) and result.pccr2_vector is not None:
+            use_dual = (
+                not _force_single_glint
+                and isinstance(_gaze_model, TwoGlintGazeModel)
+                and result.pccr2_vector is not None
+            )
+            if use_dual:
                 gaze = _gaze_model.predict(
                     result.pccr_vector[0], result.pccr_vector[1], result.pccr_side,
                     dx2=result.pccr2_vector[0], dy2=result.pccr2_vector[1],
@@ -203,8 +211,11 @@ _VALID_DEBUG_VIEWS = ("original", "p_suppressed", "p_blurred", "p_thresh",
 
 def _apply_params(params: dict, save: bool = False) -> dict:
     """Validate and apply a flat params dict. Returns applied keys."""
-    global _debug_view
+    global _debug_view, _force_single_glint
     updates = {}
+
+    if "force_single_glint" in params:
+        _force_single_glint = params["force_single_glint"] not in (False, 0, "0", "false", "")
 
     if "debug_view" in params:
         v = params["debug_view"]
@@ -352,6 +363,7 @@ class Handler(BaseHTTPRequestHandler):
         with _pipe_lock:
             params = _pipe.get_params()
         params["debug_view"] = _debug_view
+        params["force_single_glint"] = _force_single_glint
         self._send(200, json.dumps(params).encode())
 
     # ── POST /settings ────────────────────────────────────────────────────────

@@ -587,6 +587,7 @@ class MJPEGHandler(BaseHTTPRequestHandler):
         elif path == "/stats":     self._stats()
         elif path == "/gaze_model_files": self._gaze_model_files()
         elif path == "/settings":  self._get_settings()
+        elif path == "/engine/settings": self._proxy_engine_settings()
         elif path == "/eye_settings": self._get_eye_settings()
         elif path == "/record/save": self._record_save()
         elif path == "/player":      self._player()
@@ -641,6 +642,23 @@ class MJPEGHandler(BaseHTTPRequestHandler):
             except Exception:
                 try: self.send_error(400)
                 except BrokenPipeError: pass
+        elif self.path == "/engine/settings":
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length) if length > 0 else b"{}"
+            try:
+                params = json.loads(body)
+                _engine_post_settings(params)
+                resp = json.dumps({"ok": True}).encode()
+            except Exception:
+                resp = json.dumps({"ok": False}).encode()
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(resp)))
+                self.end_headers()
+                self.wfile.write(resp)
+            except BrokenPipeError:
+                pass
         elif self.path == "/engine/gaze_model/load":
             length = int(self.headers.get("Content-Length", 0))
             gbody = self.rfile.read(length) if length > 0 else b"{}"
@@ -754,6 +772,26 @@ class MJPEGHandler(BaseHTTPRequestHandler):
             pass
 
     # ── /eye_settings — proxy to compute engine ───────────────────────────────
+    def _proxy_engine_settings(self):
+        """Proxy GET /engine/settings → engine /settings (includes force_single_glint)."""
+        try:
+            import urllib.request
+            with urllib.request.urlopen(ENGINE_URL + "/settings", timeout=0.5) as r:
+                body = r.read()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except Exception:
+            body = b"{}"
+            self.send_response(503)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            try: self.wfile.write(body)
+            except BrokenPipeError: pass
+
     def _get_eye_settings(self):
         try:
             d = _engine_get_result()  # get live params from engine
@@ -1841,9 +1879,13 @@ class MJPEGHandler(BaseHTTPRequestHandler):
                oninput="document.getElementById('g_ellipse_slack_val').textContent=(this.value/100).toFixed(2)">
       </div>
     </div>
-    <div style="display:flex; gap:8px; padding:4px 0">
+    <div style="display:flex; gap:8px; padding:4px 0; align-items:center; flex-wrap:wrap">
       <button onclick="applyEyeSettings()" style="background:#286">Apply Eye</button>
       <button onclick="saveEyeSettings()" style="background:#862">Save Eye</button>
+      <label style="cursor:pointer;user-select:none;font-size:12px;display:flex;align-items:center;gap:4px">
+        <input type="checkbox" id="force_single_glint" onchange="setGlintMode(this.checked)">
+        Force single-glint
+      </label>
     </div>
     <div id="eye-feedback" style="font-size:11px; color:#8df; min-height:14px"></div>
     </details>
@@ -2383,6 +2425,21 @@ updateAlgoVisibility();
 function applyDebugView(val) {
   fetch('/set?debug_view=' + val + '&analysis=1').then(r => r.json());
 }
+
+function setGlintMode(forceSingle) {
+  fetch('/engine/settings', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({force_single_glint: forceSingle})
+  }).catch(() => {});
+}
+
+// Load initial force_single_glint state from engine
+fetch('/engine/settings').then(r => r.ok ? r.json() : null).then(s => {
+  if (!s) return;
+  const el = document.getElementById('force_single_glint');
+  if (el) el.checked = !!s.force_single_glint;
+}).catch(() => {});
 
 function applyEyeSettings() {
   const fb = document.getElementById('eye-feedback');
