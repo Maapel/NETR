@@ -33,7 +33,7 @@ import cv2
 import numpy as np
 
 from eye_pipeline import EyePipeline, EyeResult
-from gaze_model import GazeModel, DualGazeModel, TwoGlintGazeModel
+from gaze_model import GazeModel, DualGazeModel, TwoGlintGazeModel, SplitGlintModel
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 _DIR = pathlib.Path(__file__).parent
@@ -94,8 +94,9 @@ with _pipe_lock:
     _pipe.swap_pccr      = bool(_boot_settings.get("swap_pccr", False))
 
 # ── Glint mode ────────────────────────────────────────────────────────────────
-# "single" — GazeModel (6-term), one PCCR, calibrated with single-glint flow.
-# "dual"   — TwoGlintGazeModel (11-term), two PCCRs, calibrated with dual-glint flow.
+# "dual"   — SplitGlintModel: two independent 6-term models (left/right LED),
+#             near-zero PCCR filtered, max-|dx| glint selected at inference.
+# "single" — GazeModel (6-term), deprecated feature flag for comparison.
 _glint_mode: str = _boot_settings.get("glint_mode", "dual")
 if _glint_mode not in ("single", "dual"):
     _glint_mode = "dual"
@@ -106,9 +107,9 @@ _sweep_samples: list[dict] = []
 _sweep_active  = False
 
 # ── Gaze model ────────────────────────────────────────────────────────────────
-_gaze_model_file: str = ""   # actual filename loaded (for diagnostics)
+_gaze_model_file: str = ""
 
-def _load_gaze_model_for_mode(mode: str) -> "GazeModel | TwoGlintGazeModel":
+def _load_gaze_model_for_mode(mode: str):
     global _gaze_model_file
     if mode == "single":
         m = GazeModel()
@@ -119,13 +120,15 @@ def _load_gaze_model_for_mode(mode: str) -> "GazeModel | TwoGlintGazeModel":
             _gaze_model_file = GAZE_MODEL_PATH.name
         return m
     else:
-        m = TwoGlintGazeModel()
+        # Try SplitGlintModel first, then legacy TwoGlintGazeModel, then DualGazeModel
+        m = SplitGlintModel()
         if m.load(GAZE_MODEL_DUAL_PATH):
             _gaze_model_file = GAZE_MODEL_DUAL_PATH.name
             return m
-        if m.load(GAZE_MODEL_PATH):
-            _gaze_model_file = GAZE_MODEL_PATH.name
-            return m
+        legacy = TwoGlintGazeModel()
+        if legacy.load(GAZE_MODEL_DUAL_PATH) or legacy.load(GAZE_MODEL_PATH):
+            _gaze_model_file = GAZE_MODEL_DUAL_PATH.name if GAZE_MODEL_DUAL_PATH.exists() else GAZE_MODEL_PATH.name
+            return legacy
         fb = DualGazeModel()
         fb.load(GAZE_MODEL_PATH)
         _gaze_model_file = GAZE_MODEL_PATH.name
@@ -162,14 +165,22 @@ def _process(jpeg: bytes) -> bytes:
     gaze = None
     if result.pccr_vector and _gaze_model.trained:
         try:
-            if (_glint_mode == "dual"
-                    and isinstance(_gaze_model, TwoGlintGazeModel)
-                    and result.pccr2_vector is not None):
+            if isinstance(_gaze_model, SplitGlintModel) and result.pccr2_vector is not None:
+                # SplitGlintModel: dx1/dy1 = pccr_vector (preferred side), dx2/dy2 = secondary
+                # Assign right=+1, left=-1 consistently
+                if result.pccr_side >= 0:
+                    dx1, dy1 = result.pccr_vector
+                    dx2, dy2 = result.pccr2_vector
+                else:
+                    dx1, dy1 = result.pccr2_vector
+                    dx2, dy2 = result.pccr_vector
+                gaze = _gaze_model.predict(dx1, dy1, dx2, dy2)
+            elif isinstance(_gaze_model, TwoGlintGazeModel) and result.pccr2_vector is not None:
                 gaze = _gaze_model.predict(
                     result.pccr_vector[0], result.pccr_vector[1], result.pccr_side,
                     dx2=result.pccr2_vector[0], dy2=result.pccr2_vector[1],
                 )
-            elif _glint_mode == "single" and isinstance(_gaze_model, GazeModel):
+            elif isinstance(_gaze_model, GazeModel):
                 gaze = _gaze_model.predict(*result.pccr_vector)
             else:
                 gaze = _gaze_model.predict(*result.pccr_vector, result.pccr_side)

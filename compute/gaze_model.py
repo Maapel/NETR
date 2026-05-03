@@ -4,24 +4,17 @@ Gaze mapping models.
 GazeModel — single 6-term polynomial:
   1, dx, dy, dx·dy, dx², dy²
 
-DualGazeModel — two independent GazeModel instances, one per LED side:
-  model_pos  → side = +1 (right LED)
-  model_neg  → side = -1 (left LED)
-  fallback   → all samples combined (used when one side has <MIN_SAMPLES)
+DualGazeModel — two independent GazeModel instances, one per LED side (legacy).
 
-At prediction: use the side's dedicated model when trained, else fallback.
-When both glints are visible the caller should pick a preferred side
-consistently (convention: +1) rather than let geometry decide.
+TwoGlintGazeModel (deprecated, kept as feature flag) — 11-term combined polynomial.
 
-TwoGlintGazeModel — uses PCCR vectors from BOTH glints simultaneously:
-  Features: [1, dx1, dy1, dx2, dy2, dx1*dy1, dx2*dy2, dx1*dx2, dy1*dy2, dx1+dx2, dy1+dy2]
-  11-term polynomial. Trained only on frames where both LED glints were detected.
-  Falls back to DualGazeModel when only one glint is available at prediction time.
-  Requires samples to have dx1/dy1 (right LED) and dx2/dy2 (left LED) fields.
-
-File format: {"type":"dual", "pos":{A,B}, "neg":{A,B}, "fallback":{A,B}, ...}
-             {"type":"two_glint", "two":{A,B}, "fallback_pos":{A,B}, "fallback_neg":{A,B}, ...}
-Legacy single-model files (no "type" key) are loaded as fallback only.
+SplitGlintModel — two independent 6-term models, one per LED position:
+  model_right → trained on right-LED PCCR (dx1, dy1), filtered |dx1|>=MIN_PCCR
+  model_left  → trained on left-LED PCCR  (dx2, dy2), filtered |dx2|>=MIN_PCCR
+  Training: only samples where BOTH glints present; near-zero PCCRs dropped per-glint.
+  Inference: apply BOTH models, return prediction from the glint with larger |dx| magnitude
+             (max-displacement glint = furthest from pupil centre = highest SNR).
+  File: {"type": "split_glint", "right":{A,B}, "left":{A,B}, ...}
 """
 
 import json
@@ -330,6 +323,94 @@ class TwoGlintGazeModel:
                 self.fallback_neg.B = np.array(fn["B"])
                 self.fallback_neg._n_terms = 6
                 self.fallback_neg.trained  = True
+            sw = data.get("scene_width");  self.scene_width  = int(sw) if sw is not None else None
+            sh = data.get("scene_height"); self.scene_height = int(sh) if sh is not None else None
+            self.trained = True
+            return True
+        except (FileNotFoundError, KeyError, json.JSONDecodeError):
+            return False
+
+
+class SplitGlintModel:
+    """Two independent 6-term models, one per LED.
+
+    Training:
+      - Only samples with BOTH glints (dx1/dy1 AND dx2/dy2) used.
+      - Samples where |dx| < MIN_PCCR dropped per-glint (near-zero = high noise).
+    Inference:
+      - Predict from both models; return result from glint with larger |dx|
+        (most displaced from pupil centre = highest SNR).
+    """
+
+    MIN_SAMPLES = 6
+    MIN_PCCR    = 0.05   # drop samples where |dx| < this for that glint
+
+    def __init__(self):
+        self.model_right = GazeModel()   # right LED (dx1, dy1)
+        self.model_left  = GazeModel()   # left LED  (dx2, dy2)
+        self.trained = False
+        self.scene_width:  int | None = None
+        self.scene_height: int | None = None
+
+    def fit(self, samples: list[dict]) -> dict:
+        both = [s for s in samples if "dx1" in s and "dx2" in s]
+        if len(both) < self.MIN_SAMPLES:
+            raise ValueError(f"Need ≥{self.MIN_SAMPLES} two-glint samples, got {len(both)}")
+
+        right_s = [s for s in both if abs(s["dx1"]) >= self.MIN_PCCR]
+        left_s  = [s for s in both if abs(s["dx2"]) >= self.MIN_PCCR]
+
+        if len(right_s) < self.MIN_SAMPLES:
+            raise ValueError(f"Right-glint: only {len(right_s)} samples above MIN_PCCR={self.MIN_PCCR}")
+        if len(left_s) < self.MIN_SAMPLES:
+            raise ValueError(f"Left-glint: only {len(left_s)} samples above MIN_PCCR={self.MIN_PCCR}")
+
+        diag_r = self.model_right.fit(
+            [{"dx": s["dx1"], "dy": s["dy1"], "X": s["X"], "Y": s["Y"]} for s in right_s]
+        )
+        diag_l = self.model_left.fit(
+            [{"dx": s["dx2"], "dy": s["dy2"], "X": s["X"], "Y": s["Y"]} for s in left_s]
+        )
+        self.trained = True
+        return {
+            "n_both": len(both), "n_right": len(right_s), "n_left": len(left_s),
+            "r2_x_right": diag_r["r2_x"], "r2_y_right": diag_r["r2_y"],
+            "r2_x_left":  diag_l["r2_x"], "r2_y_left":  diag_l["r2_y"],
+        }
+
+    def predict(self, dx1: float, dy1: float,
+                dx2: float, dy2: float) -> tuple[float, float]:
+        if not self.trained:
+            raise RuntimeError("Model not trained")
+        if abs(dx1) >= abs(dx2):
+            return self.model_right.predict(dx1, dy1)
+        else:
+            return self.model_left.predict(dx2, dy2)
+
+    def save(self, path: str | pathlib.Path):
+        if not self.trained:
+            raise RuntimeError("Nothing to save — model not trained")
+        data: dict = {
+            "type": "split_glint",
+            "right": {"A": self.model_right.A.tolist(), "B": self.model_right.B.tolist()},
+            "left":  {"A": self.model_left.A.tolist(),  "B": self.model_left.B.tolist()},
+        }
+        if self.scene_width  is not None: data["scene_width"]  = self.scene_width
+        if self.scene_height is not None: data["scene_height"] = self.scene_height
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2)
+
+    def load(self, path: str | pathlib.Path) -> bool:
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            if data.get("type") != "split_glint":
+                return False
+            r = data["right"]; l = data["left"]
+            self.model_right.A = np.array(r["A"]); self.model_right.B = np.array(r["B"])
+            self.model_right._n_terms = 6; self.model_right.trained = True
+            self.model_left.A  = np.array(l["A"]); self.model_left.B  = np.array(l["B"])
+            self.model_left._n_terms = 6; self.model_left.trained = True
             sw = data.get("scene_width");  self.scene_width  = int(sw) if sw is not None else None
             sh = data.get("scene_height"); self.scene_height = int(sh) if sh is not None else None
             self.trained = True

@@ -32,7 +32,7 @@ from socketserver import ThreadingMixIn
 import cv2
 import numpy as np
 
-from gaze_model import GazeModel, DualGazeModel, TwoGlintGazeModel
+from gaze_model import GazeModel, DualGazeModel, TwoGlintGazeModel, SplitGlintModel
 
 # ── Rig config ────────────────────────────────────────────────────────────────
 import sys as _sys
@@ -238,8 +238,7 @@ def _get_glint_mode() -> str:
         return "dual"
 
 def _make_model(mode: str):
-    """Return a fresh unfitted model of the right class for the given mode."""
-    return GazeModel() if mode == "single" else TwoGlintGazeModel()
+    return GazeModel() if mode == "single" else SplitGlintModel()
 
 _glint_mode_boot = _get_glint_mode()
 _model        = _make_model(_glint_mode_boot)
@@ -702,24 +701,16 @@ def _refit_models():
             sm.fit(screen_samples)
             m.save(MODEL_SINGLE_PATH); sm.save(SCREEN_SINGLE_PATH)
         else:
-            # Dual-glint: TwoGlintGazeModel (11-term), needs dx1/dy1/dx2/dy2
-            n_two = sum(1 for s in samples if "dx1" in s and "dx2" in s)
-            if n_two >= TwoGlintGazeModel.MIN_SAMPLES:
-                m  = TwoGlintGazeModel(); sm = TwoGlintGazeModel()
-                diag = m.fit(samples)
-                sm.fit(screen_samples)
-                m.save(MODEL_DUAL_PATH); sm.save(SCREEN_DUAL_PATH)
-            else:
-                # Not enough dual-glint samples — fall back to DualGazeModel
-                m  = DualGazeModel(); sm = DualGazeModel()
-                diag = m.fit(samples); sm.fit(screen_samples)
-                m.save(MODEL_DUAL_PATH); sm.save(SCREEN_DUAL_PATH)
+            # Dual-glint: SplitGlintModel — two independent 6-term models (left/right LED)
+            m  = SplitGlintModel(); sm = SplitGlintModel()
+            diag = m.fit(samples)
+            sm.fit(screen_samples)
+            m.save(MODEL_DUAL_PATH); sm.save(SCREEN_DUAL_PATH)
 
         # Keep _model/_screen_model in sync so live cursor works
-        _model.A = getattr(m, 'A', None); _model.B = getattr(m, 'B', None)
-        _model.trained = m.trained
-        _screen_model.A = getattr(sm, 'A', None); _screen_model.B = getattr(sm, 'B', None)
-        _screen_model.trained = sm.trained
+        import copy
+        globals()['_model']        = copy.copy(m)
+        globals()['_screen_model'] = copy.copy(sm)
         return diag
     except Exception as e:
         print(f"[calib] _refit_models error: {e}", flush=True)
@@ -2948,6 +2939,21 @@ fetch('/viz/data').then(r=>r.json()).then(({samples, n, model_trained}) => {
 </script></body></html>"""
 
 
+def _predict_model(model, vec, vec2, side: float):
+    """Dispatch predict() correctly for any model type."""
+    if isinstance(model, SplitGlintModel) and vec2 is not None:
+        if side >= 0:
+            return model.predict(vec[0], vec[1], vec2[0], vec2[1])
+        else:
+            return model.predict(vec2[0], vec2[1], vec[0], vec[1])
+    elif isinstance(model, TwoGlintGazeModel) and vec2 is not None:
+        return model.predict(vec[0], vec[1], side, dx2=vec2[0], dy2=vec2[1])
+    elif isinstance(model, GazeModel):
+        return model.predict(vec[0], vec[1])
+    else:
+        return model.predict(vec[0], vec[1], side)
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_): pass
 
@@ -2971,24 +2977,23 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/model":
             # Return current model coefficients (fallback polynomial)
             if _model.trained:
-                if isinstance(_model, TwoGlintGazeModel):
+                if isinstance(_model, SplitGlintModel):
+                    body = json.dumps({
+                        "trained": True, "type": "split_glint",
+                        "right_ok": _model.model_right.trained,
+                        "left_ok":  _model.model_left.trained,
+                        "n_terms": 6,
+                    }).encode()
+                elif isinstance(_model, TwoGlintGazeModel):
                     body = json.dumps({
                         "trained": True, "type": "two_glint",
-                        "pos_ok": _model.fallback_pos.trained,
-                        "neg_ok": _model.fallback_neg.trained,
                         "n_terms": 11,
                         "A": _model.A.tolist() if _model.A is not None else None,
                         "B": _model.B.tolist() if _model.B is not None else None,
                     }).encode()
                 else:
-                    fb = _model.fallback
                     body = json.dumps({
-                        "trained": True, "type": "dual",
-                        "pos_ok": _model.model_pos.trained,
-                        "neg_ok": _model.model_neg.trained,
-                        "n_terms": 6,
-                        "A": fb.A.tolist() if fb.trained else None,
-                        "B": fb.B.tolist() if fb.trained else None,
+                        "trained": True, "type": "dual", "n_terms": 6,
                     }).encode()
             else:
                 body = json.dumps({"trained": False}).encode()
@@ -3134,15 +3139,14 @@ class Handler(BaseHTTPRequestHandler):
                 sd = float(d.get("pccr_side") or 1.0)
                 if sd == 0.0:
                     sd = 1.0
-                kw2 = {"dx2": vec2[0], "dy2": vec2[1]} if vec2 else {}
                 if not vec:
                     body = json.dumps({"ok": False, "reason": "no pccr vector"}).encode()
                 elif _screen_model.trained:
-                    sx, sy = _screen_model.predict(vec[0], vec[1], sd, **kw2)
+                    sx, sy = _predict_model(_screen_model, vec, vec2, sd)
                     body = json.dumps({"ok": True, "x": sx, "y": sy,
                                        "dx": vec[0], "dy": vec[1], "side": sd}).encode()
                 else:
-                    scene_x, scene_y = _model.predict(vec[0], vec[1], sd, **kw2)
+                    scene_x, scene_y = _predict_model(_model, vec, vec2, sd)
                     with _homography_lock:
                         H = _homography
                     if H is None:
