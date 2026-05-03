@@ -343,7 +343,8 @@ class SplitGlintModel:
     """
 
     MIN_SAMPLES = 6
-    MIN_PCCR    = 10.0   # drop samples where |dx| < this px (glint near pupil centre = high noise)
+    MIN_PCCR    = 10.0   # drop samples where |dx| < this px (glint near pupil centre)
+    OUTLIER_SIGMA = 3.0  # drop samples where |dy| > mean+N*std per glint (bad detection)
 
     def __init__(self):
         self.model_right = GazeModel()   # right LED (dx1, dy1)
@@ -352,18 +353,32 @@ class SplitGlintModel:
         self.scene_width:  int | None = None
         self.scene_height: int | None = None
 
+    @staticmethod
+    def _sigma_filter(samples: list[dict], dy_key: str, dx_key: str,
+                      min_pccr: float, sigma: float) -> tuple[list[dict], list[dict]]:
+        """Remove samples where |dy| > mean + sigma*std (outlier glint detection).
+        Returns (kept, rejected)."""
+        candidates = [s for s in samples if abs(s[dx_key]) >= min_pccr]
+        if len(candidates) < 3:
+            return candidates, []
+        dy_vals = np.array([abs(s[dy_key]) for s in candidates])
+        threshold = dy_vals.mean() + sigma * dy_vals.std()
+        kept     = [s for s in candidates if abs(s[dy_key]) <= threshold]
+        rejected = [s for s in candidates if abs(s[dy_key]) >  threshold]
+        return kept, rejected
+
     def fit(self, samples: list[dict]) -> dict:
         both = [s for s in samples if "dx1" in s and "dx2" in s]
         if len(both) < self.MIN_SAMPLES:
             raise ValueError(f"Need ≥{self.MIN_SAMPLES} two-glint samples, got {len(both)}")
 
-        right_s = [s for s in both if abs(s["dx1"]) >= self.MIN_PCCR]
-        left_s  = [s for s in both if abs(s["dx2"]) >= self.MIN_PCCR]
+        right_s, right_rej = self._sigma_filter(both, "dy1", "dx1", self.MIN_PCCR, self.OUTLIER_SIGMA)
+        left_s,  left_rej  = self._sigma_filter(both, "dy2", "dx2", self.MIN_PCCR, self.OUTLIER_SIGMA)
 
         if len(right_s) < self.MIN_SAMPLES:
-            raise ValueError(f"Right-glint: only {len(right_s)} samples above MIN_PCCR={self.MIN_PCCR}")
+            raise ValueError(f"Right-glint: only {len(right_s)} samples after filtering")
         if len(left_s) < self.MIN_SAMPLES:
-            raise ValueError(f"Left-glint: only {len(left_s)} samples above MIN_PCCR={self.MIN_PCCR}")
+            raise ValueError(f"Left-glint: only {len(left_s)} samples after filtering")
 
         diag_r = self.model_right.fit(
             [{"dx": s["dx1"], "dy": s["dy1"], "X": s["X"], "Y": s["Y"]} for s in right_s]
@@ -374,6 +389,7 @@ class SplitGlintModel:
         self.trained = True
         return {
             "n_both": len(both), "n_right": len(right_s), "n_left": len(left_s),
+            "n_right_rejected": len(right_rej), "n_left_rejected": len(left_rej),
             "r2_x_right": diag_r["r2_x"], "r2_y_right": diag_r["r2_y"],
             "r2_x_left":  diag_l["r2_x"], "r2_y_left":  diag_l["r2_y"],
         }
