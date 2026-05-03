@@ -652,6 +652,9 @@ def _flush_pending_target(eyes: list | None = None, target: dict | None = None):
     new_samples: list[dict] = []
     primary = {"dx": avg_dx, "dy": avg_dy, "side": avg_side,
                "X": avg_X, "Y": avg_Y, "sx": sx, "sy": sy}
+    # Hard cap: reject any glint whose |dy| > MAX_GLINT_DY — indicates a spurious
+    # detection (specular reflection / eyelid) rather than a true LED corneal reflex.
+    MAX_GLINT_DY = 120.0
     has_secondary = avg_sec_dx is not None and len(_sec_dxs) >= 2
     if has_secondary:
         # Assign dx1/dy1 = right LED (+1), dx2/dy2 = left LED (-1)
@@ -661,6 +664,12 @@ def _flush_pending_target(eyes: list | None = None, target: dict | None = None):
         else:
             primary["dx1"] = avg_sec_dx; primary["dy1"] = avg_sec_dy
             primary["dx2"] = avg_dx;     primary["dy2"] = avg_sec_dy
+        # Drop two-glint fields if either glint has an implausible |dy|
+        if abs(primary.get("dy1", 0)) > MAX_GLINT_DY or abs(primary.get("dy2", 0)) > MAX_GLINT_DY:
+            print(f"[calib] REJECT two-glint fields: |dy1|={abs(primary.get('dy1',0)):.0f} "
+                  f"|dy2|={abs(primary.get('dy2',0)):.0f} exceeds {MAX_GLINT_DY}px", flush=True)
+            primary.pop("dx1", None); primary.pop("dy1", None)
+            primary.pop("dx2", None); primary.pop("dy2", None)
     new_samples.append(primary)
     _calib_trace(
         "flush_pending APPEND sample side=%+.0f clean=%d dx=%.3f dy=%.3f two_glint=%s",
@@ -672,11 +681,14 @@ def _flush_pending_target(eyes: list | None = None, target: dict | None = None):
         n = len(_saccade_samples)
     diag = _refit_models()
     if diag:
+        # SplitGlintModel returns per-side r2; average them for the status bar
+        r2_x = diag.get("r2_x", (diag.get("r2_x_right",0) + diag.get("r2_x_left",0)) / 2)
+        r2_y = diag.get("r2_y", (diag.get("r2_y_right",0) + diag.get("r2_y_left",0)) / 2)
         _broadcast(json.dumps({
             "type": "ready",
             "n": n,
-            "r2_x": round(diag["r2_x"], 3),
-            "r2_y": round(diag["r2_y"], 3),
+            "r2_x": round(r2_x, 3),
+            "r2_y": round(r2_y, 3),
         }))
 
 
@@ -1628,7 +1640,9 @@ def _handle_ws(rfile, wfile):
                         with open(DATASET_PATH, "w") as f:
                             json.dump(samples, f)
                         if diag:
-                            result.update({"ok": True, **diag})
+                            r2_x = diag.get("r2_x", (diag.get("r2_x_right",0)+diag.get("r2_x_left",0))/2)
+                            r2_y = diag.get("r2_y", (diag.get("r2_y_right",0)+diag.get("r2_y_left",0))/2)
+                            result.update({"ok": True, "r2_x": r2_x, "r2_y": r2_y, **diag})
                         else:
                             result.update({"ok": False, "error": "Fit failed — check logs"})
                     except Exception as e:
