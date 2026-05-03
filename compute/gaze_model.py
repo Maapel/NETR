@@ -382,7 +382,10 @@ class SplitGlintModel:
                 dx2: float, dy2: float) -> tuple[float, float]:
         if not self.trained:
             raise RuntimeError("Model not trained")
-        if abs(dx1) >= abs(dx2):
+        # Select glint with larger |dy| — dy is the LED-separation axis (horizontal in
+        # image after 90° camera rotation), so |dy| best captures distance from pupil
+        # along the axis that actually discriminates between the two LEDs.
+        if abs(dy1) >= abs(dy2):
             return self.model_right.predict(dx1, dy1)
         else:
             return self.model_left.predict(dx2, dy2)
