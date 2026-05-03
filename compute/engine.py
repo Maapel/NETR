@@ -106,22 +106,30 @@ _sweep_samples: list[dict] = []
 _sweep_active  = False
 
 # ── Gaze model ────────────────────────────────────────────────────────────────
+_gaze_model_file: str = ""   # actual filename loaded (for diagnostics)
+
 def _load_gaze_model_for_mode(mode: str) -> "GazeModel | TwoGlintGazeModel":
-    """Load the correct model class + file for the given glint mode."""
+    global _gaze_model_file
     if mode == "single":
         m = GazeModel()
-        if not m.load(GAZE_MODEL_SINGLE_PATH):
-            m.load(GAZE_MODEL_PATH)   # legacy fallback
+        if m.load(GAZE_MODEL_SINGLE_PATH):
+            _gaze_model_file = GAZE_MODEL_SINGLE_PATH.name
+        else:
+            m.load(GAZE_MODEL_PATH)
+            _gaze_model_file = GAZE_MODEL_PATH.name
         return m
     else:
         m = TwoGlintGazeModel()
-        if not m.load(GAZE_MODEL_DUAL_PATH):
-            # Try legacy gaze_model.json
-            if not m.load(GAZE_MODEL_PATH):
-                fb = DualGazeModel()
-                fb.load(GAZE_MODEL_PATH)
-                return fb
-        return m
+        if m.load(GAZE_MODEL_DUAL_PATH):
+            _gaze_model_file = GAZE_MODEL_DUAL_PATH.name
+            return m
+        if m.load(GAZE_MODEL_PATH):
+            _gaze_model_file = GAZE_MODEL_PATH.name
+            return m
+        fb = DualGazeModel()
+        fb.load(GAZE_MODEL_PATH)
+        _gaze_model_file = GAZE_MODEL_PATH.name
+        return fb
 
 _gaze_model = _load_gaze_model_for_mode(_glint_mode)
 
@@ -343,6 +351,8 @@ class Handler(BaseHTTPRequestHandler):
                     {
                         "ready": False,
                         "gaze_model_trained": _gaze_model.trained,
+                        "gaze_model_type": type(_gaze_model).__name__,
+                        "gaze_model_file": _gaze_model_file,
                         "gaze_scene_width": getattr(_gaze_model, "scene_width", None),
                         "gaze_scene_height": getattr(_gaze_model, "scene_height", None),
                     }

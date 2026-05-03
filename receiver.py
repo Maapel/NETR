@@ -1879,17 +1879,23 @@ class MJPEGHandler(BaseHTTPRequestHandler):
                oninput="document.getElementById('g_ellipse_slack_val').textContent=(this.value/100).toFixed(2)">
       </div>
     </div>
-    <div style="display:flex; gap:8px; padding:4px 0; align-items:center; flex-wrap:wrap">
+    <div style="display:flex; gap:8px; padding:4px 0">
       <button onclick="applyEyeSettings()" style="background:#286">Apply Eye</button>
       <button onclick="saveEyeSettings()" style="background:#862">Save Eye</button>
-      <label style="font-size:12px">Glint mode
-        <select id="glint_mode" onchange="setGlintMode(this.value)" style="margin-left:4px">
-          <option value="dual">Dual (11-term)</option>
-          <option value="single">Single (6-term)</option>
-        </select>
-      </label>
     </div>
     <div id="eye-feedback" style="font-size:11px; color:#8df; min-height:14px"></div>
+    </details>
+    <details style="margin-top:6px">
+      <summary style="cursor:pointer; font-weight:bold; font-size:12px">Glint Mode</summary>
+      <div style="padding:6px 0; display:flex; align-items:center; gap:8px">
+        <label style="font-size:12px">Mode
+          <select id="glint_mode" onchange="setGlintMode(this.value)" style="margin-left:4px">
+            <option value="dual">Dual (11-term)</option>
+            <option value="single">Single (6-term)</option>
+          </select>
+        </label>
+        <span id="glint-mode-feedback" style="font-size:11px; color:#8df"></span>
+      </div>
     </details>
   </div>
 
@@ -2429,18 +2435,29 @@ function applyDebugView(val) {
 }
 
 function setGlintMode(mode) {
+  // sync all glint_mode selects on page
+  document.querySelectorAll('#glint_mode').forEach(el => el.value = mode);
+  document.querySelectorAll('#glint-mode-feedback').forEach(el => el.textContent = 'Switching…');
   fetch('/engine/settings', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({glint_mode: mode})
-  }).catch(() => {});
+  }).then(r => r.json()).then(d => {
+    document.querySelectorAll('#glint-mode-feedback').forEach(el =>
+      el.textContent = d.ok ? 'Active: ' + mode : 'Failed');
+  }).catch(() => {
+    document.querySelectorAll('#glint-mode-feedback').forEach(el => el.textContent = 'Error');
+  });
 }
 
 // Load initial glint_mode from engine
 fetch('/engine/settings').then(r => r.ok ? r.json() : null).then(s => {
   if (!s) return;
-  const el = document.getElementById('glint_mode');
-  if (el && s.glint_mode) el.value = s.glint_mode;
+  if (s.glint_mode) {
+    document.querySelectorAll('#glint_mode').forEach(el => el.value = s.glint_mode);
+    document.querySelectorAll('#glint-mode-feedback').forEach(el =>
+      el.textContent = 'Active: ' + s.glint_mode);
+  }
 }).catch(() => {});
 
 function applyEyeSettings() {
@@ -2693,6 +2710,18 @@ fetch('/eye_settings').then(r => r.json()).then(s => {
     <div style="display:flex; gap:8px; padding-top:6px">
       <button class="eye-btn" style="background:#862" onclick="saveEyeSettings()">Save Eye Settings</button>
       <span id="eye-feedback" style="font-size:10px; color:#8df; align-self:center"></span>
+    </div>
+  </details>
+  <details style="margin-top:6px">
+    <summary style="cursor:pointer; font-weight:bold; font-size:12px">Glint Mode</summary>
+    <div style="padding:6px 0; display:flex; align-items:center; gap:8px">
+      <label style="font-size:12px">Mode
+        <select id="glint_mode" onchange="setGlintMode(this.value)" style="margin-left:4px">
+          <option value="dual">Dual (11-term)</option>
+          <option value="single">Single (6-term)</option>
+        </select>
+      </label>
+      <span id="glint-mode-feedback" style="font-size:11px; color:#8df"></span>
     </div>
   </details>
 
