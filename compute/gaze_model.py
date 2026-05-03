@@ -343,7 +343,7 @@ class SplitGlintModel:
     """
 
     MIN_SAMPLES = 6
-    MIN_PCCR    = 0.05   # drop samples where |dx| < this for that glint
+    MIN_PCCR    = 10.0   # drop samples where |dx| < this px (glint near pupil centre = high noise)
 
     def __init__(self):
         self.model_right = GazeModel()   # right LED (dx1, dy1)
