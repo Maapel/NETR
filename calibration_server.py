@@ -1633,11 +1633,13 @@ def _handle_ws(rfile, wfile):
                           "recording": was_recording, "session_path": session_path}
                 if len(samples) >= 6:
                     try:
-                        diag = _model.fit(samples)
-                        _model.save(MODEL_PATH)
+                        diag = _refit_models()
                         with open(DATASET_PATH, "w") as f:
                             json.dump(samples, f)
-                        result.update({"ok": True, **diag})
+                        if diag:
+                            result.update({"ok": True, **diag})
+                        else:
+                            result.update({"ok": False, "error": "Fit failed — check logs"})
                     except Exception as e:
                         result.update({"ok": False, "error": str(e)})
                 else:
