@@ -165,15 +165,20 @@ def _process(jpeg: bytes) -> bytes:
     gaze = None
     if result.pccr_vector and _gaze_model.trained:
         try:
-            if isinstance(_gaze_model, SplitGlintModel) and result.pccr2_vector is not None:
-                # Assign right=+1 LED as dx1/dy1, left=-1 as dx2/dy2
-                if result.pccr_side >= 0:
-                    dx1, dy1 = result.pccr_vector
-                    dx2, dy2 = result.pccr2_vector
+            if isinstance(_gaze_model, SplitGlintModel):
+                if result.pccr2_vector is not None:
+                    # Assign right=+1 LED as dx1/dy1, left=-1 as dx2/dy2
+                    if result.pccr_side >= 0:
+                        dx1, dy1 = result.pccr_vector
+                        dx2, dy2 = result.pccr2_vector
+                    else:
+                        dx1, dy1 = result.pccr2_vector
+                        dx2, dy2 = result.pccr_vector
+                    gaze = _gaze_model.predict(dx1, dy1, dx2, dy2)
                 else:
-                    dx1, dy1 = result.pccr2_vector
-                    dx2, dy2 = result.pccr_vector
-                gaze = _gaze_model.predict(dx1, dy1, dx2, dy2)  # selects by max|dy|
+                    # Only one glint visible — use matching sub-model
+                    m = _gaze_model.model_right if result.pccr_side >= 0 else _gaze_model.model_left
+                    gaze = m.predict(*result.pccr_vector)
             elif isinstance(_gaze_model, TwoGlintGazeModel) and result.pccr2_vector is not None:
                 gaze = _gaze_model.predict(
                     result.pccr_vector[0], result.pccr_vector[1], result.pccr_side,

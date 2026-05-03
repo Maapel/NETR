@@ -117,17 +117,24 @@ class EyePipeline:
                 labeled.append((gx, gy, side))
 
             # Primary glint selection:
-            # When both LED sides are visible, always pick the preferred_side glint
-            # (not just the closest) so the gaze model gets a consistent side.
+            # When both LED sides visible, pick by max PCCR magnitude — matches
+            # SplitGlintModel.predict() selection so live preview = model behavior.
             sides_seen = {s for _, _, s in labeled}
             if len(sides_seen) == 2:
-                preferred = [(gx, gy) for gx, gy, s in labeled if s == self.preferred_side]
-                gx, gy = preferred[0] if preferred else (gr.primary[0], gr.primary[1])
-                # Compute secondary PCCR from the other LED glint
-                sec_side = -self.preferred_side
-                sec = [(gx2, gy2) for gx2, gy2, s in labeled if s == sec_side]
-                if sec:
-                    sgx, sgy = sec[0]
+                pos_glints = [(gx, gy) for gx, gy, s in labeled if s == self.preferred_side]
+                neg_glints = [(gx, gy) for gx, gy, s in labeled if s == -self.preferred_side]
+                pg = pos_glints[0] if pos_glints else None
+                ng = neg_glints[0] if neg_glints else None
+                if pg and ng:
+                    # Magnitude of each PCCR vector (swap_pccr swaps axes but not magnitude)
+                    mag_p = (pcx - pg[0])**2 + (pcy - pg[1])**2
+                    mag_n = (pcx - ng[0])**2 + (pcy - ng[1])**2
+                    gx, gy = pg if mag_p >= mag_n else ng
+                    sgx, sgy = ng if mag_p >= mag_n else pg
+                else:
+                    gx, gy = pg or ng
+                    sgx, sgy = None, None
+                if sgx is not None:
                     s_raw_dx = pcx - sgx; s_raw_dy = pcy - sgy
                     if self.swap_pccr:
                         pccr2 = (float(s_raw_dy), float(s_raw_dx))

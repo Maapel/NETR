@@ -12,8 +12,8 @@ SplitGlintModel — two independent 6-term models, one per LED position:
   model_right → trained on right-LED PCCR (dx1, dy1), filtered |dx1|>=MIN_PCCR
   model_left  → trained on left-LED PCCR  (dx2, dy2), filtered |dx2|>=MIN_PCCR
   Training: only samples where BOTH glints present; near-zero PCCRs dropped per-glint.
-  Inference: apply BOTH models, return prediction from the glint with larger |dx| magnitude
-             (max-displacement glint = furthest from pupil centre = highest SNR).
+  Inference: apply BOTH models, return prediction from the glint with larger magnitude
+             hypot(dx,dy) — furthest from pupil centre = highest SNR.
   File: {"type": "split_glint", "right":{A,B}, "left":{A,B}, ...}
 """
 
@@ -398,10 +398,9 @@ class SplitGlintModel:
                 dx2: float, dy2: float) -> tuple[float, float]:
         if not self.trained:
             raise RuntimeError("Model not trained")
-        # Select glint with larger |dy| — dy is the LED-separation axis (horizontal in
-        # image after 90° camera rotation), so |dy| best captures distance from pupil
-        # along the axis that actually discriminates between the two LEDs.
-        if abs(dy1) >= abs(dy2):
+        # Select glint with larger magnitude — higher PCCR magnitude = LED farther
+        # from pupil centre = higher SNR measurement.
+        if (dx1**2 + dy1**2) >= (dx2**2 + dy2**2):
             return self.model_right.predict(dx1, dy1)
         else:
             return self.model_left.predict(dx2, dy2)

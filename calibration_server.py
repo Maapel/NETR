@@ -224,10 +224,6 @@ def _wait_async_flushes(timeout_s: float = 120.0):
             _flush_inflight_cv.wait(timeout=remaining)
         _calib_trace("wait_async_flushes: done inflight=%d", _flush_inflight)
 
-SCREEN_MODEL_PATH      = pathlib.Path(__file__).parent / "screen_model.json"
-SCREEN_SINGLE_PATH     = pathlib.Path(__file__).parent / "screen_model_single.json"
-SCREEN_DUAL_PATH       = pathlib.Path(__file__).parent / "screen_model_dual.json"
-
 def _get_glint_mode() -> str:
     """Fetch glint_mode from engine. Returns 'single' or 'dual'."""
     try:
@@ -241,15 +237,11 @@ def _make_model(mode: str):
     return GazeModel() if mode == "single" else SplitGlintModel()
 
 _glint_mode_boot = _get_glint_mode()
-_model        = _make_model(_glint_mode_boot)
-_screen_model = _make_model(_glint_mode_boot)
-_mp = MODEL_SINGLE_PATH if _glint_mode_boot == "single" else MODEL_DUAL_PATH
-_sp = SCREEN_SINGLE_PATH if _glint_mode_boot == "single" else SCREEN_DUAL_PATH
-_model_ok  = _model.load(_mp)  or _model.load(MODEL_PATH)
-_screen_ok = _screen_model.load(_sp) or _screen_model.load(SCREEN_MODEL_PATH)
+_model    = _make_model(_glint_mode_boot)
+_mp       = MODEL_SINGLE_PATH if _glint_mode_boot == "single" else MODEL_DUAL_PATH
+_model_ok = _model.load(_mp) or _model.load(MODEL_PATH)
 print(f"[calib] glint_mode={_glint_mode_boot}  "
-      f"gaze_model loaded={_model_ok} trained={_model.trained}  "
-      f"screen_model loaded={_screen_ok} trained={_screen_model.trained}")
+      f"gaze_model loaded={_model_ok} trained={_model.trained}")
 
 # ── Recording ─────────────────────────────────────────────────────────────────
 # Per calibration session (START → STOP): raw sensor videos + aligned timestamps.
@@ -693,36 +685,25 @@ def _flush_pending_target(eyes: list | None = None, target: dict | None = None):
 
 
 def _refit_models():
-    """Refit both models from current saccade samples. Called after each fixation."""
+    """Refit model from current saccade samples. Called after each fixation."""
     with _saccade_lock:
         samples = list(_saccade_samples)
     if len(samples) < 6:
         return None
     try:
         mode = _get_glint_mode()
-        screen_samples = [{"dx": s["dx"], "dy": s["dy"],
-                           "side": float(s.get("side", 1.0)),
-                           "X": s["sx"], "Y": s["sy"],
-                           **({k: s[k] for k in ("dx1","dy1","dx2","dy2") if k in s})}
-                          for s in samples]
 
         if mode == "single":
-            # Pure single-glint: GazeModel (6-term), uses only dx/dy
-            m  = GazeModel(); sm = GazeModel()
+            m = GazeModel()
             diag = m.fit(samples)
-            sm.fit(screen_samples)
-            m.save(MODEL_SINGLE_PATH); sm.save(SCREEN_SINGLE_PATH)
+            m.save(MODEL_SINGLE_PATH)
         else:
-            # Dual-glint: SplitGlintModel — two independent 6-term models (left/right LED)
-            m  = SplitGlintModel(); sm = SplitGlintModel()
+            m = SplitGlintModel()
             diag = m.fit(samples)
-            sm.fit(screen_samples)
-            m.save(MODEL_DUAL_PATH); sm.save(SCREEN_DUAL_PATH)
+            m.save(MODEL_DUAL_PATH)
 
-        # Keep _model/_screen_model in sync so live cursor works
         import copy
-        globals()['_model']        = copy.copy(m)
-        globals()['_screen_model'] = copy.copy(sm)
+        globals()['_model'] = copy.copy(m)
         return diag
     except Exception as e:
         print(f"[calib] _refit_models error: {e}", flush=True)
@@ -3001,11 +2982,16 @@ fetch('/viz/data').then(r=>r.json()).then(({samples, n, model_trained}) => {
 
 def _predict_model(model, vec, vec2, side: float):
     """Dispatch predict() correctly for any model type."""
-    if isinstance(model, SplitGlintModel) and vec2 is not None:
-        if side >= 0:
-            return model.predict(vec[0], vec[1], vec2[0], vec2[1])
+    if isinstance(model, SplitGlintModel):
+        if vec2 is not None:
+            if side >= 0:
+                return model.predict(vec[0], vec[1], vec2[0], vec2[1])
+            else:
+                return model.predict(vec2[0], vec2[1], vec[0], vec[1])
         else:
-            return model.predict(vec2[0], vec2[1], vec[0], vec[1])
+            # Only one glint — use whichever sub-model matches the visible side
+            m = model.model_right if side >= 0 else model.model_left
+            return m.predict(vec[0], vec[1])
     elif isinstance(model, TwoGlintGazeModel) and vec2 is not None:
         return model.predict(vec[0], vec[1], side, dx2=vec2[0], dy2=vec2[1])
     elif isinstance(model, GazeModel):
@@ -3201,10 +3187,8 @@ class Handler(BaseHTTPRequestHandler):
                     sd = 1.0
                 if not vec:
                     body = json.dumps({"ok": False, "reason": "no pccr vector"}).encode()
-                elif _screen_model.trained:
-                    sx, sy = _predict_model(_screen_model, vec, vec2, sd)
-                    body = json.dumps({"ok": True, "x": sx, "y": sy,
-                                       "dx": vec[0], "dy": vec[1], "side": sd}).encode()
+                elif not _model.trained:
+                    body = json.dumps({"ok": False, "reason": "model not trained"}).encode()
                 else:
                     scene_x, scene_y = _predict_model(_model, vec, vec2, sd)
                     with _homography_lock:
@@ -3216,9 +3200,8 @@ class Handler(BaseHTTPRequestHandler):
                         pt = np.array([[[scene_x, scene_y]]], dtype=np.float32)
                         scr = cv2.perspectiveTransform(pt, H_inv)[0][0]
                         sx, sy = float(scr[0]), float(scr[1])
-                        print(f"[live] pccr=({vec[0]:.3f},{vec[1]:.3f}) → scene=({scene_x:.1f},{scene_y:.1f}) → screen=({sx:.0f},{sy:.0f})")
                         body = json.dumps({"ok": True, "x": sx, "y": sy,
-                                           "dx": vec[0], "dy": vec[1]}).encode()
+                                           "dx": vec[0], "dy": vec[1], "side": sd}).encode()
             except Exception as e:
                 print(f"[live] EXCEPTION: {e}")
                 body = json.dumps({"ok": False, "reason": str(e)}).encode()

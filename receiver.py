@@ -1864,8 +1864,8 @@ class MJPEGHandler(BaseHTTPRequestHandler):
                oninput="document.getElementById('g_search_radius_factor_val').textContent=(this.value/10).toFixed(1)">
       </div>
       <div class="ctrl-group">
-        <span style="color:#ff8">Glint -Circularity min: <b id="g_circularity_min_val">0.3</b></span>
-        <input type="range" min="10" max="100" value="30" id="g_circularity_min"
+        <span style="color:#ff8">Glint -Circularity min: <b id="g_circularity_min_val">0.6</b></span>
+        <input type="range" min="10" max="100" value="60" id="g_circularity_min"
                oninput="document.getElementById('g_circularity_min_val').textContent=(this.value/100).toFixed(2)">
       </div>
       <div class="ctrl-group">
@@ -2695,8 +2695,8 @@ fetch('/eye_settings').then(r => r.json()).then(s => {
         <input type="range" min="10" max="50" value="25" id="g_search_radius_factor" oninput="upd(this,10)">
       </div>
       <div class="ctrl-group">
-        <span style="color:#ff8">Glint -Circ min: <b id="g_circularity_min_val">0.3</b></span>
-        <input type="range" min="10" max="100" value="30" id="g_circularity_min" oninput="upd(this,100)">
+        <span style="color:#ff8">Glint -Circ min: <b id="g_circularity_min_val">0.6</b></span>
+        <input type="range" min="10" max="100" value="60" id="g_circularity_min" oninput="upd(this,100)">
       </div>
       <div class="ctrl-group">
         <span style="color:#ff8">Glint -Iris r x pupil: <b id="g_iris_radius_factor_val">2.15</b></span>

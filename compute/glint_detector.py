@@ -155,7 +155,7 @@ class GlintDetector:
         brightness_thresh: int = 180,
         min_area: int = 5,
         max_area: int = 800,
-        circularity_min: float = 0.3,
+        circularity_min: float = 0.6,
         # Limbus detection
         limbus_n_rays: int = 16,
         limbus_max_factor: float = 4.0,

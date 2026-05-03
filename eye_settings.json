@@ -19,7 +19,7 @@
   "g_brightness_thresh": 150,
   "g_min_area": 5,
   "g_max_area": 800,
-  "g_circularity_min": 0.3,
+  "g_circularity_min": 0.6,
   "g_iris_radius_factor": 2.2,
   "g_limbus_n_rays": 16,
   "g_limbus_max_factor": 4.0,
@@ -29,5 +29,6 @@
   "g_min_dist_factor": 0.3,
   "glint_switch_dx": 0.0,
   "preferred_side": 1.0,
-  "swap_pccr": true
+  "swap_pccr": true,
+  "glint_mode": "dual"
 }
