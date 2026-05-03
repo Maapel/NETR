@@ -1807,7 +1807,7 @@ button.trace-on   { background: #1a1a33; color: #88ccff; border-color: #6699cc; 
   <span id="status">Connecting…</span>
 </div>
 <div id="bottom-bar">
-  <button id="btnGrid" title="Toggle grid mode — systematic 6×7 coverage [G]">GRID OFF</button>
+  <button id="btnGrid" title="Cycle spawn mode [G]: Zone → Grid → Adaptive">Zone</button>
   <button onclick="window.open('/viz','_blank')" title="Open visualiser [V]">📊 Viz</button>
   <button id="btnTrace" type="button" title="Toggle pipeline trace [T]">Trace OFF</button>
   <span id="glintSweepStatus"></span>
@@ -2337,19 +2337,26 @@ function pollArucoGate(now) {
 }
 
 // ── Grid mode ─────────────────────────────────────────────────────────────────
-let gridMode = false;
-let gridPts  = [];   // [{x,y}] — built at initSaccade time when W/H known
-let gridIdx  = 0;
+// ── Spawn mode: 'zone' | 'grid' | 'adaptive' ─────────────────────────────────
+const SPAWN_MODES = ['zone', 'grid', 'adaptive'];
+const SPAWN_LABELS = {zone: 'Zone', grid: 'Grid', adaptive: 'Adaptive'};
+const SPAWN_COLORS = {zone: '', grid: '#1a331a', adaptive: '#1a1a44'};
+const SPAWN_TEXT_COLORS = {zone: '', grid: '#88ff88', adaptive: '#88aaff'};
+let spawnMode = 'zone';
+let gridPts   = [];
+let gridIdx   = 0;
+// Collected screen-space points for adaptive mode
+let collectedPts = [];
 
 const btnGrid = document.getElementById('btnGrid');
 btnGrid.onclick = () => {
   if (running) return;
-  gridMode = !gridMode;
-  btnGrid.textContent = gridMode ? 'GRID ON' : 'GRID OFF';
-  btnGrid.classList.toggle('mode active', gridMode);
-  btnGrid.style.background    = gridMode ? '#1a331a' : '';
-  btnGrid.style.color         = gridMode ? '#88ff88' : '';
-  btnGrid.style.borderColor   = gridMode ? '#44cc44' : '';
+  const idx = SPAWN_MODES.indexOf(spawnMode);
+  spawnMode = SPAWN_MODES[(idx + 1) % SPAWN_MODES.length];
+  btnGrid.textContent    = SPAWN_LABELS[spawnMode];
+  btnGrid.style.background  = SPAWN_COLORS[spawnMode];
+  btnGrid.style.color       = SPAWN_TEXT_COLORS[spawnMode];
+  btnGrid.style.borderColor = SPAWN_TEXT_COLORS[spawnMode];
 };
 
 function markerExclusionSize() {
@@ -2387,14 +2394,49 @@ function buildGridPoints() {
   return pts;
 }
 
+// ── Adaptive candidate grid (8×5 = 40 points) ────────────────────────────────
+function buildAdaptiveCandidates() {
+  const cols = 8, rows = 5;
+  const padX = W * 0.08, padY = H * 0.10;
+  const pts = [];
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const p = {
+        x: padX + (W - 2*padX) * c / (cols - 1),
+        y: padY + (H - 2*padY) * r / (rows - 1),
+      };
+      if (!isOverMarker(p.x, p.y)) pts.push(p);
+    }
+  }
+  return pts;
+}
+
+// Pick candidate that maximises min-distance to all already-collected points.
+// First point: centre. Subsequent: farthest from any collected point.
+function adaptiveNextPoint() {
+  const cands = buildAdaptiveCandidates();
+  if (collectedPts.length === 0) return {x: W/2, y: H/2};
+  let best = cands[0], bestDist = -1;
+  for (const c of cands) {
+    // Skip if very close to an already-collected point
+    const minD = Math.min(...collectedPts.map(p =>
+      Math.hypot(c.x - p.x, c.y - p.y)));
+    if (minD > bestDist) { bestDist = minD; best = c; }
+  }
+  return best;
+}
+
 function nextSaccadePoint() {
-  if (gridMode) {
+  if (spawnMode === 'grid') {
     if (gridIdx >= gridPts.length) {
-      gridPts = buildGridPoints();   // new shuffle each pass
+      gridPts = buildGridPoints();
       gridIdx = 0;
     }
     saccadePos = gridPts[gridIdx++];
+  } else if (spawnMode === 'adaptive') {
+    saccadePos = adaptiveNextPoint();
   } else {
+    // zone
     if (zoneSeqIdx >= zoneSeq.length) {
       zoneSeq    = buildZoneSequence().slice(1);
       zoneSeqIdx = 0;
@@ -2408,10 +2450,11 @@ function nextSaccadePoint() {
 }
 
 function initSaccade() {
-  zoneSeq    = buildZoneSequence();
-  zoneSeqIdx = 0;
-  gridPts    = buildGridPoints();
-  gridIdx    = 0;
+  zoneSeq      = buildZoneSequence();
+  zoneSeqIdx   = 0;
+  gridPts      = buildGridPoints();
+  gridIdx      = 0;
+  collectedPts = [];
   saccadeCount  = 0;
   arucoGateOk   = false;
   lastArucoPoll = 0;
@@ -2436,19 +2479,22 @@ function tickSaccade(now) {
     fixationSentAt = now;
     saccadeSampled = true;
     saccadeCount++;
-    if (gridMode) {
+    collectedPts.push({x: saccadePos.x, y: saccadePos.y});  // track for adaptive
+    if (spawnMode === 'grid') {
       const total = gridPts.length;
       const pass  = Math.ceil(saccadeCount / total);
       statusEl.textContent = `Grid: ${saccadeCount} pts  (pass ${pass}, point ${gridIdx}/${total})`;
+    } else if (spawnMode === 'adaptive') {
+      statusEl.textContent = `Adaptive: ${saccadeCount} pts collected`;
     } else {
       const round   = Math.ceil(saccadeCount / 9);
       const inRound = ((saccadeCount - 1) % 9) + 1;
       statusEl.textContent = `Saccade: ${saccadeCount} pts  (round ${round}, point ${inRound}/9)`;
     }
   } else if (settled && !saccadeSampled) {
-    statusEl.textContent = gridMode
+    statusEl.textContent = spawnMode === 'grid'
       ? `Grid: ${saccadeCount} pts  (point ${gridIdx}/${gridPts.length}) — waiting for ArUco`
-      : `Saccade: ${saccadeCount} pts — waiting for 4 ArUco markers`;
+      : `${SPAWN_LABELS[spawnMode]}: ${saccadeCount} pts — waiting for 4 ArUco markers`;
   }
 
   if (saccadeSampled && fixationSentAt !== null && (now - fixationSentAt) >= FIXATE_MS) {
