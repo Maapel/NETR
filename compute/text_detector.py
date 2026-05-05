@@ -77,6 +77,7 @@ class TextROIDetector:
         spine_valley_thresh: float = 0.85, # valley/neighbour ratio threshold (lower = stricter)
         spine_angle_range: float = 20.0,   # ±degrees to search (rotated_proj)
         spine_n_angles: int = 9,           # number of angles to test (rotated_proj)
+        stabilize_lines: bool = False,     # temporal stabilization via optical flow
     ):
         self.min_area = min_area
         self.max_area = max_area
@@ -124,6 +125,11 @@ class TextROIDetector:
         self.spine_valley_thresh = spine_valley_thresh
         self.spine_angle_range = spine_angle_range
         self.spine_n_angles = spine_n_angles
+        self.stabilize_lines = stabilize_lines
+        # Stabilization state (optical flow between frames)
+        self._stab_prev_gray: "np.ndarray | None" = None
+        self._stab_prev_kps:  list = []          # tracked keypoints from prev frame
+        self._stab_prev_tracks: list = []        # tracks from prev frame
         self._last_debug: dict = {}
         self._mser = cv2.MSER_create()
         self._mser.setMinArea(min_area)
@@ -948,6 +954,13 @@ class TextROIDetector:
             block, int(self.adaptive_c),
         )
 
+        # ── Book region mask — restrict detection to page area ────────────────
+        book_quad = _find_book_quad(bgr)
+        if book_quad is not None:
+            book_mask = np.zeros((H, W), dtype=np.uint8)
+            cv2.fillPoly(book_mask, [book_quad], 255)
+            bin_inv = cv2.bitwise_and(bin_inv, book_mask)
+
         # ── Spine detection ───────────────────────────────────────────────────
         split_x     = None
         split_angle = 0.0
@@ -1027,6 +1040,13 @@ class TextROIDetector:
             bot = np.stack([xs_d, np.clip(ys_d + half_h, 0, H - 1)], axis=1).astype(np.int32)
             out.append(np.vstack([top, bot[::-1]]))
 
+        # Temporal stabilization: warp previous tracks when current detection fails
+        if self.stabilize_lines:
+            warped = self._stab_warp(gray)
+            if not tracks and warped:
+                tracks = warped
+            self._stab_update(gray, tracks, book_quad)
+
         self._last_debug = {
             "regions": [],
             "method": "curve_track",
@@ -1034,8 +1054,57 @@ class TextROIDetector:
             "bin_inv": bin_inv,
             "split_x": split_x,
             "split_angle": split_angle,
+            "book_quad": book_quad,
         }
         return out, float("nan")
+
+    # ── Temporal stabilization helpers ───────────────────────────────────────
+
+    def _stab_warp(self, gray: np.ndarray) -> list:
+        """Track keypoints from prev frame into current via LK optical flow.
+
+        Returns warped version of prev tracks (in current frame coords), or []
+        if there are not enough tracked points for a reliable homography.
+        """
+        if self._stab_prev_gray is None or not self._stab_prev_kps or not self._stab_prev_tracks:
+            return []
+        prev_pts = np.float32(self._stab_prev_kps).reshape(-1, 1, 2)
+        curr_pts, status, _ = cv2.calcOpticalFlowPyrLK(
+            self._stab_prev_gray, gray, prev_pts, None,
+            winSize=(21, 21), maxLevel=3,
+            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 20, 0.01),
+        )
+        if curr_pts is None:
+            return []
+        mask = status.ravel() == 1
+        if mask.sum() < 4:
+            return []
+        src = prev_pts[mask].reshape(-1, 2)
+        dst = curr_pts[mask].reshape(-1, 2)
+        H, inliers = cv2.findHomography(src, dst, cv2.RANSAC, 5.0)
+        if H is None or (inliers is not None and inliers.sum() < 4):
+            return []
+        warped = []
+        for track in self._stab_prev_tracks:
+            pts = np.float32(track).reshape(-1, 1, 2)
+            w = cv2.perspectiveTransform(pts, H)
+            warped.append([tuple(p[0].astype(int).tolist()) for p in w])
+        return warped
+
+    def _stab_update(self, gray: np.ndarray, tracks: list,
+                     book_quad: "np.ndarray | None") -> None:
+        """Refresh stabilization state: sample new keypoints when tracks are fresh."""
+        self._stab_prev_gray = gray.copy()
+        if tracks:
+            self._stab_prev_tracks = tracks
+            mask = None
+            if book_quad is not None:
+                mask = np.zeros(gray.shape, np.uint8)
+                cv2.fillPoly(mask, [book_quad], 255)
+            kps = cv2.goodFeaturesToTrack(
+                gray, maxCorners=120, qualityLevel=0.01, minDistance=8, mask=mask,
+            )
+            self._stab_prev_kps = kps.reshape(-1, 2).tolist() if kps is not None else []
 
     def annotate_curve_track(self, bgr: np.ndarray) -> np.ndarray:
         """Coloured polyline per detected text line (curve_track method)."""
@@ -2026,31 +2095,46 @@ def _merge_into_lines_indexed(
 # ── Book quad detection ────────────────────────────────────────────────────────
 
 def _find_book_quad(bgr: np.ndarray) -> np.ndarray | None:
-    """Detect the largest quadrilateral = book page boundary.
+    """Detect book page boundary as the largest bright region with dark blobs.
 
-    Returns shape (4,2) int32 polygon in image coordinates, or None.
-    Falls back to convex hull of the largest contour if no clean quad found.
+    Page = light background (paper) with dark text blobs on it.
+    Threshold to isolate bright region, morphologically close to fill text gaps,
+    find the largest blob, approx to quad.
+
+    Returns shape (N,2) int32 polygon, or None if no large bright region found.
     """
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY) if bgr.ndim == 3 else bgr
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    otsu_val, _ = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    lo = max(1.0, otsu_val * 0.5)
-    edges = cv2.Canny(blurred, lo, otsu_val)
-    edges = cv2.dilate(edges, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
-    cnts, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    H, W = gray.shape[:2]
+
+    # Threshold: keep pixels brighter than 60th percentile → isolates white page
+    thresh_val = int(np.percentile(gray, 60))
+    thresh_val = max(thresh_val, 80)    # never go below 80 (avoid dark scenes)
+    # subtract 1 so percentile value itself is included (cv2 uses strict >)
+    _, bright = cv2.threshold(gray, max(0, thresh_val - 1), 255, cv2.THRESH_BINARY)
+
+    # Close morphologically to fill dark text blobs within the page
+    close_k = max(3, min(W, H) // 30) | 1
+    k = cv2.getStructuringElement(cv2.MORPH_RECT, (close_k, close_k))
+    bright = cv2.morphologyEx(bright, cv2.MORPH_CLOSE, k, iterations=3)
+    bright = cv2.morphologyEx(bright, cv2.MORPH_OPEN,  k, iterations=1)
+
+    cnts, _ = cv2.findContours(bright, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not cnts:
         return None
-    H, W = bgr.shape[:2]
+
+    # Must cover at least 10% of the frame to be a page, not a highlight glare
     min_area = H * W * 0.10
     cnts = sorted(cnts, key=cv2.contourArea, reverse=True)
-    for cnt in cnts[:5]:
-        if cv2.contourArea(cnt) < min_area:
-            break
-        peri = cv2.arcLength(cnt, True)
-        approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
-        if len(approx) == 4:
-            return approx.reshape(4, 2).astype(np.int32)
-    hull = cv2.convexHull(cnts[0])
+    largest = cnts[0]
+    if cv2.contourArea(largest) < min_area:
+        return None
+
+    # Approx to quad; fall back to convex hull
+    hull = cv2.convexHull(largest)
+    peri = cv2.arcLength(hull, True)
+    approx = cv2.approxPolyDP(hull, 0.02 * peri, True)
+    if len(approx) == 4:
+        return approx.reshape(4, 2).astype(np.int32)
     return hull.reshape(-1, 2).astype(np.int32)
 
 

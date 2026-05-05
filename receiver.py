@@ -54,8 +54,13 @@ _tl_params: dict = {
     "track_max_gap":   2,
     "smooth_win":      7,
     "min_track_len":   4,
-    "split_pages":     False,
-    "spine_method":    "column_sum",
+    "split_pages":        False,
+    "spine_method":       "rotated_proj",
+    "spine_search_frac":  0.35,
+    "spine_valley_thresh": 0.85,
+    "spine_angle_range":  20.0,
+    "spine_n_angles":     9,
+    "stabilize":          False,
 }
 
 def _get_text_detector():
@@ -79,6 +84,11 @@ def _get_text_detector():
             min_track_len=int(p["min_track_len"]),
             split_pages=bool(p["split_pages"]),
             spine_method=str(p["spine_method"]),
+            spine_search_frac=float(p["spine_search_frac"]),
+            spine_valley_thresh=float(p["spine_valley_thresh"]),
+            spine_angle_range=float(p["spine_angle_range"]),
+            spine_n_angles=int(p["spine_n_angles"]),
+            stabilize_lines=bool(p["stabilize"]),
         )
     except Exception as _e:
         print(f"text_detector unavailable: {_e}")
@@ -87,6 +97,9 @@ def _get_text_detector():
 # Line-based gaze snapper (lazy-init)
 _line_snapper      = None
 _line_snapper_lock = threading.Lock()
+
+# Cache last text-line detection result — reuse when world-cam frame hasn't changed
+_gaze_line_cache: dict = {"frame_hash": None, "tracks": [], "book_quad": None}
 
 def _get_line_snapper():
     global _line_snapper
@@ -1194,10 +1207,11 @@ class MJPEGHandler(BaseHTTPRequestHandler):
 
         # Text-line overlay params — any tl_* key rebuilds the detector
         _tl_int   = {"blur_ksize", "adaptive_block", "strip_count", "peak_min_dist",
-                     "y_tol", "track_max_gap", "smooth_win", "min_track_len"}
-        _tl_float = {"clahe_clip", "adaptive_c", "peak_min_height"}
+                     "y_tol", "track_max_gap", "smooth_win", "min_track_len", "spine_n_angles"}
+        _tl_float = {"clahe_clip", "adaptive_c", "peak_min_height",
+                     "spine_search_frac", "spine_valley_thresh", "spine_angle_range"}
         _tl_dirty = False
-        for k in list(_tl_int | _tl_float | {"split_pages", "spine_method"}):
+        for k in list(_tl_int | _tl_float | {"split_pages", "spine_method", "stabilize"}):
             key = "tl_" + k
             if key in params:
                 if k in _tl_int:
@@ -1376,30 +1390,26 @@ class MJPEGHandler(BaseHTTPRequestHandler):
         try: self.wfile.write(body)
         except BrokenPipeError: pass
 
-    # ── /gaze_line  snap gaze to nearest text baseline ────────────────────────
+    # ── /gaze_line  detect text lines + highlight active line under gaze ────────
     def _gaze_line(self):
-        """
-        Run LineSnapper on the current world-cam frame using the latest gaze.
-        Returns JSON with snapped gaze, line index, confidence, WPM, etc.
-        World cam is whichever cam is NOT the eye cam (cam1=eye → world=cam2, else cam1).
+        """Detect text lines in world cam (book-masked), find nearest to gaze.
+
+        Returns tracks (polylines), active_line index, book_quad, raw gaze.
+        No snapping or hysteresis — raw nearest-line detection only.
         """
         world_cam = CAMS[2] if g_eye_cam == 1 else CAMS[1]
         det = _get_text_detector()
-        snapper = _get_line_snapper()
 
         result = {
             "ok": False,
-            "line_idx": None,
+            "active_line": None,
             "line_count": 0,
-            "snap_xy": None,
-            "confidence": 0.0,
-            "is_new_line": False,
-            "is_regression": False,
-            "dwell_ms": 0.0,
+            "tracks": [],
+            "book_quad": None,
             "raw_gaze_xy": None,
         }
 
-        if det is None or snapper is None or not _PUPIL_OK:
+        if det is None or not _PUPIL_OK:
             body = json.dumps(result).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -1409,7 +1419,6 @@ class MJPEGHandler(BaseHTTPRequestHandler):
             except BrokenPipeError: pass
             return
 
-        # Get latest gaze from engine
         eng = _engine_get_result()
         gaze = None
         if eng and eng.get("ready") and isinstance(eng.get("gaze"), list):
@@ -1427,55 +1436,64 @@ class MJPEGHandler(BaseHTTPRequestHandler):
             except BrokenPipeError: pass
             return
 
-        # Get tracks + book quad from world cam frame
         tracks = []
-        page_quad_size = None
+        book_quad = None
         with world_cam.frame_lock:
             frame_data = world_cam.latest_frame
 
         if frame_data:
-            try:
-                buf = np.frombuffer(frame_data, dtype=np.uint8)
-                bgr = cv2.imdecode(buf, cv2.IMREAD_COLOR)
-                if bgr is not None:
-                    det.detect_lines(bgr)
-                    tracks = det._last_debug.get("tracks", [])
-                    H, W = bgr.shape[:2]
-                    snapper.scene_w = W
-                    snapper.scene_h = H
-                    try:
-                        from compute.text_detector import _find_book_quad, _book_quad_size
-                        quad = _find_book_quad(bgr)
-                        if quad is not None:
-                            page_quad_size = _book_quad_size(quad)
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+            frame_hash = hash(frame_data)
+            if frame_hash == _gaze_line_cache["frame_hash"]:
+                # Same frame as last call — reuse cached detection
+                tracks    = _gaze_line_cache["tracks"]
+                book_quad = _gaze_line_cache["book_quad"]
+            else:
+                try:
+                    buf = np.frombuffer(frame_data, dtype=np.uint8)
+                    bgr = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+                    if bgr is not None:
+                        det.detect_lines(bgr)
+                        tracks    = det._last_debug.get("tracks", [])
+                        book_quad = det._last_debug.get("book_quad")
+                        _gaze_line_cache["frame_hash"] = frame_hash
+                        _gaze_line_cache["tracks"]     = tracks
+                        _gaze_line_cache["book_quad"]  = book_quad
+                except Exception:
+                    pass
 
-        ts_ms = time.time() * 1000.0
-        with _line_snapper_lock:
-            snap = snapper.update(tracks, gaze, ts_ms, page_quad_size=page_quad_size)
+        # Sort tracks top→bottom by mean Y (simple; book assumed roughly upright)
+        tracks_sorted = sorted(tracks, key=lambda t: float(np.mean([p[1] for p in t])))
+
+        # Nearest track: minimum 2D distance from gaze to any polyline segment
+        active_line = None
+        if tracks_sorted:
+            gx, gy = gaze
+            best_d = float("inf")
+            for i, track in enumerate(tracks_sorted):
+                for j in range(len(track) - 1):
+                    ax, ay = float(track[j][0]),   float(track[j][1])
+                    bx, by = float(track[j+1][0]), float(track[j+1][1])
+                    abx, aby = bx - ax, by - ay
+                    ab2 = abx*abx + aby*aby
+                    t = max(0.0, min(1.0, ((gx-ax)*abx + (gy-ay)*aby) / ab2)) if ab2 > 1e-9 else 0.0
+                    d = ((gx - ax - t*abx)**2 + (gy - ay - t*aby)**2)**0.5
+                    if d < best_d:
+                        best_d = d
+                        active_line = i
+                # Single-point tracks
+                if len(track) == 1:
+                    d = ((gx - track[0][0])**2 + (gy - track[0][1])**2)**0.5
+                    if d < best_d:
+                        best_d = d
+                        active_line = i
 
         result = {
             "ok": True,
-            "line_idx": snap.line_idx,
-            "line_count": snap.line_count,
-            "snap_xy": list(snap.snap_xy) if snap.snap_xy else None,
-            "confidence": snap.confidence,
-            "is_new_line": snap.is_new_line,
-            "is_regression": snap.is_regression,
-            "dwell_ms": round(snap.dwell_ms, 1),
-            "raw_gaze_xy": list(snap.raw_gaze_xy),
-            "offset_px": round(snapper._offset, 1),
-            "offset_ready": snapper.offset_ready,
-            "depth_calib_active": snapper.depth_calib_active,
-            "depth_calib_trained": snapper.depth_calib_trained,
-            "depth_calib_n": snapper.depth_calib_sample_count,
-            "depth_calib_std": round(snapper.depth_calib_size_std, 1),
-            "parallax_a": round(snapper._parallax_a, 4),
-            "parallax_b": round(snapper._parallax_b, 1),
-            "page_quad_size": round(page_quad_size, 1) if page_quad_size is not None else None,
+            "active_line": active_line,
+            "line_count": len(tracks_sorted),
+            "tracks": [[list(pt) for pt in t] for t in tracks_sorted],
+            "book_quad": book_quad.tolist() if book_quad is not None else None,
+            "raw_gaze_xy": list(gaze),
         }
         body = json.dumps(result).encode()
         self.send_response(200)
@@ -1582,10 +1600,6 @@ class MJPEGHandler(BaseHTTPRequestHandler):
     <label style="cursor:pointer; user-select:none"><input type="checkbox" id="text_lines_world"> Show text lines on world cam</label>
     <label style="cursor:pointer; user-select:none"><input type="checkbox" id="line_snap_world"> Line snap gaze</label>
     <span id="line_snap_hud" style="color:#8f8;font-size:11px;min-width:180px"></span>
-    <button id="depth_calib_btn" type="button"
-            style="padding:4px 10px;background:#363;color:#cfc;border:none;border-radius:3px;cursor:pointer;font-size:11px"
-            onclick="depthCalibToggle()">Depth calib</button>
-    <span id="depth_calib_hud" style="color:#adf;font-size:11px;min-width:200px"></span>
     <span style="color:#888">Model</span>
     <select id="gaze_model_select" style="min-width:220px"></select>
     <button type="button" onclick="applyGazeModel()" style="padding:4px 12px;background:#257;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px">Apply model</button>
@@ -1786,10 +1800,37 @@ class MJPEGHandler(BaseHTTPRequestHandler):
       <div class="ctrl-group">
         <span>Spine method</span>
         <select id="tl_spine_method" onchange="tlSet('spine_method',this.value)">
-          <option value="column_sum" selected>column_sum (fast, vertical)</option>
-          <option value="rotated_proj">rotated_proj (angle search ±20°)</option>
-          <option value="line_perp">line_perp (perpendicular to tracks)</option>
+          <option value="column_sum">column_sum (vertical only)</option>
+          <option value="rotated_proj" selected>rotated_proj (±angle, default)</option>
+          <option value="line_perp">line_perp (perp to tracks)</option>
           <option value="none">none</option>
+        </select>
+      </div>
+      <div class="ctrl-group">
+        <span>Spine search frac: <b id="tl_spine_search_frac_v">0.35</b></span>
+        <input type="range" min="0.1" max="0.5" step="0.05" value="0.35" id="tl_spine_search_frac"
+               oninput="document.getElementById('tl_spine_search_frac_v').textContent=this.value;tlSet('spine_search_frac',this.value)">
+      </div>
+      <div class="ctrl-group">
+        <span>Spine valley thresh: <b id="tl_spine_valley_thresh_v">0.85</b></span>
+        <input type="range" min="0.5" max="1.0" step="0.05" value="0.85" id="tl_spine_valley_thresh"
+               oninput="document.getElementById('tl_spine_valley_thresh_v').textContent=this.value;tlSet('spine_valley_thresh',this.value)">
+      </div>
+      <div class="ctrl-group">
+        <span>Spine angle range °: <b id="tl_spine_angle_range_v">20</b></span>
+        <input type="range" min="5" max="45" step="5" value="20" id="tl_spine_angle_range"
+               oninput="document.getElementById('tl_spine_angle_range_v').textContent=this.value;tlSet('spine_angle_range',this.value)">
+      </div>
+      <div class="ctrl-group">
+        <span>Spine n angles: <b id="tl_spine_n_angles_v">9</b></span>
+        <input type="range" min="3" max="19" step="2" value="9" id="tl_spine_n_angles"
+               oninput="document.getElementById('tl_spine_n_angles_v').textContent=this.value;tlSet('spine_n_angles',this.value)">
+      </div>
+      <div class="ctrl-group">
+        <span>Stabilize lines</span>
+        <select id="tl_stabilize" onchange="tlSet('stabilize',this.value)">
+          <option value="0" selected>Off</option>
+          <option value="1">On (optical flow)</option>
         </select>
       </div>
     </div>
@@ -1938,8 +1979,8 @@ class MJPEGHandler(BaseHTTPRequestHandler):
       <div style="padding:6px 0; display:flex; align-items:center; gap:8px">
         <label style="font-size:12px">Mode
           <select id="glint_mode" onchange="setGlintMode(this.value)" style="margin-left:4px">
-            <option value="dual">Dual (11-term)</option>
-            <option value="single">Single (6-term)</option>
+            <option value="dual">Dual glint (2×6-term, right-first)</option>
+            <option value="single">Single glint (6-term)</option>
           </select>
         </label>
         <span id="glint-mode-feedback" style="font-size:11px; color:#8df"></span>
@@ -1962,45 +2003,11 @@ const gazeOverlayEl    = document.getElementById('gaze_overlay_world');
 const textLinesEl      = document.getElementById('text_lines_world');
 const lineSnapEl       = document.getElementById('line_snap_world');
 const lineSnapHud      = document.getElementById('line_snap_hud');
-const depthCalibBtn    = document.getElementById('depth_calib_btn');
-const depthCalibHud    = document.getElementById('depth_calib_hud');
 let   _lastTextLines   = null;   // {lines, w, h} cached from last /text_lines fetch
 let   _textLinesFetching = false;
 let   _lastGazeLine    = null;   // cached /gaze_line response
 let   _gazeLineFetching = false;
-let   _depthCalibActive = false;
 
-function depthCalibToggle() {
-  if (_depthCalibActive) {
-    fetch('/set?depth_calib=stop').catch(() => {});
-    _depthCalibActive = false;
-    if (depthCalibBtn) depthCalibBtn.textContent = 'Depth calib';
-  } else {
-    fetch('/set?depth_calib=start').catch(() => {});
-    _depthCalibActive = true;
-    if (depthCalibBtn) { depthCalibBtn.textContent = 'Stop calib'; depthCalibBtn.style.background='#633'; }
-  }
-}
-
-function _updateDepthCalibHud(j) {
-  if (!depthCalibHud || !j) return;
-  if (j.depth_calib_trained) {
-    depthCalibHud.style.color = '#adf';
-    depthCalibHud.textContent =
-      `parallax ✓ a=${j.parallax_a} b=${j.parallax_b}px` +
-      (j.page_quad_size !== null ? `  quad=${j.page_quad_size}px` : '');
-    if (depthCalibBtn) { depthCalibBtn.textContent = 'Depth calib'; depthCalibBtn.style.background='#363'; }
-    _depthCalibActive = false;
-  } else if (j.depth_calib_active) {
-    const pct = Math.min(100, Math.round(j.depth_calib_n / 40 * 100));
-    depthCalibHud.style.color = '#fa8';
-    depthCalibHud.textContent =
-      `collecting… ${j.depth_calib_n} samples  range=${j.depth_calib_std}px (need ≥30)`;
-  } else {
-    depthCalibHud.style.color = '#888';
-    depthCalibHud.textContent = j.depth_calib_trained ? '' : '(not calibrated)';
-  }
-}
 
 function _fetchGazeLine() {
   if (_gazeLineFetching || !lineSnapEl || !lineSnapEl.checked) return;
@@ -2009,7 +2016,6 @@ function _fetchGazeLine() {
     .then(r => r.ok ? r.json() : null)
     .then(j => {
       if (j && j.ok) _lastGazeLine = j;
-      _updateDepthCalibHud(j);
     })
     .catch(() => {})
     .finally(() => { _gazeLineFetching = false; });
@@ -2347,48 +2353,62 @@ function drawGazeOnWorldCanvas() {
   ctx.stroke();
 
   // Snapped gaze (yellow dot + horizontal rule to raw)
-  const snapOn = lineSnapEl && lineSnapEl.checked && _lastGazeLine && _lastGazeLine.snap_xy;
-  if (snapOn) {
-    const [sx, sy] = scaleXY(_lastGazeLine.snap_xy[0], _lastGazeLine.snap_xy[1]);
-    // Dashed line from raw to snapped
-    ctx.strokeStyle = 'rgba(255,220,0,0.5)';
-    ctx.lineWidth = 1;
-    ctx.setLineDash([3, 3]);
-    ctx.beginPath(); ctx.moveTo(rx, ry); ctx.lineTo(sx, sy); ctx.stroke();
-    ctx.setLineDash([]);
-    // Snapped crosshair (yellow)
-    ctx.strokeStyle = _lastGazeLine.is_regression ? '#f80' : '#ff0';
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    ctx.moveTo(sx - r, sy); ctx.lineTo(sx + r, sy);
-    ctx.moveTo(sx, sy - r); ctx.lineTo(sx, sy + r);
-    ctx.stroke();
-    // HUD text (sidebar span)
-    const conf  = (_lastGazeLine.confidence * 100).toFixed(0);
-    const li    = _lastGazeLine.line_idx !== null ? `L${_lastGazeLine.line_idx + 1}/${_lastGazeLine.line_count}` : '';
-    const reg   = _lastGazeLine.is_regression ? ' ↩re-read' : (_lastGazeLine.is_new_line ? ' →new' : '');
-    const dwell = _lastGazeLine.dwell_ms > 0 ? ` ${(_lastGazeLine.dwell_ms/1000).toFixed(1)}s` : '';
-    const offTxt = _lastGazeLine.offset_ready
-      ? ` off:${_lastGazeLine.offset_px > 0 ? '+' : ''}${_lastGazeLine.offset_px}px`
-      : ' (calibrating…)';
-    if (lineSnapHud) lineSnapHud.textContent = `${li} conf:${conf}%${dwell}${reg}${offTxt}`;
+  // Text line overlay + active line highlight
+  const lineOn = lineSnapEl && lineSnapEl.checked && _lastGazeLine && _lastGazeLine.ok;
+  if (lineOn) {
+    const gl = _lastGazeLine;
+    const tracks = gl.tracks || [];
+    const activeIdx = gl.active_line;
 
-    // HUD drawn on canvas (top-left corner, always visible)
-    ctx.save();
-    ctx.font = 'bold 13px monospace';
-    const hudLines = [
-      `${li}  conf ${conf}%${dwell}`,
-      reg ? reg.trim() : '',
-      _lastGazeLine.offset_ready ? `depth offset ${_lastGazeLine.offset_px > 0 ? '+' : ''}${_lastGazeLine.offset_px}px` : 'calibrating depth offset…',
-    ].filter(Boolean);
-    const pad = 6;
-    hudLines.forEach((txt, i) => {
-      ctx.fillStyle = 'rgba(0,0,0,0.55)';
-      ctx.fillRect(8, 8 + i * 18, ctx.measureText(txt).width + pad * 2, 17);
-      ctx.fillStyle = i === 0 ? '#ff0' : (reg && i === 1 ? '#f80' : '#8f8');
-      ctx.fillText(txt, 8 + pad, 22 + i * 18);
+    // Book quad outline
+    if (gl.book_quad && gl.book_quad.length >= 3) {
+      ctx.strokeStyle = 'rgba(100,180,255,0.5)';
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([6, 4]);
+      ctx.beginPath();
+      gl.book_quad.forEach(([px, py], i) => {
+        const [cx, cy] = scaleXY(px, py);
+        i === 0 ? ctx.moveTo(cx, cy) : ctx.lineTo(cx, cy);
+      });
+      ctx.closePath();
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+
+    // All tracks (dim)
+    tracks.forEach((track, i) => {
+      if (i === activeIdx || track.length < 2) return;
+      ctx.strokeStyle = 'rgba(100,220,100,0.35)';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      track.forEach(([px, py], j) => {
+        const [cx, cy] = scaleXY(px, py);
+        j === 0 ? ctx.moveTo(cx, cy) : ctx.lineTo(cx, cy);
+      });
+      ctx.stroke();
     });
-    ctx.restore();
+
+    // Active track (bright highlight)
+    if (activeIdx !== null && activeIdx < tracks.length) {
+      const at = tracks[activeIdx];
+      ctx.strokeStyle = '#ffe040';
+      ctx.lineWidth = 3;
+      ctx.shadowColor = '#ffe040';
+      ctx.shadowBlur = 6;
+      ctx.beginPath();
+      at.forEach(([px, py], j) => {
+        const [cx, cy] = scaleXY(px, py);
+        j === 0 ? ctx.moveTo(cx, cy) : ctx.lineTo(cx, cy);
+      });
+      ctx.stroke();
+      ctx.shadowBlur = 0;
+    }
+
+    // HUD: line index
+    if (lineSnapHud) {
+      const li = activeIdx !== null ? `L${activeIdx + 1}/${gl.line_count}` : `${gl.line_count} lines`;
+      lineSnapHud.textContent = li;
+    }
   } else if (lineSnapHud) {
     lineSnapHud.textContent = '';
   }
