@@ -4,14 +4,42 @@ All parameters exposed in `tools/text_tuner.py`. Organised by method.
 
 ---
 
-## Line Detection Method (`line_method`)
+## Line Detection Methods
+
+### `mser_global`
+Estimates **one dominant skew** for the whole frame (projection-profile variance or NN median), rotates box corners, merges by y-overlap. Fast (~5–15ms). Best when the page is roughly planar and all text shares a tilt. Fails on curved pages or two-page spreads where two pages tilt oppositely.
+
+### `docstrum`
+Every region gets its **own local orientation** from its k-nearest neighbors, smoothed by complex-mean. Edges connecting neighbors within `angle_tol` form a graph; connected components = lines. Tolerates curved pages, perspective, any plane. O(N·k) — ~15–40ms. Tune `angle_tol` loose for curl, tight for noise.
+
+### `vector_flow`
+Same kNN angle graph as docstrum, but groups members into a reading-order **chain** (sorted by projection onto mean text direction) and outputs a **convex hull** per chain instead of minAreaRect. The hull naturally wraps curved/arced lines without over-boxing. knn panel shows magenta arrows for chain order. Uses same docstrum sliders.
+
+### `word_chain`
+Each MSER region gets a **rotated** bounding box aligned to its local smoothed angle (not axis-aligned). Then left-to-right greedy ray-cast: the leading-edge ray from box A hits the first unassigned box B on the same baseline → A chains to B. Produces text-direction-aware chains without global skew. Tune same docstrum sliders; `docstrum_max_dist` controls how far the ray reaches.
+
+### `gap_scan`
+Projects the preprocessed image onto the y-axis (mean intensity per row) and finds **bright horizontal bands** = inter-line whitespace. Each consecutive pair of gaps becomes the top/bottom border of a text-line strip. No MSER needed. Very robust to word spaces, ligatures, and kerning gaps. Tune `gap_threshold` and enable `clahe_clip` for dark images.
+
+### `local_patch`
+Splits the image into a `patch_grid × patch_grid` grid (with 10% overlap), runs `mser_global` per patch so each patch gets its own skew. Handles non-planar pages crudely but does **not** stitch lines across patch boundaries. Cheapest mental model; use 2–4 grid.
+
+### `curve_track`
+No MSER. Binarises the image (adaptive threshold, controlled by `adaptive_block`/`adaptive_c`/`clahe_clip`/`blur_ksize`) then slices it into vertical strips. Per strip: horizontal projection profile → peak finding → greedy tracking across strips. Naturally **follows page curvature**. Use `split_pages` to handle book spreads. Output: polynomial-fit curved strip polygons. Tune `peak_min_dist` to roughly the inter-line gap in pixels.
+
+---
+
+## Line Detection Method (`line_method`) — Quick Reference
 
 | Value | Description |
 |-------|-------------|
-| `mser_global` | MSER regions → group into lines using merge/docstrum/word_chain |
-| `gap_scan` | White inter-line gaps → strip borders |
-| `curve_track` | Strip projection peaks, follows page curvature |
-| `local_patch` | Splits image into N×N patches, runs `mser_global` per patch |
+| `mser_global` | One global skew estimate → MSER regions → merge/docstrum/word_chain grouping |
+| `docstrum` | Per-region local orientation via kNN → graph edges → connected components |
+| `vector_flow` | Like docstrum but outputs convex hull chains — handles curved/arced lines |
+| `word_chain` | Rotated per-region boxes + greedy ray-cast chaining left-to-right |
+| `gap_scan` | Bright inter-line whitespace bands → strip borders, no MSER |
+| `local_patch` | N×N patch grid, `mser_global` per patch, own skew per patch |
+| `curve_track` | Vertical strip projection peaks tracked across strips, follows curvature |
 
 ---
 
