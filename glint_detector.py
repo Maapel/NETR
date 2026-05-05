@@ -67,6 +67,22 @@ def _estimate_limbus_radius(
         limbus_rs.append(float(radii[peak_i]))
 
     if len(limbus_rs) < n_rays // 2:
+        # Collect peak gradients for diagnosis even when detection fails
+        _peak_grads = []
+        for angle in angles:
+            cos_a, sin_a = np.cos(angle), np.sin(angle)
+            xs = np.clip(cx + cos_a * radii, 0, w - 1).astype(np.int32)
+            ys = np.clip(cy + sin_a * radii, 0, h - 1).astype(np.int32)
+            profile = gray[ys, xs].astype(np.float32)
+            smoothed = np.convolve(profile, kernel, mode="same")
+            grad2 = np.diff(smoothed)[smooth_k // 2:]
+            if len(grad2) >= 2:
+                _peak_grads.append(float(grad2.max()))
+        if _peak_grads:
+            import sys
+            print(f"[limbus] FAIL: {len(limbus_rs)}/{n_rays} rays ok  "
+                  f"peak_grads max={max(_peak_grads):.1f} median={sorted(_peak_grads)[len(_peak_grads)//2]:.1f} "
+                  f"threshold={min_gradient}", file=sys.stderr, flush=True)
         return None
     return float(np.median(limbus_rs))
 

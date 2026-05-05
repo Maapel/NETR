@@ -42,7 +42,7 @@ class GazeModel:
         ones = np.ones_like(dx)
         return np.column_stack([ones, dx, dy, dx * dy, dx**2, dy**2])
 
-    def fit(self, samples: list[dict]) -> dict:
+    def fit(self, samples: list[dict], weights: "np.ndarray | None" = None) -> dict:
         if len(samples) < 6:
             raise ValueError(f"Need at least 6 samples, got {len(samples)}")
         dx = np.array([s["dx"] for s in samples], dtype=float)
@@ -50,8 +50,17 @@ class GazeModel:
         Ux = np.array([s["X"]  for s in samples], dtype=float)
         Uy = np.array([s["Y"]  for s in samples], dtype=float)
         M  = self._design(dx, dy)
-        self.A, _, _, _ = np.linalg.lstsq(M, Ux, rcond=None)
-        self.B, _, _, _ = np.linalg.lstsq(M, Uy, rcond=None)
+        if weights is not None:
+            # Weighted least squares: scale rows by sqrt(w)
+            sqw = np.sqrt(np.clip(np.asarray(weights, dtype=float), 0, None))
+            M_w  = M  * sqw[:, None]
+            Ux_w = Ux * sqw
+            Uy_w = Uy * sqw
+            self.A, _, _, _ = np.linalg.lstsq(M_w, Ux_w, rcond=None)
+            self.B, _, _, _ = np.linalg.lstsq(M_w, Uy_w, rcond=None)
+        else:
+            self.A, _, _, _ = np.linalg.lstsq(M, Ux, rcond=None)
+            self.B, _, _, _ = np.linalg.lstsq(M, Uy, rcond=None)
         self._n_terms = 6
         self.trained  = True
         Ux_pred = M @ self.A
@@ -355,25 +364,38 @@ class SplitGlintModel:
 
     @staticmethod
     def _sigma_filter(samples: list[dict], dy_key: str, dx_key: str,
-                      min_pccr: float, sigma: float) -> tuple[list[dict], list[dict]]:
+                      min_pccr: float, sigma: float,
+                      weights: "np.ndarray | None" = None,
+                      ) -> "tuple[list[dict], list[dict], np.ndarray | None]":
         """Remove samples where |dy| > mean + sigma*std (outlier glint detection).
-        Returns (kept, rejected)."""
-        candidates = [s for s in samples if abs(s[dx_key]) >= min_pccr]
+        Returns (kept, rejected, kept_weights)."""
+        idx = [i for i, s in enumerate(samples) if abs(s[dx_key]) >= min_pccr]
+        candidates = [samples[i] for i in idx]
+        cand_w = weights[idx] if weights is not None else None
         if len(candidates) < 3:
-            return candidates, []
+            return candidates, [], cand_w
         dy_vals = np.array([abs(s[dy_key]) for s in candidates])
         threshold = dy_vals.mean() + sigma * dy_vals.std()
-        kept     = [s for s in candidates if abs(s[dy_key]) <= threshold]
-        rejected = [s for s in candidates if abs(s[dy_key]) >  threshold]
-        return kept, rejected
+        mask = dy_vals <= threshold
+        kept     = [s for s, k in zip(candidates, mask) if k]
+        rejected = [s for s, k in zip(candidates, mask) if not k]
+        kept_w   = cand_w[mask] if cand_w is not None else None
+        return kept, rejected, kept_w
 
-    def fit(self, samples: list[dict]) -> dict:
-        both = [s for s in samples if "dx1" in s and "dx2" in s]
+    def fit(self, samples: list[dict], weights: "np.ndarray | None" = None) -> dict:
+        both_idx = [i for i, s in enumerate(samples) if "dx1" in s and "dx2" in s]
+        both     = [samples[i] for i in both_idx]
+        both_w   = weights[both_idx] if weights is not None else None
+
         if len(both) < self.MIN_SAMPLES:
             raise ValueError(f"Need ≥{self.MIN_SAMPLES} two-glint samples, got {len(both)}")
 
-        right_s, right_rej = self._sigma_filter(both, "dy1", "dx1", self.MIN_PCCR, self.OUTLIER_SIGMA)
-        left_s,  left_rej  = self._sigma_filter(both, "dy2", "dx2", self.MIN_PCCR, self.OUTLIER_SIGMA)
+        both_w_arr = np.asarray(both_w, dtype=float) if both_w is not None else None
+
+        right_s, right_rej, right_w = self._sigma_filter(
+            both, "dy1", "dx1", self.MIN_PCCR, self.OUTLIER_SIGMA, both_w_arr)
+        left_s,  left_rej,  left_w  = self._sigma_filter(
+            both, "dy2", "dx2", self.MIN_PCCR, self.OUTLIER_SIGMA, both_w_arr)
 
         if len(right_s) < self.MIN_SAMPLES:
             raise ValueError(f"Right-glint: only {len(right_s)} samples after filtering")
@@ -381,10 +403,12 @@ class SplitGlintModel:
             raise ValueError(f"Left-glint: only {len(left_s)} samples after filtering")
 
         diag_r = self.model_right.fit(
-            [{"dx": s["dx1"], "dy": s["dy1"], "X": s["X"], "Y": s["Y"]} for s in right_s]
+            [{"dx": s["dx1"], "dy": s["dy1"], "X": s["X"], "Y": s["Y"]} for s in right_s],
+            weights=right_w,
         )
         diag_l = self.model_left.fit(
-            [{"dx": s["dx2"], "dy": s["dy2"], "X": s["X"], "Y": s["Y"]} for s in left_s]
+            [{"dx": s["dx2"], "dy": s["dy2"], "X": s["X"], "Y": s["Y"]} for s in left_s],
+            weights=left_w,
         )
         self.trained = True
         return {
@@ -394,15 +418,30 @@ class SplitGlintModel:
             "r2_x_left":  diag_l["r2_x"], "r2_y_left":  diag_l["r2_y"],
         }
 
+    # Set True to use max-magnitude glint selection instead of preferred-side.
+    # Deprecated: LOO analysis shows always-right outperforms magnitude-based
+    # selection when left model has fewer/noisier training samples.
+    USE_MAX_MAGNITUDE = False
+
     def predict(self, dx1: float, dy1: float,
                 dx2: float, dy2: float) -> tuple[float, float]:
         if not self.trained:
             raise RuntimeError("Model not trained")
-        # Select glint with larger magnitude — higher PCCR magnitude = LED farther
-        # from pupil centre = higher SNR measurement.
-        if (dx1**2 + dy1**2) >= (dx2**2 + dy2**2):
+        if self.USE_MAX_MAGNITUDE:
+            if (dx1**2 + dy1**2) >= (dx2**2 + dy2**2):
+                return self.model_right.predict(dx1, dy1)
+            else:
+                return self.model_left.predict(dx2, dy2)
+        # Default: always use right (preferred) LED model.
+        # Fall back to left only when right glint is near-zero (unreliable).
+        if abs(dx1) >= self.MIN_PCCR:
             return self.model_right.predict(dx1, dy1)
+        elif abs(dx2) >= self.MIN_PCCR:
+            return self.model_left.predict(dx2, dy2)
         else:
+            # Both near-zero — least-bad: use larger magnitude
+            if (dx1**2 + dy1**2) >= (dx2**2 + dy2**2):
+                return self.model_right.predict(dx1, dy1)
             return self.model_left.predict(dx2, dy2)
 
     def save(self, path: str | pathlib.Path):

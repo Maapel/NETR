@@ -45,6 +45,12 @@ class LineSnapper:
       2. Large backward jump along track tangent → end-of-line wrap or re-read
 
     Book can be at any angle — all geometry is 2D track-relative.
+
+    Depth parallax correction:
+      World cam is physically offset from the eye (mainly in Y).
+      Parallax = baseline_y * focal / Z ∝ apparent_page_size (sqrt of quad area).
+      A linear model  parallax_y = a * quad_size + b  is fit during depth calibration:
+      user fixates one text line while slowly moving book toward/away from them.
     """
 
     SMOOTH_MS           = 120.0   # rolling median window for raw gaze (ms)
@@ -54,6 +60,10 @@ class LineSnapper:
     SACCADE_PX_MS       = 1.5     # px/ms; above = saccade, skip hysteresis update
     OFFSET_CALIB_FRAMES = 20      # high-conf frames to collect before applying offset
     OFFSET_CONF_MIN     = 0.6     # minimum confidence to count a frame for offset calib
+
+    # Depth calibration thresholds
+    DEPTH_CALIB_MIN_SAMPLES  = 40    # minimum frames collected before auto-fit
+    DEPTH_CALIB_MIN_SIZE_STD = 30.0  # minimum std of quad_size values (ensures depth range covered)
 
     def __init__(self):
         self._smooth_buf: collections.deque = collections.deque(maxlen=64)
@@ -71,16 +81,27 @@ class LineSnapper:
         self._offset: float = 0.0          # applied correction (px)
         self.offset_ready: bool = False    # True once calibrated
 
+        # Depth-dependent parallax model: parallax_y = a * quad_size + b
+        # Active when depth_calib_trained is True and a quad_size is available.
+        # Falls back to fixed _offset otherwise.
+        self._parallax_a: float = 0.0
+        self._parallax_b: float = 0.0
+        self.depth_calib_trained: bool = False
+        self.depth_calib_active: bool = False
+        self._depth_calib_samples: list[tuple[float, float]] = []  # (quad_size, offset_y)
+
     # ── Public ────────────────────────────────────────────────────────────────
 
     def update(self,
                tracks: list[list[tuple[int, int]]],
                gaze_xy: tuple[float, float],
-               ts_ms: float) -> SnapResult:
+               ts_ms: float,
+               page_quad_size: float | None = None) -> SnapResult:
         """
         tracks: curve_track output — list of [(x,y),...] polylines, one per line.
         gaze_xy: raw gaze in scene/world cam pixel coords.
         ts_ms: current time in milliseconds.
+        page_quad_size: sqrt(book quad area) in pixels — depth proxy for parallax correction.
         """
         raw = gaze_xy
         self._smooth_buf.append((ts_ms, gaze_xy[0], gaze_xy[1]))
@@ -95,8 +116,12 @@ class LineSnapper:
         n = len(sorted_tracks)
         gx, gy = smooth
 
-        # Apply session offset correction (corrects residual depth/parallax bias)
-        gy_corr = gy - self._offset
+        # Parallax correction: depth-dependent model takes priority when trained
+        # and a book quad is available; falls back to fixed session offset.
+        if self.depth_calib_trained and page_quad_size is not None:
+            gy_corr = gy - (self._parallax_a * page_quad_size + self._parallax_b)
+        else:
+            gy_corr = gy - self._offset
 
         # 2D distance from gaze to each track curve
         dists, snaps = zip(*[_dist_to_track(gx, gy_corr, t) for t in sorted_tracks])
@@ -162,6 +187,21 @@ class LineSnapper:
                 self._offset = float(np.median(self._offset_samples))
                 self.offset_ready = True
 
+        # Depth calibration: collect (quad_size, parallax_y) pairs.
+        # User fixates any one line while slowly varying book distance.
+        # parallax_y = raw_gy - snap_y of the nearest (fixated) line.
+        if (self.depth_calib_active
+                and page_quad_size is not None
+                and conf >= self.OFFSET_CONF_MIN
+                and not is_saccade):
+            snap_y = snaps[nearest][1]
+            self._depth_calib_samples.append((page_quad_size, gy - snap_y))
+            # Auto-fit once enough samples with sufficient depth range
+            sizes = [s for s, _ in self._depth_calib_samples]
+            if (len(sizes) >= self.DEPTH_CALIB_MIN_SAMPLES
+                    and float(np.std(sizes)) >= self.DEPTH_CALIB_MIN_SIZE_STD):
+                self._fit_depth_model()
+
         return SnapResult(
             line_idx=locked,
             line_count=n,
@@ -172,6 +212,57 @@ class LineSnapper:
             dwell_ms=float(dwell),
             raw_gaze_xy=raw,
         )
+
+    # ── Depth calibration API ─────────────────────────────────────────────────
+
+    def start_depth_calib(self):
+        """Begin collecting depth calibration samples. Clears any previous run."""
+        self._depth_calib_samples = []
+        self.depth_calib_active = True
+
+    def stop_depth_calib(self) -> bool:
+        """Stop collection and attempt to fit the parallax model.
+
+        Returns True if fit succeeded (enough samples + sufficient depth range).
+        """
+        self.depth_calib_active = False
+        return self._fit_depth_model()
+
+    def reset_depth_calib(self):
+        """Discard learned parallax model and collected samples."""
+        self._depth_calib_samples = []
+        self.depth_calib_active = False
+        self.depth_calib_trained = False
+        self._parallax_a = 0.0
+        self._parallax_b = 0.0
+
+    def _fit_depth_model(self) -> bool:
+        """Fit parallax_y = a * quad_size + b via least squares.
+
+        Returns True if the fit passed quality gates.
+        """
+        self.depth_calib_active = False
+        if len(self._depth_calib_samples) < self.DEPTH_CALIB_MIN_SAMPLES:
+            return False
+        sizes   = np.array([s for s, _ in self._depth_calib_samples], dtype=float)
+        offsets = np.array([o for _, o in self._depth_calib_samples], dtype=float)
+        if float(np.std(sizes)) < self.DEPTH_CALIB_MIN_SIZE_STD:
+            return False
+        a, b = np.polyfit(sizes, offsets, 1)
+        self._parallax_a = float(a)
+        self._parallax_b = float(b)
+        self.depth_calib_trained = True
+        return True
+
+    @property
+    def depth_calib_sample_count(self) -> int:
+        return len(self._depth_calib_samples)
+
+    @property
+    def depth_calib_size_std(self) -> float:
+        if not self._depth_calib_samples:
+            return 0.0
+        return float(np.std([s for s, _ in self._depth_calib_samples]))
 
     def reset(self):
         self._smooth_buf.clear()
@@ -184,6 +275,7 @@ class LineSnapper:
         self._offset_samples = []
         self._offset = 0.0
         self.offset_ready = False
+        self.reset_depth_calib()
 
     # ── Internals ─────────────────────────────────────────────────────────────
 

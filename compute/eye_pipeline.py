@@ -117,22 +117,27 @@ class EyePipeline:
                 labeled.append((gx, gy, side))
 
             # Primary glint selection:
-            # When both LED sides visible, pick by max PCCR magnitude — matches
-            # SplitGlintModel.predict() selection so live preview = model behavior.
+            # When both LED sides visible, use preferred_side (right LED) as primary.
+            # Falls back to left only when right glint dx is near-zero (unreliable),
+            # matching SplitGlintModel.predict() logic.
             sides_seen = {s for _, _, s in labeled}
             if len(sides_seen) == 2:
                 pos_glints = [(gx, gy) for gx, gy, s in labeled if s == self.preferred_side]
                 neg_glints = [(gx, gy) for gx, gy, s in labeled if s == -self.preferred_side]
                 pg = pos_glints[0] if pos_glints else None
                 ng = neg_glints[0] if neg_glints else None
-                if pg and ng:
-                    # Magnitude of each PCCR vector (swap_pccr swaps axes but not magnitude)
-                    mag_p = (pcx - pg[0])**2 + (pcy - pg[1])**2
-                    mag_n = (pcx - ng[0])**2 + (pcy - ng[1])**2
-                    gx, gy = pg if mag_p >= mag_n else ng
-                    sgx, sgy = ng if mag_p >= mag_n else pg
+                # Mirror SplitGlintModel.predict(): right unless near-zero dx
+                if pg is not None:
+                    raw_dx_p = abs((pcy - pg[1]) if self.swap_pccr else (pcx - pg[0]))
+                    from compute.gaze_model import SplitGlintModel as _SGM
+                    if raw_dx_p >= _SGM.MIN_PCCR or ng is None:
+                        gx, gy = pg
+                        sgx, sgy = ng if ng else (None, None)
+                    else:
+                        gx, gy = ng
+                        sgx, sgy = pg
                 else:
-                    gx, gy = pg or ng
+                    gx, gy = ng
                     sgx, sgy = None, None
                 if sgx is not None:
                     s_raw_dx = pcx - sgx; s_raw_dy = pcy - sgy

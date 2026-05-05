@@ -2021,3 +2021,43 @@ def _merge_into_lines_indexed(
                 group = [i]
         out.append(group)
     return out
+
+
+# ── Book quad detection ────────────────────────────────────────────────────────
+
+def _find_book_quad(bgr: np.ndarray) -> np.ndarray | None:
+    """Detect the largest quadrilateral = book page boundary.
+
+    Returns shape (4,2) int32 polygon in image coordinates, or None.
+    Falls back to convex hull of the largest contour if no clean quad found.
+    """
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY) if bgr.ndim == 3 else bgr
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    otsu_val, _ = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    lo = max(1.0, otsu_val * 0.5)
+    edges = cv2.Canny(blurred, lo, otsu_val)
+    edges = cv2.dilate(edges, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
+    cnts, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return None
+    H, W = bgr.shape[:2]
+    min_area = H * W * 0.10
+    cnts = sorted(cnts, key=cv2.contourArea, reverse=True)
+    for cnt in cnts[:5]:
+        if cv2.contourArea(cnt) < min_area:
+            break
+        peri = cv2.arcLength(cnt, True)
+        approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
+        if len(approx) == 4:
+            return approx.reshape(4, 2).astype(np.int32)
+    hull = cv2.convexHull(cnts[0])
+    return hull.reshape(-1, 2).astype(np.int32)
+
+
+def _book_quad_size(quad: np.ndarray) -> float:
+    """Scalar depth proxy from a book quad polygon: sqrt(area).
+
+    sqrt(area) ∝ 1/Z (distance to page), making it linearly proportional
+    to the parallax offset we want to correct for.
+    """
+    return float(cv2.contourArea(quad) ** 0.5)

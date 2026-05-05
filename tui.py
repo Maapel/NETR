@@ -219,7 +219,7 @@ class RigManager(App):
     analysis_enabled    = reactive(False)
     eye_cam             = reactive(2)   # which cam runs the eye pipeline
 
-    LOG_GROUPS = ("all", "cam1", "cam2", "ota", "sys")
+    LOG_GROUPS = ("all", "cam1", "cam2", "ota", "sys", "err")
 
     def __init__(self):
         super().__init__()
@@ -283,6 +283,7 @@ class RigManager(App):
                     yield Button("CAM2", id="flt-cam2")
                     yield Button("OTA", id="flt-ota")
                     yield Button("Sys", id="flt-sys")
+                    yield Button("Err", id="flt-err")
                 yield RichLog(id="log", highlight=True, markup=True)
                 yield Static("── PUPIL ANALYSIS ──", classes="panel-title")
                 with Vertical(id="analysis-section"):
@@ -403,7 +404,7 @@ class RigManager(App):
 
     # ── Logging ───────────────────────────────────────────────────────────────
     def log_msg(self, msg: str, group: str = "sys"):
-        tag_colors = {"cam1": "cyan", "cam2": "magenta", "ota": "yellow", "sys": "dim white"}
+        tag_colors = {"cam1": "cyan", "cam2": "magenta", "ota": "yellow", "sys": "dim white", "err": "red"}
         color = tag_colors.get(group, "white")
         tag = f"[{color}]{group.upper():>4}[/]"
         rendered = f"[dim]{now()}[/] {tag}  {msg}"
@@ -516,6 +517,22 @@ class RigManager(App):
                     btn.remove_class("filter-active")
             self._refilter_log()
 
+    # ── Process output streaming ──────────────────────────────────────────────
+
+    def _stream_proc(self, proc: subprocess.Popen, tag: str):
+        """Stream stdout→tag and stderr→'err' group from a subprocess."""
+        def _read(pipe, group):
+            try:
+                for raw in pipe:
+                    line = raw.decode(errors="ignore").rstrip()
+                    if line:
+                        self.call_from_thread(self.log_msg, line, group)
+            except Exception:
+                pass
+
+        threading.Thread(target=_read, args=(proc.stdout, tag),  daemon=True).start()
+        threading.Thread(target=_read, args=(proc.stderr, "err"), daemon=True).start()
+
     # ── Receiver ──────────────────────────────────────────────────────────────
     def _toggle_receiver(self):
         btn = self.query_one("#btn-receiver", Button)
@@ -528,8 +545,9 @@ class RigManager(App):
         else:
             self._receiver_proc = subprocess.Popen(
                 [str(PYTHON), str(RECEIVER)],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             )
+            self._stream_proc(self._receiver_proc, "sys")
             self.receiver_running = True
             btn.label = "■ Receiver"; btn.add_class("running")
             self.log_msg("[green]Receiver started[/] → http://localhost:8080", "sys")
@@ -547,8 +565,9 @@ class RigManager(App):
             self._engine_proc = subprocess.Popen(
                 [str(PYTHON), str(ENGINE)],
                 cwd=ROOT / "compute",
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             )
+            self._stream_proc(self._engine_proc, "sys")
             self.engine_running = True
             btn.label = "■ Engine"; btn.add_class("running")
             self.log_msg("[green]Engine started[/] → http://localhost:8081", "sys")
@@ -565,8 +584,9 @@ class RigManager(App):
         else:
             self._calibration_proc = subprocess.Popen(
                 [str(PYTHON), str(CALIBRATION)],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             )
+            self._stream_proc(self._calibration_proc, "sys")
             self.calibration_running = True
             btn.label = "■ Calibration"; btn.add_class("running")
             self.log_msg("[green]Calibration started[/] → http://localhost:8090", "sys")

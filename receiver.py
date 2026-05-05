@@ -209,13 +209,28 @@ def _engine_push(jpeg: bytes) -> tuple:
     except Exception:
         return None, None, time.time() * 1000, None, 0.0, {}
 
-def _engine_get_result() -> dict | None:
+_engine_result_cache: dict | None = None
+_engine_result_lock = threading.Lock()
+
+def _engine_result_poller():
+    """Background thread: polls engine /result at ~30 Hz and caches it."""
     import urllib.request
-    try:
-        with urllib.request.urlopen(ENGINE_URL + "/result", timeout=0.3) as r:
-            return json.loads(r.read())
-    except Exception:
-        return None
+    global _engine_result_cache
+    while True:
+        try:
+            with urllib.request.urlopen(ENGINE_URL + "/result", timeout=0.25) as r:
+                result = json.loads(r.read())
+            with _engine_result_lock:
+                _engine_result_cache = result
+        except Exception:
+            pass
+        time.sleep(0.033)  # ~30 Hz
+
+threading.Thread(target=_engine_result_poller, daemon=True, name="engine-poller").start()
+
+def _engine_get_result() -> dict | None:
+    with _engine_result_lock:
+        return _engine_result_cache
 
 
 def _engine_post_gaze_model_load(body: bytes) -> tuple[int, bytes]:
@@ -1150,6 +1165,21 @@ class MJPEGHandler(BaseHTTPRequestHandler):
             g_calib_trace = raw not in ("0", "false", "")
             print(f"[calib] receiver pipeline trace -> {'ON' if g_calib_trace else 'OFF'}", flush=True)
 
+        if "depth_calib" in params:
+            action = params["depth_calib"]
+            snapper = _get_line_snapper()
+            if snapper is not None:
+                with _line_snapper_lock:
+                    if action == "start":
+                        snapper.start_depth_calib()
+                        print("[depth_calib] started collection", flush=True)
+                    elif action == "stop":
+                        ok = snapper.stop_depth_calib()
+                        print(f"[depth_calib] stopped — fit {'ok' if ok else 'failed (insufficient data)'}", flush=True)
+                    elif action == "reset":
+                        snapper.reset_depth_calib()
+                        print("[depth_calib] reset", flush=True)
+
         if "eye_cam" in params:
             global g_eye_cam
             try:
@@ -1397,8 +1427,9 @@ class MJPEGHandler(BaseHTTPRequestHandler):
             except BrokenPipeError: pass
             return
 
-        # Get tracks from world cam frame
+        # Get tracks + book quad from world cam frame
         tracks = []
+        page_quad_size = None
         with world_cam.frame_lock:
             frame_data = world_cam.latest_frame
 
@@ -1409,16 +1440,22 @@ class MJPEGHandler(BaseHTTPRequestHandler):
                 if bgr is not None:
                     det.detect_lines(bgr)
                     tracks = det._last_debug.get("tracks", [])
-                    # Update snapper scene size in case it changed
                     H, W = bgr.shape[:2]
                     snapper.scene_w = W
                     snapper.scene_h = H
+                    try:
+                        from compute.text_detector import _find_book_quad, _book_quad_size
+                        quad = _find_book_quad(bgr)
+                        if quad is not None:
+                            page_quad_size = _book_quad_size(quad)
+                    except Exception:
+                        pass
             except Exception:
                 pass
 
         ts_ms = time.time() * 1000.0
         with _line_snapper_lock:
-            snap = snapper.update(tracks, gaze, ts_ms)
+            snap = snapper.update(tracks, gaze, ts_ms, page_quad_size=page_quad_size)
 
         result = {
             "ok": True,
@@ -1432,6 +1469,13 @@ class MJPEGHandler(BaseHTTPRequestHandler):
             "raw_gaze_xy": list(snap.raw_gaze_xy),
             "offset_px": round(snapper._offset, 1),
             "offset_ready": snapper.offset_ready,
+            "depth_calib_active": snapper.depth_calib_active,
+            "depth_calib_trained": snapper.depth_calib_trained,
+            "depth_calib_n": snapper.depth_calib_sample_count,
+            "depth_calib_std": round(snapper.depth_calib_size_std, 1),
+            "parallax_a": round(snapper._parallax_a, 4),
+            "parallax_b": round(snapper._parallax_b, 1),
+            "page_quad_size": round(page_quad_size, 1) if page_quad_size is not None else None,
         }
         body = json.dumps(result).encode()
         self.send_response(200)
@@ -1538,6 +1582,10 @@ class MJPEGHandler(BaseHTTPRequestHandler):
     <label style="cursor:pointer; user-select:none"><input type="checkbox" id="text_lines_world"> Show text lines on world cam</label>
     <label style="cursor:pointer; user-select:none"><input type="checkbox" id="line_snap_world"> Line snap gaze</label>
     <span id="line_snap_hud" style="color:#8f8;font-size:11px;min-width:180px"></span>
+    <button id="depth_calib_btn" type="button"
+            style="padding:4px 10px;background:#363;color:#cfc;border:none;border-radius:3px;cursor:pointer;font-size:11px"
+            onclick="depthCalibToggle()">Depth calib</button>
+    <span id="depth_calib_hud" style="color:#adf;font-size:11px;min-width:200px"></span>
     <span style="color:#888">Model</span>
     <select id="gaze_model_select" style="min-width:220px"></select>
     <button type="button" onclick="applyGazeModel()" style="padding:4px 12px;background:#257;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px">Apply model</button>
@@ -1914,17 +1962,55 @@ const gazeOverlayEl    = document.getElementById('gaze_overlay_world');
 const textLinesEl      = document.getElementById('text_lines_world');
 const lineSnapEl       = document.getElementById('line_snap_world');
 const lineSnapHud      = document.getElementById('line_snap_hud');
+const depthCalibBtn    = document.getElementById('depth_calib_btn');
+const depthCalibHud    = document.getElementById('depth_calib_hud');
 let   _lastTextLines   = null;   // {lines, w, h} cached from last /text_lines fetch
 let   _textLinesFetching = false;
 let   _lastGazeLine    = null;   // cached /gaze_line response
 let   _gazeLineFetching = false;
+let   _depthCalibActive = false;
+
+function depthCalibToggle() {
+  if (_depthCalibActive) {
+    fetch('/set?depth_calib=stop').catch(() => {});
+    _depthCalibActive = false;
+    if (depthCalibBtn) depthCalibBtn.textContent = 'Depth calib';
+  } else {
+    fetch('/set?depth_calib=start').catch(() => {});
+    _depthCalibActive = true;
+    if (depthCalibBtn) { depthCalibBtn.textContent = 'Stop calib'; depthCalibBtn.style.background='#633'; }
+  }
+}
+
+function _updateDepthCalibHud(j) {
+  if (!depthCalibHud || !j) return;
+  if (j.depth_calib_trained) {
+    depthCalibHud.style.color = '#adf';
+    depthCalibHud.textContent =
+      `parallax ✓ a=${j.parallax_a} b=${j.parallax_b}px` +
+      (j.page_quad_size !== null ? `  quad=${j.page_quad_size}px` : '');
+    if (depthCalibBtn) { depthCalibBtn.textContent = 'Depth calib'; depthCalibBtn.style.background='#363'; }
+    _depthCalibActive = false;
+  } else if (j.depth_calib_active) {
+    const pct = Math.min(100, Math.round(j.depth_calib_n / 40 * 100));
+    depthCalibHud.style.color = '#fa8';
+    depthCalibHud.textContent =
+      `collecting… ${j.depth_calib_n} samples  range=${j.depth_calib_std}px (need ≥30)`;
+  } else {
+    depthCalibHud.style.color = '#888';
+    depthCalibHud.textContent = j.depth_calib_trained ? '' : '(not calibrated)';
+  }
+}
 
 function _fetchGazeLine() {
   if (_gazeLineFetching || !lineSnapEl || !lineSnapEl.checked) return;
   _gazeLineFetching = true;
   fetch('/gaze_line?t=' + Date.now())
     .then(r => r.ok ? r.json() : null)
-    .then(j => { if (j && j.ok) _lastGazeLine = j; })
+    .then(j => {
+      if (j && j.ok) _lastGazeLine = j;
+      _updateDepthCalibHud(j);
+    })
     .catch(() => {})
     .finally(() => { _gazeLineFetching = false; });
 }
@@ -1973,13 +2059,17 @@ function drawTextLinesOnWorldCanvas() {
   ctx.restore();
 }
 let gazeStatsTimer = null;
+let _gazeStatsFetching = false;
 
 function setGazePolling(on) {
   if (gazeStatsTimer) { clearInterval(gazeStatsTimer); gazeStatsTimer = null; }
   if (!on) return;
   gazeStatsTimer = setInterval(() => {
-    fetch('/stats').then(r => r.json()).then(d => { __lastStats = d; }).catch(() => {});
-  }, 100);
+    if (_gazeStatsFetching) return;
+    _gazeStatsFetching = true;
+    fetch('/stats').then(r => r.json()).then(d => { __lastStats = d; }).catch(() => {})
+      .finally(() => { _gazeStatsFetching = false; });
+  }, 50);
 }
 if (gazeOverlayEl) gazeOverlayEl.addEventListener('change', () => setGazePolling(!!gazeOverlayEl.checked));
 

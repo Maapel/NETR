@@ -684,6 +684,56 @@ def _flush_pending_target(eyes: list | None = None, target: dict | None = None):
         }))
 
 
+def _compute_loo_errors(samples: list[dict]) -> list[dict]:
+    """LOO residuals for each sample using the active model type.
+
+    Uses SplitGlintModel (dual) or GazeModel (single) matching _get_glint_mode(),
+    with the same right-glint-first prediction logic as the live model.
+    Falls back to GazeModel for samples missing dx1/dx2.
+    Returns [{sx, sy, err}] in world-frame pixels.
+    """
+    if len(samples) < 7:
+        return []
+    mode = _get_glint_mode()
+    errors = []
+    for i, s in enumerate(samples):
+        leave_out = samples[:i] + samples[i+1:]
+        try:
+            if mode == "dual":
+                m = SplitGlintModel()
+                m.fit(leave_out)
+                if "dx1" in s and "dx2" in s:
+                    pred = m.predict(s["dx1"], s["dy1"], s["dx2"], s["dy2"])
+                else:
+                    # single-glint sample — use whichever sub-model matches side
+                    sub = m.model_right if s.get("side", 1.0) >= 0 else m.model_left
+                    pred = sub.predict(s["dx"], s["dy"])
+            else:
+                m = GazeModel()
+                m.fit(leave_out)
+                pred = m.predict(s["dx"], s["dy"])
+            err = float(((pred[0] - s["X"])**2 + (pred[1] - s["Y"])**2)**0.5)
+            errors.append({"sx": s["sx"], "sy": s["sy"], "err": round(err, 1)})
+        except Exception:
+            errors.append({"sx": s["sx"], "sy": s["sy"], "err": 0.0})
+    return errors
+
+
+def _loo_weights(samples: list[dict]) -> "np.ndarray | None":
+    """Lorentzian weights from LOO residuals.
+
+    w_i = 1 / (1 + (err_i / median_err)²)
+    Inliers (err ≈ median) get w ≈ 0.5; clean samples (err << median) get w → 1;
+    outliers (err >> median) get w → 0.
+    """
+    loo = _compute_loo_errors(samples)
+    if len(loo) != len(samples):
+        return None
+    errs = np.array([e["err"] for e in loo], dtype=float)
+    sigma = float(np.median(errs)) + 1e-6
+    return 1.0 / (1.0 + (errs / sigma) ** 2)
+
+
 def _refit_models():
     """Refit model from current saccade samples. Called after each fixation."""
     with _saccade_lock:
@@ -692,14 +742,15 @@ def _refit_models():
         return None
     try:
         mode = _get_glint_mode()
+        weights = _loo_weights(samples)
 
         if mode == "single":
             m = GazeModel()
-            diag = m.fit(samples)
+            diag = m.fit(samples, weights=weights)
             m.save(MODEL_SINGLE_PATH)
         else:
             m = SplitGlintModel()
-            diag = m.fit(samples)
+            diag = m.fit(samples, weights=weights)
             m.save(MODEL_DUAL_PATH)
 
         import copy
@@ -812,6 +863,8 @@ def _detect_aruco_corners(frame_bgr: np.ndarray) -> tuple[dict[int, np.ndarray] 
         small = cv2.resize(gray, (int(w0 * scale), int(h0 * scale)))
     else:
         small = gray; scale = 1.0
+    if small.std() < 3.0:   # near-uniform frame — skip detection (avoids OpenCV crash)
+        return None, [], [], None
     with _aruco_lock:
         det = _aruco_detector
     corners_small, ids, _ = det.detectMarkers(small)
@@ -1947,6 +2000,7 @@ ws.onmessage = e => {
   if (m.type === 'ready') {
     btnLive.disabled = false;  // model just refitted, enable live
     statusEl.textContent = `${m.n} pts — R²x=${m.r2_x}  R²y=${m.r2_y}`;
+    fetchCalibErrors();  // refresh LOO errors for next adaptive point selection
   }
   if (m.type === 'result') {
     btnStop.disabled  = false;
@@ -2328,6 +2382,16 @@ let gridPts   = [];
 let gridIdx   = 0;
 // Collected screen-space points for adaptive mode
 let collectedPts = [];
+// LOO errors fetched from /calib_errors after each model refit
+let _calibErrors = [];
+// Points to collect in spatial-coverage phase before switching to error-guided
+const ADAPTIVE_BOOTSTRAP_N = 9;
+
+function fetchCalibErrors() {
+  fetch('/calib_errors').then(r => r.json()).then(d => {
+    if (d && d.errors) _calibErrors = d.errors;
+  }).catch(() => {});
+}
 
 const btnGrid = document.getElementById('btnGrid');
 btnGrid.onclick = () => {
@@ -2392,17 +2456,48 @@ function buildAdaptiveCandidates() {
   return pts;
 }
 
-// Pick candidate that maximises min-distance to all already-collected points.
-// First point: centre. Subsequent: farthest from any collected point.
+// Pick next adaptive calibration point.
+// Phase 1 (saccadeCount < ADAPTIVE_BOOTSTRAP_N): max-min-distance spatial coverage.
+// Phase 2 (after bootstrap): IDW-interpolated LOO error — bias toward high-error regions.
+// Excludes already-visited grid slots; resets pool when all exhausted.
 function adaptiveNextPoint() {
   const cands = buildAdaptiveCandidates();
   if (collectedPts.length === 0) return {x: W/2, y: H/2};
-  let best = cands[0], bestDist = -1;
-  for (const c of cands) {
-    // Skip if very close to an already-collected point
-    const minD = Math.min(...collectedPts.map(p =>
-      Math.hypot(c.x - p.x, c.y - p.y)));
-    if (minD > bestDist) { bestDist = minD; best = c; }
+
+  // Filter out already-visited candidates (within 10px = same grid slot)
+  let pool = cands.filter(c =>
+    !collectedPts.some(p => Math.hypot(c.x - p.x, c.y - p.y) < 10));
+  if (pool.length === 0) {
+    collectedPts = [];
+    pool = cands;
+  }
+
+  // Phase 1: spatial coverage — maximise min-distance to collected points
+  if (saccadeCount < ADAPTIVE_BOOTSTRAP_N || _calibErrors.length < 3) {
+    let best = pool[0], bestDist = -1;
+    for (const c of pool) {
+      const minD = Math.min(...collectedPts.map(p =>
+        Math.hypot(c.x - p.x, c.y - p.y)));
+      if (minD > bestDist) { bestDist = minD; best = c; }
+    }
+    return best;
+  }
+
+  // Phase 2: error-guided — IDW interpolation of LOO errors at known sample positions.
+  // score(c) = Σ(err_i / dist(c,i)²) / Σ(1 / dist(c,i)²)
+  // Candidates near high-error samples score highest.
+  const EPS = 100;  // px² floor to avoid division by zero at exact overlap
+  let best = pool[0], bestScore = -1;
+  for (const c of pool) {
+    let wSum = 0, errSum = 0;
+    for (const e of _calibErrors) {
+      const d2 = (c.x - e.sx)**2 + (c.y - e.sy)**2 + EPS;
+      const w  = 1.0 / d2;
+      wSum   += w;
+      errSum += w * e.err;
+    }
+    const score = wSum > 0 ? errSum / wSum : 0;
+    if (score > bestScore) { bestScore = score; best = c; }
   }
   return best;
 }
@@ -2416,6 +2511,7 @@ function nextSaccadePoint() {
     saccadePos = gridPts[gridIdx++];
   } else if (spawnMode === 'adaptive') {
     saccadePos = adaptiveNextPoint();
+    collectedPts.push({x: saccadePos.x, y: saccadePos.y});
   } else {
     // zone
     if (zoneSeqIdx >= zoneSeq.length) {
@@ -2460,7 +2556,6 @@ function tickSaccade(now) {
     fixationSentAt = now;
     saccadeSampled = true;
     saccadeCount++;
-    collectedPts.push({x: saccadePos.x, y: saccadePos.y});  // track for adaptive
     if (spawnMode === 'grid') {
       const total = gridPts.length;
       const pass  = Math.ceil(saccadeCount / total);
@@ -3107,6 +3202,18 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+
+        elif self.path == "/calib_errors":
+            with _saccade_lock:
+                samples = list(_saccade_samples)
+            errs = _compute_loo_errors(samples)
+            body = json.dumps({"errors": errs, "n": len(errs)}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            try: self.wfile.write(body)
+            except BrokenPipeError: pass
 
         elif self.path == "/debug":
             with _debug_lock:
