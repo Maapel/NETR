@@ -3453,8 +3453,9 @@ def main():
     threading.Thread(target=_eye_cam_thread,   daemon=True).start()
     threading.Thread(target=_eye_poll_thread,  daemon=True).start()
 
-    server = ThreadedHTTPServer(("", 8090), Handler)
-    print("Calibration server on http://localhost:8090")
+    calib_port = int(os.environ.get("CALIB_PORT", 8092))
+    server = ThreadedHTTPServer(("", calib_port), Handler)
+    print(f"Calibration server on http://localhost:{calib_port}")
     print(f"Scene cam: cam{SCENE_CAM_ID} (world cam from rig_config) via {RECEIVER_URL}")
     print(f"Model path: {MODEL_PATH}")
     if _model.trained:
