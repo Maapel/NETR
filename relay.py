@@ -17,12 +17,15 @@ Localhost cmd inputs (127.0.0.1:5001 / 5003):
   any bytes    — command from receiver.py, forwarded to ESP32's cmd channel
 """
 
+import os
 import socket
 import threading
 import time
 
 RELAY_PORT   = 8877
-SECRET       = "e0201424befd0e31"
+SECRET       = os.environ.get("RELAY_SECRET", "")
+if not SECRET:
+    raise RuntimeError("RELAY_SECRET env var not set — refusing to start with no auth")
 CAM_PORTS    = {1: 5000, 2: 5002}
 CMD_IN_PORTS = {1: 5001, 2: 5003}
 

@@ -34,9 +34,9 @@
 // Comment out USE_RELAY to fall back to LAN beacon discovery (local hotspot).
 #define USE_RELAY
 #ifdef USE_RELAY
-  #define RELAY_IP     "80.225.197.86"
-  #define RELAY_PORT   8877
-  #define RELAY_SECRET "e0201424befd0e31"
+  #define RELAY_IP    "80.225.197.86"
+  #define RELAY_PORT  8877
+  #include "secrets.h"   // defines RELAY_SECRET — gitignored, never committed
 #endif
 // ─────────────────────────────────────────────────────────────────────────────
 

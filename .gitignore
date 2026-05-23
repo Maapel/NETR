@@ -2,3 +2,4 @@ __pycache__/
 recordings/
 cam_settings.json
 text_debug/
+esp32cam-stream/src/secrets.h
