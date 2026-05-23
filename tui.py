@@ -4,6 +4,7 @@ Run: /home/maadhav/pio-venv/bin/python tui.py
 """
 
 import asyncio
+import os
 import re
 import socket
 import subprocess
@@ -38,6 +39,10 @@ ENGINE     = ROOT / "compute" / "engine.py"
 CALIBRATION = ROOT / "calibration_server.py"
 NTP_SRV    = ROOT / "ntp_server.py"
 SERIAL_DEV = "/dev/ttyUSB0"
+
+_RECEIVER_HOST = os.environ.get("RECEIVER_HOST", "localhost")
+_RECEIVER_PORT = int(os.environ.get("HTTP_PORT", 8080))
+RECEIVER_BASE  = f"http://{_RECEIVER_HOST}:{_RECEIVER_PORT}"
 
 DISCOVERY_PORT = 5004
 LOG_PORT       = 5010
@@ -362,7 +367,7 @@ class RigManager(App):
         val = "1" if self.analysis_enabled else "0"
         try:
             urllib.request.urlopen(
-                f"http://localhost:8080/set?analysis={val}", timeout=1
+                f"{RECEIVER_BASE}/set?analysis={val}", timeout=1
             ).close()
         except Exception:
             pass
@@ -550,7 +555,7 @@ class RigManager(App):
             self._stream_proc(self._receiver_proc, "sys")
             self.receiver_running = True
             btn.label = "■ Receiver"; btn.add_class("running")
-            self.log_msg("[green]Receiver started[/] → http://localhost:8080", "sys")
+            self.log_msg(f"[green]Receiver started[/] → {RECEIVER_BASE}", "sys")
 
     # ── Engine ────────────────────────────────────────────────────────────────
     def _toggle_engine(self):
@@ -570,7 +575,7 @@ class RigManager(App):
             self._stream_proc(self._engine_proc, "sys")
             self.engine_running = True
             btn.label = "■ Engine"; btn.add_class("running")
-            self.log_msg("[green]Engine started[/] → http://localhost:8081", "sys")
+            self.log_msg(f"[green]Engine started[/] → {_RECEIVER_HOST}:8081", "sys")
 
     # ── Calibration ───────────────────────────────────────────────────────────
     def _toggle_calibration(self):
@@ -589,7 +594,7 @@ class RigManager(App):
             self._stream_proc(self._calibration_proc, "sys")
             self.calibration_running = True
             btn.label = "■ Calibration"; btn.add_class("running")
-            self.log_msg("[green]Calibration started[/] → http://localhost:8090", "sys")
+            self.log_msg(f"[green]Calibration started[/] → {_RECEIVER_HOST}:8090", "sys")
 
     # ── Software reset ─────────────────────────────────────────────────────────
     _CMD_PORTS = {"cam1": 5001, "cam2": 5003}
