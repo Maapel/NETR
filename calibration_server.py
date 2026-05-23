@@ -18,6 +18,7 @@ Ports: HTTP/WS 8090
 """
 
 import asyncio
+import os
 import json
 import time
 import threading
@@ -46,7 +47,7 @@ except Exception:
     _EYE_CAM = 2
 
 # ── Config ────────────────────────────────────────────────────────────────────
-RECEIVER_URL  = "http://localhost:8080"
+RECEIVER_URL  = f"http://localhost:{int(os.environ.get('HTTP_PORT', 8080))}"
 ENGINE_URL    = "http://localhost:8081"
 SCENE_CAM_ID  = _WORLD_CAM     # which cam to use for ArUco detection (world cam from rig_config)
 EYE_CAM_ID    = _EYE_CAM      # eye stream cam id (rig_config)

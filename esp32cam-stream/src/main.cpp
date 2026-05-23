@@ -29,6 +29,17 @@
 #define OTA_HOSTNAME     "esp32cam-" STR(CAM_ID)
 // ─────────────────────────────────────────────────────────────────────────────
 
+// ── Relay mode ───────────────────────────────────────────────────────────────
+// Default: USE_RELAY sends stream to Oracle relay server on one public UDP port.
+// Comment out USE_RELAY to fall back to LAN beacon discovery (local hotspot).
+#define USE_RELAY
+#ifdef USE_RELAY
+  #define RELAY_IP     "80.225.197.86"
+  #define RELAY_PORT   8877
+  #define RELAY_SECRET "e0201424befd0e31"
+#endif
+// ─────────────────────────────────────────────────────────────────────────────
+
 // AI-Thinker ESP32-CAM pin map
 #define PWDN_GPIO_NUM     32
 #define RESET_GPIO_NUM    -1
@@ -270,7 +281,11 @@ void sendTask(void *) {
             memcpy(pkt + HDR_SIZE, data + offset, pld_len);
 
             if (g_laptop_ip[0] == '\0') continue;  // not yet discovered
+#ifdef USE_RELAY
+            udp.beginPacket(g_laptop_ip, RELAY_PORT);
+#else
             udp.beginPacket(g_laptop_ip, LAPTOP_PORT);
+#endif
             udp.write(pkt, HDR_SIZE + pld_len);
             udp.endPacket();
         }
@@ -287,7 +302,22 @@ void cmdTask(void *) {
     cmdUdp.begin(CMD_PORT);
     Serial.printf("CMD listener on UDP :%d\n", CMD_PORT);
 
+#ifdef USE_RELAY
+    TickType_t lastKeepalive = xTaskGetTickCount() - pdMS_TO_TICKS(5000);
+#endif
+
     while (true) {
+#ifdef USE_RELAY
+        // Keepalive to relay — creates NAT mapping so relay can send commands back
+        if (xTaskGetTickCount() - lastKeepalive >= pdMS_TO_TICKS(5000)) {
+            char ka[16];
+            snprintf(ka, sizeof(ka), "CMD_KA:%d", CAM_ID);
+            cmdUdp.beginPacket(RELAY_IP, RELAY_PORT);
+            cmdUdp.write((uint8_t *)ka, strlen(ka));
+            cmdUdp.endPacket();
+            lastKeepalive = xTaskGetTickCount();
+        }
+#endif
         int len = cmdUdp.parsePacket();
         if (len <= 0) {
             vTaskDelay(pdMS_TO_TICKS(50));
@@ -355,6 +385,7 @@ void cmdTask(void *) {
 // ── Task: beacon-based laptop discovery ───────────────────────────────────────
 // Broadcasts "CAM:<id>" every 10s so discover.py can find our IP.
 // Listens for "LAPTOP:<ip>" from the receiver so we know where to stream.
+// In relay mode: sends heartbeat to relay server instead of LAN broadcast.
 void discoveryTask(void *) {
     discUdp.begin(DISCOVERY_PORT);
 
@@ -363,6 +394,44 @@ void discoveryTask(void *) {
 
     TickType_t lastAnnounce = xTaskGetTickCount() - pdMS_TO_TICKS(10000); // fire immediately
 
+#ifdef USE_RELAY
+    // Relay mode: authenticate once, then send periodic heartbeats.
+    // Auth whitelists our IP — relay drops all packets from unknown IPs.
+    {
+        char auth[64];
+        snprintf(auth, sizeof(auth), "AUTH:%d:%s", CAM_ID, RELAY_SECRET);
+        // Retry until we get AUTH_OK
+        while (true) {
+            if (g_ota_active) { vTaskDelay(pdMS_TO_TICKS(200)); continue; }
+            discUdp.beginPacket(RELAY_IP, RELAY_PORT);
+            discUdp.write((const uint8_t *)auth, strlen(auth));
+            discUdp.endPacket();
+            vTaskDelay(pdMS_TO_TICKS(500));
+            int len = discUdp.parsePacket();
+            if (len > 0) {
+                char resp[16] = {};
+                discUdp.read(resp, sizeof(resp) - 1);
+                if (strncmp(resp, "AUTH_OK", 7) == 0) {
+                    udp_log("Relay auth OK");
+                    break;
+                }
+            }
+            vTaskDelay(pdMS_TO_TICKS(2000));  // wait before retry
+        }
+    }
+    while (true) {
+        if (g_ota_active) { vTaskDelay(pdMS_TO_TICKS(200)); continue; }
+        // Heartbeat keeps NAT mapping alive (no secret needed — IP already whitelisted)
+        if (xTaskGetTickCount() - lastAnnounce >= pdMS_TO_TICKS(5000)) {
+            discUdp.beginPacket(RELAY_IP, RELAY_PORT);
+            discUdp.write((const uint8_t *)announce, strlen(announce));
+            discUdp.endPacket();
+            lastAnnounce = xTaskGetTickCount();
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+#else
+    // LAN mode: broadcast announce + listen for LAPTOP beacon.
     while (true) {
         // Re-announce every 10s
         if (xTaskGetTickCount() - lastAnnounce >= pdMS_TO_TICKS(10000)) {
@@ -410,6 +479,7 @@ void discoveryTask(void *) {
 
         vTaskDelay(pdMS_TO_TICKS(100));
     }
+#endif
 }
 
 // ── Task: handle OTA updates ──────────────────────────────────────────────────
@@ -557,7 +627,9 @@ void wifiTask(void *) {
             if (WiFi.status() == WL_CONNECTED) {
                 udp_log("WiFi reconnected — IP: %s",
                         WiFi.localIP().toString().c_str());
-
+#ifdef USE_RELAY
+                strncpy(g_laptop_ip, RELAY_IP, sizeof(g_laptop_ip) - 1);
+#endif
                 // Clock will re-sync automatically once beacon resumes
             } else {
                 udp_log("WiFi reconnect failed — will retry");
@@ -593,6 +665,12 @@ void setup() {
     // Clock syncs from laptop beacon — no NTP server needed
 
     udp.begin(LAPTOP_PORT);
+
+#ifdef USE_RELAY
+    strncpy(g_laptop_ip,      RELAY_IP, sizeof(g_laptop_ip) - 1);
+    strncpy(g_last_laptop_ip, RELAY_IP, sizeof(g_last_laptop_ip) - 1);
+    Serial.println("Relay mode — streaming to " RELAY_IP);
+#endif
 
     frameQueue = xQueueCreate(2, sizeof(FrameEnvelope));
     xTaskCreatePinnedToCore(captureTask,   "capture",   4096, NULL, 1, NULL, 0);

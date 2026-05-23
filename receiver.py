@@ -437,7 +437,7 @@ from datetime import datetime
 RECORD_BUF_SECS = 40  # 40-second rolling buffer
 RECORD_MAX_FRAMES = 30 * RECORD_BUF_SECS  # ~3600 frames at 30fps
 
-HTTP_PORT      = 8080
+HTTP_PORT      = int(os.environ.get("HTTP_PORT", 8080))
 DISCOVERY_PORT = 5004
 TIMESYNC_PORT  = 5005
 FRAME_TIMEOUT  = 0.25    # discard incomplete frames older than this (s)
