@@ -363,6 +363,8 @@ app.router.add_post("/iot-dashboard/api/start/{name}", handle_api_start)
 app.router.add_post("/iot-dashboard/api/stop/{name}",  handle_api_stop)
 app.router.add_route("*", "/calibration",      handle_calibration)
 app.router.add_route("*", "/calibration/{path:.*}", handle_calibration)
+# Calibration JS builds ws://<host>/ws (not /calibration/ws) — catch it here
+app.router.add_get("/ws",                      handle_calibration)
 app.router.add_route("*", "/engine",           handle_engine)
 app.router.add_route("*", "/engine/{path:.*}", handle_engine)
 app.router.add_route("*", "/{path:.*}",        handle_receiver)
